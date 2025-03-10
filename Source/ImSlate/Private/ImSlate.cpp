@@ -1,0 +1,1240 @@
+// Copyright ImSlate, Inc. All Rights Reserved.
+#include "ImSlate.h"
+#include "ImSlatePrivate.h"
+
+#include "Slate.h"
+
+#include "AttributeCompatibility.h"
+#include "Components/Widget.h"
+#include "Engine/Texture2D.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/Application/SlateUser.h"
+#include "Framework/SlateDelegates.h"
+#include "ImSlateInternal.h"
+#include "ImSlateStyleSetting.h"
+#include "ImSlateTemplates.h"
+#include "Internationalization/Text.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "PrivateFieldAccessor.h"
+#include "ProtectFieldAccessor.h"
+#include "SImSlatePanel.h"
+#include "SImSlateViewport.h"
+#include "SImSlateWindow.h"
+#include "SImViewportGame.h"
+#include "SImViewportHost.h"
+#include "UnrealCompatibility.h"
+
+DEFINE_LOG_CATEGORY(LogImSlate);
+
+namespace ImSlate
+{
+namespace ImSlateInternal
+{
+	GS_PRIVATEACCESS_FUNCTION(SWidget, Prepass_Internal, void(float))
+	GS_PRIVATEACCESS_FUNCTION(SWidget, SetDesiredSize, void(const FVector2D&))
+
+}  // namespace ImSlateInternal
+
+void PrepassInternal(const TSharedRef<SWidget>& InWidget, float LayoutScaleMultiplier)
+{
+	ImSlateInternal::PrivateAccess::Prepass_Internal(InWidget.Get(), LayoutScaleMultiplier);
+}
+void SetDesiredSize(SWidget* InWidget, const ImVec2& InSize)
+{
+	if (InSize.HasValidSize())
+		ImSlateInternal::PrivateAccess::SetDesiredSize(*InWidget, InSize);
+}
+
+// Save current stack sizes for later compare
+void ImSlateStackSizes::SetToCurrentState()
+{
+	ImSlateContext& g = *GImSlate;
+	ImSlateWindow* MyWindow = g.CurrentWindow;
+	SizeOfBeginPopupStack = (short)g.BeginPopupStack.Num();
+	// SizeOfIDStack = (short)MyWindow->IDStack.Num();
+}
+
+// Compare to detect usage errors
+void ImSlateStackSizes::CompareWithCurrentState()
+{
+	ImSlateContext& g = *GImSlate;
+	ImSlateWindow* MyWindow = g.CurrentWindow;
+	check(MyWindow);
+
+	// Window stacks
+	// NOT checking: DC.ItemWidth, DC.TextWrapPos (per MyWindow) to allow user to conveniently push once and not pop (they are cleared on Begin)
+	// checkf(SizeOfIDStack == MyWindow->IDStack.Num(), TEXT("PushID/PopID or TreeNode/TreePop Mismatch!"));
+
+	// Global stacks
+	// For color, style and font stacks there is an incentive to use Push/Begin/Pop/.../End patterns, so we relax our checks a little to allow them.
+	checkf(SizeOfBeginPopupStack == g.BeginPopupStack.Num(), TEXT("BeginPopup/EndPopup or BeginMenu/EndMenu Mismatch!"));
+}
+
+static void SetWindowConditionAllowFlags(ImSlateWindow* MyWindow, ImSlateCond Cond, bool bEnabled)
+{
+	MyWindow->SetWindowPosAllowFlags = bEnabled ? (MyWindow->SetWindowPosAllowFlags | Cond) : (MyWindow->SetWindowPosAllowFlags & ~Cond);
+	MyWindow->SetWindowSizeAllowFlags = bEnabled ? (MyWindow->SetWindowSizeAllowFlags | Cond) : (MyWindow->SetWindowSizeAllowFlags & ~Cond);
+	MyWindow->SetWindowCollapsedAllowFlags = bEnabled ? (MyWindow->SetWindowCollapsedAllowFlags | Cond) : (MyWindow->SetWindowCollapsedAllowFlags & ~Cond);
+	MyWindow->SetWindowDockAllowFlags = bEnabled ? (MyWindow->SetWindowDockAllowFlags | Cond) : (MyWindow->SetWindowDockAllowFlags & ~Cond);
+	MyWindow->SetWindowTitleAllowFlags = bEnabled ? (MyWindow->SetWindowTitleAllowFlags | Cond) : (MyWindow->SetWindowTitleAllowFlags & ~Cond);
+}
+
+void SetWindowPos(ImSlateWindow* MyWindow, const ImVec2& Pos, ImSlateCond Cond)
+{
+	// Test condition (NB: bit 0 is always true) and clear flags for next time
+	if (Cond && (MyWindow->SetWindowPosAllowFlags & Cond) == 0)
+		return;
+
+	check(Cond == 0 || FMath::IsPowerOfTwo(Cond));  // Make sure the user doesn't attempt to combine multiple condition flags.
+	MyWindow->SetWindowPosAllowFlags &= ~ImSlateCond_FirstClearMask;
+	MyWindow->SetWindowPosVal = ImVec2(FLT_MAX, FLT_MAX);
+
+	MyWindow->DragingWindowPos(Pos, Pos);
+}
+
+void SetWindowSize(ImSlateWindow* MyWindow, const ImVec2& Size, ImSlateCond Cond)
+{
+	// Test condition (NB: bit 0 is always true) and clear flags for next time
+	if (Cond && (MyWindow->SetWindowSizeAllowFlags & Cond) == 0)
+		return;
+
+	check(Cond == 0 || FMath::IsPowerOfTwo(Cond));  // Make sure the user doesn't attempt to combine multiple condition flags.
+	MyWindow->SetWindowSizeAllowFlags &= ~ImSlateCond_FirstClearMask;
+
+	// Set
+	MyWindow->SetWindowSize(Size);
+}
+void SetWindowContentSize(ImSlateWindow* MyWindow, const ImVec2& Size, ImSlateCond Cond)
+{
+	// Test condition (NB: bit 0 is always true) and clear flags for next time
+	if (Cond && (MyWindow->SetWindowSizeAllowFlags & Cond) == 0)
+		return;
+
+	check(Cond == 0 || FMath::IsPowerOfTwo(Cond));  // Make sure the user doesn't attempt to combine multiple condition flags.
+	MyWindow->SetWindowSizeAllowFlags &= ~ImSlateCond_FirstClearMask;
+
+	// Set
+	MyWindow->SetWindowContentSize(Size);
+}
+void SetWindowCollapsed(ImSlateWindow* MyWindow, bool bCollapsed, ImSlateCond Cond)
+{
+	// Test condition (NB: bit 0 is always true) and clear flags for next time
+	if (Cond && (MyWindow->SetWindowCollapsedAllowFlags & Cond) == 0)
+		return;
+	MyWindow->SetWindowCollapsedAllowFlags &= ~ImSlateCond_FirstClearMask;
+
+	// Set
+	MyWindow->Collapsed = bCollapsed;
+}
+
+void SetWindowTopmost(ImSlateWindow* MyWindow, bool bTopmost, ImSlateCond Cond)
+{
+	// Test condition (NB: bit 0 is always true) and clear flags for next time
+	if (Cond && (MyWindow->SetWindowTopmostAllowFlags & Cond) == 0)
+		return;
+	MyWindow->SetWindowTopmostAllowFlags &= ~ImSlateCond_FirstClearMask;
+
+	// Set
+	if (bTopmost)
+		MyWindow->DisplayOrder = INT_MAX;
+	else if (MyWindow->DisplayOrder == INT_MAX)
+		MyWindow->DisplayOrder = INT_MAX - 1;
+}
+
+void SetWindowBgAlpha(ImSlateWindow* MyWindow, float Alpha, ImSlateCond Cond)
+{
+	// Test condition (NB: bit 0 is always true) and clear flags for next time
+	if (Cond && (MyWindow->SetWindowByAlphaAllowFlags & Cond) == 0)
+		return;
+	MyWindow->SetWindowByAlphaAllowFlags &= ~ImSlateCond_FirstClearMask;
+
+	// Set
+	MyWindow->SetBgAlpha(Alpha);
+}
+
+void SetWindowTitle(ImSlateWindow* MyWindow, const FText& InTitle, ImSlateCond Cond)
+{
+	// Test condition (NB: bit 0 is always true) and clear flags for next time
+	if (Cond && (MyWindow->SetWindowTitleAllowFlags & Cond) == 0)
+		return;
+	MyWindow->SetWindowTitleAllowFlags &= ~ImSlateCond_FirstClearMask;
+
+	// Set
+	MyWindow->SetTitleText(InTitle);
+}
+
+void SetWindowFocus(ImSlateWindow* MyWindow, ImSlateCond Cond = 0)
+{
+	if (MyWindow)
+		FSlateApplication::Get().SetAllUserFocus(MyWindow->ToSharedRef());
+}
+
+void UpdateWindowParentAndRootLinks(ImSlateWindow* MyWindow, ImSlateWindowFlags InFlags, ImSlateWindow* parent_window)
+{
+	// MyWindow->ParentWindow = parent_window;
+	// 	MyWindow->RootWindow = MyWindow->RootWindowPopupTree = MyWindow->RootWindowDockTree = MyWindow->RootWindowForTitleBarHighlight = MyWindow->RootWindowForNav = MyWindow;
+	// 	if (parent_window && (flags & ImSlateWindowFlags_Popup))
+	// 		MyWindow->RootWindowPopupTree = parent_window->RootWindowPopupTree;
+	// 	while (MyWindow->RootWindowForNav->Flags & ImSlateWindowFlags_NavFlattened)
+	// 	{
+	// 		IM_ASSERT(MyWindow->RootWindowForNav->ParentWindow != NULL);
+	// 		MyWindow->RootWindowForNav = MyWindow->RootWindowForNav->ParentWindow;
+	// 	}
+}
+
+template<typename T = SImSlateViewport>
+static T* GetViewportImpl()
+{
+	auto& g = *GImSlate;
+#if WITH_EDITOR
+	for (auto& Viewport : g.Viewports)
+	{
+		if constexpr (std::is_same<T, SImSlateViewport>::value)
+		{
+			return &Viewport.Get();
+		}
+		else if constexpr (std::is_same<T, SImViewportGame>::value)
+		{
+			if (Viewport->IsGameViewport())
+				return static_cast<T*>(&Viewport.Get());
+		}
+		else
+		{
+			if (!Viewport->IsGameViewport())
+				return static_cast<T*>(&Viewport.Get());
+		}
+	}
+	return nullptr;
+#else
+	check(g.Viewports.Num() && (std::is_same<T, SImViewportGame>::value || g.Viewports[0]->IsGameViewport()));
+	return static_cast<T*>(&g.Viewports[0].Get());
+#endif
+}
+
+static void WindowSelectViewport(ImSlateWindow* MyWindow)
+{
+	auto Viewport = MyWindow->Viewport;
+#if WITH_EDITOR && 0
+	if (Viewport == nullptr)
+	{
+		Viewport = GetViewportImpl();
+		Viewport = MyWindow->SelectViewport();
+	}
+#endif
+	MyWindow->MoveToViewport(Viewport);
+	MyWindow->UpdateViewport();
+}
+
+SImViewportGame* GetGameViewportImpl()
+{
+	return GetViewportImpl<SImViewportGame>();
+}
+
+SImSlateViewport* GetWindowViewport()
+{
+	ImSlateContext& g = *GImSlate;
+	check(g.CurrentViewport != nullptr && g.CurrentViewport == g.CurrentWindow->Viewport);
+	return g.CurrentViewport;
+}
+
+void BeginFrameImpl(float DeltaTime, ImSlateContext* Ptr)
+{
+	ImSlateContext& g = *Ptr;
+	ensure(!g.bIsFrameStarted);
+	if (!g.bIsFrameStarted && g.bIsFrameEnded)
+	{
+		g.Time += DeltaTime;
+		g.WithinFrameScope = true;
+		g.FrameCount = GFrameNumber;
+		// g.WithinFrameScopeWithImplicitWindow = true;
+
+		//g.CurrentWindowStack.Reset(0);
+		//g.BeginPopupStack.Reset(0);
+
+		g.NextWindowData.ClearFlags();
+		g.NextItemData.ClearFlags();
+
+		g.bIsFrameEnded = false;
+		g.bIsFrameStarted = true;
+	}
+}
+void EndFrameImpl(ImSlateContext* Ptr)
+{
+	ImSlateContext& g = *Ptr;
+	ensure(!g.bIsFrameEnded);
+	if (g.bIsFrameStarted && !g.bIsFrameEnded)
+	{
+		ensureMsgf(g.IDStack.StackInfos.Num() == 1, TEXT("Begin/End mismatch!!!"));
+		// g.WithinFrameScopeWithImplicitWindow = false;
+		if (g.CurrentWindow && !g.CurrentWindow->WriteAccessed)
+			g.CurrentWindow->Active = false;
+
+		// End frame
+		g.ReferencedObjects.SetNum(0, false);
+		g.WithinFrameScope = false;
+		g.FrameCountEnded = g.FrameCount;
+
+		g.LastWindowsById = MoveTemp(g.WindowsById);
+		g.LastHostById = MoveTemp(g.HostById);
+
+		g.bIsFrameStarted = false;
+		g.bIsFrameEnded = true;
+	}
+}
+
+IMSLATE_API void BeginFrame(float DeltaTime)
+{
+	BeginFrameImpl(DeltaTime, GImSlate);
+}
+IMSLATE_API void EndFrame()
+{
+	EndFrameImpl(GImSlate);
+}
+
+static SImSlateWindow* FindWindowById(uint32 Id)
+{
+	ImSlateContext& g = *GImSlate;
+	if (auto Find = g.WindowsById.Find(Id))
+	{
+		return &Find->Get();
+	}
+	if (auto Find = g.LastWindowsById.Find(Id))
+	{
+		return &Find->Get();
+	}
+
+	return nullptr;
+}
+
+SImSlateWindow* FindWindowByName(ImStr Name)
+{
+	uint32 id = ImSlateIdStack::FullHash(Name.GetData(), Name.Len());
+	return FindWindowById(id);
+}
+
+SImSlateWindow* FindWindowByStackName(ImStr Name)
+{
+	ImSlateContext& g = *GImSlate;
+	uint32 id = g.IDStack.GetId(Name.GetData(), Name.Len());
+	return FindWindowById(id);
+}
+
+static void SetCurrentWindow(ImSlateWindow* MyWindow)
+{
+	ImSlateContext& g = *GImSlate;
+	g.CurrentWindow = MyWindow;
+}
+
+static SImSlateWindow* CreateNewWindowImpl(uint32 InWindowID, ImStr Name, ImWindowFlags Flags)
+{
+	ImSlateContext& g = *GImSlate;
+	auto SlateWindowPtr = SNew(SImSlateWindow, InWindowID)
+							.Flags(Flags)
+							.Title(Name.StartsWith("##") ? FText::GetEmpty() : FText::FromString(Name.GetData()));
+	SImSlateWindow* Window = &SlateWindowPtr.Get();
+#if WITH_EDITOR
+	Window->PIEInstanceID = g.PIEInstanceID;
+#endif
+	g.WindowsById.Add(Window->WindowId, SlateWindowPtr);
+	return Window;
+}
+
+static SImSlateWindow* CreateNewWindow(ImStr Name, ImWindowFlags Flags)
+{
+	ImSlateContext& g = *GImSlate;
+	auto WindowId = g.IDStack.GetId(Name.GetData(), Name.Len());
+	return CreateNewWindowImpl(WindowId, Name, Flags);
+}
+
+static bool FindOrCreateWindow(ImStr StackName, ImWindowFlags Flags, SImSlateWindow*& OutWindow)
+{
+	ImSlateContext& g = *GImSlate;
+	auto WindowId = g.IDStack.Push(StackName.GetData(), StackName.Len());
+	SImSlateWindow* MyWindow = FindWindowById(WindowId);
+	if (!MyWindow)
+	{
+		UE_LOG(LogImSlate, Log, TEXT("FindOrCreateWindow Not Find: WindowId: %d"), WindowId);
+	}
+	OutWindow = (!MyWindow) ? CreateNewWindowImpl(WindowId, StackName, Flags) : &g.WindowsById.Add(MyWindow->WindowId, MyWindow->ToSharedRef()).Get();
+	return !MyWindow;
+}
+
+void PushId(ImStr StrId)
+{
+	ImSlateContext& g = *GImSlate;
+	g.IDStack.Push(StrId);
+}
+
+void PushId(const void* PtrId)
+{
+	ImSlateContext& g = *GImSlate;
+	char Tmp[256];
+	auto Cnt = snprintf(Tmp, 255, "%p", PtrId);
+	g.IDStack.Push(Tmp, Cnt);
+}
+
+void PushId(int32 IntId)
+{
+	ImSlateContext& g = *GImSlate;
+	char Tmp[32];
+	auto Cnt = snprintf(Tmp, 31, "%d", IntId);
+	g.IDStack.Push(Tmp, Cnt);
+}
+
+void PopId()
+{
+	ImSlateContext& g = *GImSlate;
+	g.IDStack.Pop();
+}
+
+uint32 GetId(ImStr StrId)
+{
+	ImSlateContext& g = *GImSlate;
+	return g.IDStack.GetId(StrId);
+}
+
+uint32 GetId(const void* ptr_id)
+{
+	ImSlateContext& g = *GImSlate;
+	char tmp[256];
+	auto cnt = snprintf(tmp, 255, "%p", ptr_id);
+	return g.IDStack.GetId(tmp, cnt);
+}
+template<typename T>
+uint32 TestId(const T& Val)
+{
+	return GetId(Val);
+}
+
+struct ImSlateScopedId
+{
+	template<typename... TArgs>
+	ImSlateScopedId(const TArgs&... Args)
+	{
+		PushId(Args...);
+	}
+	~ImSlateScopedId() { PopId(); }
+	uint32 GetId() const { return GImSlate->IDStack.GetId(); }
+	operator uint32() const { return GetId(); }
+};
+
+static void SetWindowViewport(ImSlateWindow* MyWindow, ImSlateViewport*& InViewport)
+{
+	check(MyWindow && InViewport);
+
+	ImSlateContext& g = *GImSlate;
+	g.CurrentViewport = InViewport;
+
+	if (!InViewport->IsGameViewport())
+	{
+		TSharedPtr<FViewportPopupHolder> Holder;
+		auto Shared = StaticCastSharedRef<SImSlateViewport>(InViewport->AsShared());
+		if (g.LastHostById.RemoveAndCopyValue(Shared, Holder))
+		{
+			// keep host lifecycle
+			g.HostById.Emplace(Shared, MoveTemp(Holder));
+		}
+	}
+
+	if (MyWindow->ViewportOwned && MyWindow->Viewport != InViewport)
+	{
+		check(MyWindow->Viewport->Window == MyWindow);
+		MyWindow->Viewport->RemoveWindow(MyWindow->ToSharedRef());
+	}
+
+	MyWindow->Viewport = InViewport;
+	MyWindow->ViewportId = InViewport->ID;
+	MyWindow->ViewportOwned = (InViewport->Window == MyWindow);
+}
+
+void SetCurrentViewport(SImSlateWindow* CurrentWindow, SImSlateViewport* InViewport)
+{
+#if 1
+	check(CurrentWindow && InViewport);
+
+	ImSlateContext& g = *GImSlate;
+	g.CurrentViewport = InViewport;
+
+	if (!InViewport->IsGameViewport())
+	{
+		TSharedPtr<FViewportPopupHolder> Holder;
+		auto Shared = StaticCastSharedRef<SImSlateViewport>(InViewport->AsShared());
+		if (g.LastHostById.RemoveAndCopyValue(Shared, Holder))
+		{
+			// keep host lifecycle
+			g.HostById.Emplace(Shared, MoveTemp(Holder));
+		}
+	}
+#endif
+}
+
+ImSlateViewport* FindViewportByID(ImSlateId InId)
+{
+	ImSlateContext& g = *GImSlate;
+	for (int n = 0; n < g.Viewports.Num(); ++n)
+	{
+		if (g.Viewports[n]->ID == InId)
+			return &g.Viewports[n].Get();
+	}
+	return nullptr;
+}
+
+//////////////////////////////////////////////////////////////////////////
+void SetWindowPos(ImStr Name, const ImVec2& Pos, ImSlateCond Cond)
+{
+	if (auto MyWindow = FindWindowByName(Name))
+		SetWindowPos(MyWindow, Pos, Cond);
+}
+void SetWindowSize(ImStr Name, const ImVec2& Size, ImSlateCond Cond)
+{
+	if (auto MyWindow = FindWindowByName(Name))
+		SetWindowSize(MyWindow, Size, Cond);
+}
+void SetWindowCollapsed(ImStr Name, bool bCollapsed, ImSlateCond Cond)
+{
+	if (auto MyWindow = FindWindowByName(Name))
+		SetWindowCollapsed(MyWindow, bCollapsed, Cond);
+}
+void SetWindowTopmost(ImStr Name, bool bTopmost, ImSlateCond Cond)
+{
+	if (auto MyWindow = FindWindowByName(Name))
+		SetWindowTopmost(MyWindow, bTopmost, Cond);
+}
+void SetWindowBgAlpha(ImStr Name, float Alpha, ImSlateCond Cond)
+{
+	if (auto MyWindow = FindWindowByName(Name))
+		SetWindowBgAlpha(MyWindow, Alpha, Cond);
+}
+void SetWindowTitle(ImStr Name, const FText& InTitle, ImSlateCond Cond)
+{
+	if (auto MyWindow = FindWindowByName(Name))
+		SetWindowTitle(MyWindow, InTitle, Cond);
+}
+
+void SetCurrentWindowTitle(TFunctionRef<FText()> InTitle, ImSlateCond Cond)
+{
+	if (auto MyWindow = GetCurrentWindow())
+	{
+		// Test condition (NB: bit 0 is always true) and clear flags for next time
+		if (Cond && (MyWindow->SetWindowTitleAllowFlags & Cond) == 0)
+			return;
+
+		MyWindow->SetWindowTitleAllowFlags &= ~ImSlateCond_FirstClearMask;
+		// Set
+		MyWindow->SetTitleText(InTitle());
+	}
+}
+
+void SetWindowFocus(ImStr name, ImSlateCond Cond)
+{
+	if (auto MyWindow = FindWindowByName(name))
+		SetWindowFocus(MyWindow, Cond);
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+bool Begin(ImStr Name, bool* bIsOpen, ImWindowFlags Flags, int32 Id)
+{
+	// Automatically disable manual moving/resizing when NoInputs is set
+	if ((Flags & ImSlateWindowFlags_NoInputs) == ImSlateWindowFlags_NoInputs)
+		Flags |= ImSlateWindowFlags_NoMove | ImSlateWindowFlags_NoResize;
+
+	if (Flags & ImSlateWindowFlags_NavFlattened)
+		check(Flags & ImSlateWindowFlags_ChildWindow);
+
+	if (bIsOpen)
+		Flags |= ImSlateWindowFlags_ShowCloseButton;
+
+	ImSlateContext& g = *GImSlate;
+
+	// Find or create
+	SImSlateWindow* CurWindow = nullptr;
+	const bool bWindowJustCreated = FindOrCreateWindow(Name, Flags, CurWindow);
+	g.WindowStack.Push(CurWindow);
+
+	const auto CurFrame = g.FrameCount;
+	const bool bFirstBeginOfTheFrame = (CurWindow->LastFrameActive != CurFrame);
+	bool bWindowJustActivatedByUser = (CurWindow->LastFrameActive < CurFrame - 1);
+	if (Flags & ImSlateWindowFlags_Popup)
+	{
+		ImSlatePopupData& PopupRef = g.OpenPopupStack.Last();
+		bWindowJustActivatedByUser |= (CurWindow->PopupId != PopupRef.PopupId);  // We recycle popups so treat MyWindow as activated if popup id changed
+		bWindowJustActivatedByUser |= (CurWindow != PopupRef.Window);
+	}
+
+	// Update Flags, LastFrameActive fields
+	const bool bWindowWasAppearing = CurWindow->Appearing;
+	if (bFirstBeginOfTheFrame)
+	{
+		CurWindow->Appearing = bWindowJustActivatedByUser;
+		if (CurWindow->Appearing)
+			SetWindowConditionAllowFlags(CurWindow, ImSlateCond_Appearing, true);
+
+		CurWindow->FlagsPreviousFrame = CurWindow->Flags;
+		CurWindow->Flags = (ImSlateWindowFlags)Flags;
+		CurWindow->LastFrameActive = CurFrame;
+	}
+	else
+	{
+		Flags = CurWindow->Flags;
+	}
+
+	// Add to stack
+	// We intentionally set g.CurrentWindow to NULL to prevent usage until when the viewport is set, then will call SetCurrentWindow()
+	g.CurrentWindow = CurWindow;
+	ImSlateWindowStackData WindowStackData;
+	WindowStackData.Window = CurWindow;
+	WindowStackData.ParentLastItemDataBackup = g.LastItemData;
+	WindowStackData.StackSizesOnBegin.SetToCurrentState();
+	g.CurrentWindowStack.Push(WindowStackData);
+
+	g.CurrentWindow = nullptr;
+	if (Flags & ImSlateWindowFlags_Popup)
+	{
+		ImSlatePopupData& PopupRef = g.OpenPopupStack.Last();
+		PopupRef.Window = CurWindow;
+		g.BeginPopupStack.Push(PopupRef);
+		CurWindow->PopupId = PopupRef.PopupId;
+	}
+
+	// Code explicitly request a viewport
+	const bool bLockViewport = g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasViewport;
+	if (bLockViewport)
+	{
+		CurWindow->Viewport = FindViewportByID(g.NextWindowData.ViewportId);
+		CurWindow->ViewportId = g.NextWindowData.ViewportId;
+	}
+
+	// Init
+	if (bFirstBeginOfTheFrame)
+	{
+		// Initialize
+		CurWindow->Active = true;
+		WindowSelectViewport(CurWindow);
+		SetWindowViewport(CurWindow, CurWindow->Viewport);
+		Flags = CurWindow->Flags;
+	}
+	else
+	{
+		SetWindowViewport(CurWindow, CurWindow->Viewport);
+	}
+	CurWindow->CheckCloseButton(bIsOpen);
+
+	// Process SetNextWindow***() calls
+	// (FIXME: Consider splitting the HasXXX flags into X/Y components
+	bool bWindowPosSetByApi = false;
+	bool bWindowSizeXSetByApi = false;
+	bool bWindowSizeYSetByApi = false;
+
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasSize)
+	{
+		bWindowSizeXSetByApi = (CurWindow->SetWindowSizeAllowFlags & g.NextWindowData.SizeCond) != 0 && (g.NextWindowData.SizeVal.X > 0.0f);
+		bWindowSizeYSetByApi = (CurWindow->SetWindowSizeAllowFlags & g.NextWindowData.SizeCond) != 0 && (g.NextWindowData.SizeVal.Y > 0.0f);
+		SetWindowSize(CurWindow, g.NextWindowData.SizeVal, g.NextWindowData.SizeCond);
+	}
+
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasContentSize)
+	{
+		bWindowSizeXSetByApi = (CurWindow->SetWindowSizeAllowFlags & g.NextWindowData.ContentSizeCond) != 0 && (g.NextWindowData.ContentSizeVal.X > 0.0f);
+		bWindowSizeYSetByApi = (CurWindow->SetWindowSizeAllowFlags & g.NextWindowData.ContentSizeCond) != 0 && (g.NextWindowData.ContentSizeVal.Y > 0.0f);
+		SetWindowContentSize(CurWindow, g.NextWindowData.ContentSizeVal, g.NextWindowData.ContentSizeCond);
+	}
+
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasResizeCallback && g.NextWindowData.ResizeCallback)
+	{
+		CurWindow->ResizeCallback = MoveTemp(g.NextWindowData.ResizeCallback);
+	}
+
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasPos)
+	{
+		bWindowPosSetByApi = (CurWindow->SetWindowPosAllowFlags & g.NextWindowData.PosCond) != 0;
+		if (bWindowPosSetByApi && g.NextWindowData.PosPivotVal.HasValidSize())
+		{
+			// May be processed on the next frame if this is our first frame and we are measuring size
+			// FIXME: Look into removing the branch so everything can go through this same code path for consistency.
+			CurWindow->SetWindowPosVal = g.NextWindowData.PosVal;
+			CurWindow->SetWindowPosPivot = g.NextWindowData.PosPivotVal;
+			// CurWindow->SetWindowPosAllowFlags &= ~ImSlateCond_FirstClearMask;
+		}
+		SetWindowPos(CurWindow, g.NextWindowData.PosVal, g.NextWindowData.PosCond);
+	}
+
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasTitle)
+		SetWindowTitle(CurWindow, g.NextWindowData.TitleVal, g.NextWindowData.TitleCond);
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasScroll)
+		CurWindow->SetScrollTarget(g.NextWindowData.ScrollVal);
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasBgAlpha)
+		SetWindowBgAlpha(CurWindow, g.NextWindowData.BgAlphaVal, g.NextWindowData.BgAlphaCond);
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasCollapsed)
+		SetWindowCollapsed(CurWindow, g.NextWindowData.CollapsedVal, g.NextWindowData.CollapsedCond);
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasTopmost)
+		SetWindowTopmost(CurWindow, g.NextWindowData.TopmostVal, g.NextWindowData.TopmostCond);
+
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasFocus)
+		SetWindowFocus(CurWindow);
+
+	if (!bWindowJustCreated)
+		SetWindowConditionAllowFlags(CurWindow, ImSlateCond_Appearing, false);
+
+	g.CurrentWindow = CurWindow;
+	// Clear 'accessed' flag last thing (After PushClipRect which will set the flag.
+	// We want the flag to stay false when the default "Debug" MyWindow is unused)
+	CurWindow->BeginCount++;
+	g.NextWindowData.ClearFlags();
+
+	// Update visibility
+	if (bFirstBeginOfTheFrame)
+	{
+#if WITH_EDITOR
+		if (CurWindow->SkipItems && !CurWindow->Appearing)
+		{
+			check(CurWindow->Appearing == false);
+		}
+#endif
+	}
+
+	return !CurWindow->SkipItems;
+}
+
+void End()
+{
+	ImSlateContext& g = *GImSlate;
+	ImSlateWindow* MyWindow = g.CurrentWindow;
+	check(MyWindow);
+
+	g.NextItemData.ClearFlags();
+
+	// Error checking: verify that user hasn't called End() too many times!
+	if (g.CurrentWindowStack.Num() <= 1 && g.WithinFrameScopeWithImplicitWindow)
+	{
+		checkf(g.CurrentWindowStack.Num() > 1, TEXT("Calling End() too many times!"));
+		return;
+	}
+	check(g.CurrentWindowStack.Num() > 0);
+
+	checkSlow(g.CurrentWindow && g.WindowStack.Last() == g.CurrentWindow);
+	g.WindowStack.Pop();
+
+	// Error checking: verify that user doesn't directly call End() on a child MyWindow.
+	if ((MyWindow->Flags & ImSlateWindowFlags_ChildWindow) && !(MyWindow->Flags & ImSlateWindowFlags_DockNodeHost))
+		checkf(g.WithinEndChild, TEXT("Must call EndChild() and not End()!"));
+
+	// Pop from MyWindow stack
+	g.LastItemData = g.CurrentWindowStack.Last().ParentLastItemDataBackup;
+	if (MyWindow->Flags & ImSlateWindowFlags_Popup)
+		g.BeginPopupStack.Pop(false);
+	g.CurrentWindowStack.Last().StackSizesOnBegin.CompareWithCurrentState();
+	g.CurrentWindowStack.Pop(false);
+	SetCurrentWindow(g.CurrentWindowStack.Num() == 0 ? nullptr : g.CurrentWindowStack.Last().Window);
+	if (g.CurrentWindow)
+		SetWindowViewport(g.CurrentWindow, g.CurrentWindow->Viewport);
+	MyWindow->LastFrameEnded = g.FrameCount;
+	g.IDStack.Pop();
+}
+
+ImSlateWindow* GetCurrentWindowRead()
+{
+	ImSlateContext& g = *GImSlate;
+	return g.CurrentWindow;
+}
+
+ImSlateWindow* GetCurrentWindow()
+{
+	ImSlateContext& g = *GImSlate;
+	return g.CurrentWindow;
+}
+
+void SetNextWindowPos(const ImVec2& Pos, ImSlateCond Cond, const ImVec2& Pivot)
+{
+	ImSlateContext& g = *GImSlate;
+	check(Cond == 0 || FMath::IsPowerOfTwo(Cond));
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasPos;
+	g.NextWindowData.PosVal = Pos;
+	g.NextWindowData.PosPivotVal = Pivot;
+	g.NextWindowData.PosCond = Cond ? Cond : ImSlateCond_Always;
+	g.NextWindowData.PosUndock = true;
+}
+
+void SetNextWindowSize(const ImVec2& Size, ImSlateCond Cond)
+{
+	ImSlateContext& g = *GImSlate;
+	check(Cond == 0 || FMath::IsPowerOfTwo(Cond));
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasSize;
+	g.NextWindowData.SizeVal = Size;
+	g.NextWindowData.SizeCond = Cond ? Cond : ImSlateCond_Always;
+}
+
+void SetNextContentSize(const ImVec2& Size, ImSlateCond Cond)
+{
+	ImSlateContext& g = *GImSlate;
+	check(Cond == 0 || FMath::IsPowerOfTwo(Cond));
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasContentSize;
+	g.NextWindowData.ContentSizeVal = Size;
+	g.NextWindowData.ContentSizeCond = Cond ? Cond : ImSlateCond_Always;
+}
+
+void SetNextWindowContentSize(const ImVec2& Size)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasContentSize;
+	g.NextWindowData.ContentSizeVal = Size;
+}
+
+void SetNextWindowCollapsed(bool bCollapsed, ImSlateCond Cond)
+{
+	ImSlateContext& g = *GImSlate;
+	check(Cond == 0 || FMath::IsPowerOfTwo(Cond));
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasCollapsed;
+	g.NextWindowData.CollapsedVal = bCollapsed;
+	g.NextWindowData.CollapsedCond = Cond ? Cond : ImSlateCond_Always;
+}
+
+void SetNextWindowTopmost(bool bTopmost, ImSlateCond Cond)
+{
+	ImSlateContext& g = *GImSlate;
+	check(Cond == 0 || FMath::IsPowerOfTwo(Cond));
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasTopmost;
+	g.NextWindowData.TopmostVal = bTopmost;
+	g.NextWindowData.TopmostCond = Cond ? Cond : ImSlateCond_Always;
+}
+
+void SetNextWindowFocus()
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasFocus;
+}
+
+void SetNextWindowBgAlpha(float Alpha, ImSlateCond Cond)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasBgAlpha;
+	g.NextWindowData.BgAlphaVal = Alpha;
+	g.NextWindowData.BgAlphaCond = Cond ? Cond : ImSlateCond_Always;
+}
+
+void SetNextWindowTitle(const FText& InTitle, ImSlateCond Cond)
+{
+	ImSlateContext& g = *GImSlate;
+	check(Cond == 0 || FMath::IsPowerOfTwo(Cond));
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasTitle;
+	g.NextWindowData.TitleVal = InTitle;
+	g.NextWindowData.TitleCond = Cond ? Cond : ImSlateCond_Always;
+}
+
+void SetNextWindowResizeCallback(ImSlateResizeCallback CustomCallback)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasResizeCallback;
+	g.NextWindowData.ResizeCallback = MoveTemp(CustomCallback);
+}
+
+void SetNextWindowViewport(ImSlateId InViewportId, ImSlateCond Cond)
+{
+	ImSlateContext& g = *GImSlate;
+	check(Cond == 0 || FMath::IsPowerOfTwo(Cond));
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasViewport;
+	g.NextWindowData.ViewportId = InViewportId;
+	g.NextWindowData.ViewportCond = Cond ? Cond : ImSlateCond_Always;
+}
+
+// void SetNextWindowViewport(uint32 viewport_id)
+// {
+// 	ImSlateContext& g = *GImSlate;
+// 	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasViewport;
+// 	g.NextWindowData.ViewportId = viewport_id;
+// }
+
+bool IsWindowValid(ImStr Name)
+{
+	ImSlateWindow* WindowPtr = FindWindowByName(Name);
+	if (WindowPtr)
+	{
+		return true;
+	}
+	return false;
+}
+
+bool IsWindowAppearing()
+{
+	ImSlateWindow* MyWindow = GetCurrentWindowRead();
+	return MyWindow->Appearing;
+}
+
+bool IsWindowCollapsed()
+{
+	ImSlateWindow* MyWindow = GetCurrentWindowRead();
+	return MyWindow->Collapsed;
+}
+
+bool IsWindowFocused(ImSlateFocusedFlags InFlags)
+{
+	ImSlateWindow* MyWindow = GetCurrentWindowRead();
+	return FSlateApplication::Get().GetCursorUser()->HasFocusedDescendants(MyWindow->ToSharedRef());
+}
+
+bool IsWindowHovered(ImSlateFocusedFlags InFlags)
+{
+	check((InFlags & (ImSlateHoveredFlags_AllowWhenOverlapped | ImSlateHoveredFlags_AllowWhenDisabled)) == 0);
+	ImSlateWindow* MyWindow = GetCurrentWindowRead();
+	return FSlateApplication::Get().GetCursorUser()->IsWidgetUnderCursor(MyWindow->ToSharedRef());
+}
+
+float GetWindowDpiScale()
+{
+	float DpiScale = FSlateApplication::Get().GetApplicationScale();
+	if (auto Window = GetCurrentWindowRead())
+	{
+		auto AbsPos = Window->GetCachedGeometry().GetAbsolutePosition();
+		DpiScale = SImSlateViewport::StaticGetDPIScaleFactorAtPoint(AbsPos);
+	}
+	return DpiScale;
+}
+
+ImVec2 GetWindowPos()
+{
+	ImSlateWindow* MyWindow = GetCurrentWindowRead();
+	return (ImVec2)MyWindow->GetCachedGeometry().GetAbsolutePosition();
+}
+
+ImVec2 GetWindowSize()
+{
+	ImSlateWindow* MyWindow = GetCurrentWindowRead();
+	return (ImVec2)MyWindow->GetCachedGeometry().GetAbsoluteSize();
+}
+
+ImVec2 GetWindowContentSize()
+{
+	ImSlateWindow* MyWindow = GetCurrentWindowRead();
+	return MyWindow->GetContentSize();
+}
+
+float GetWindowByAlpha()
+{
+	ImSlateWindow* MyWindow = GetCurrentWindowRead();
+	return MyWindow->GetColorAndOpacity().A;
+}
+
+float GetWindowWidth()
+{
+	return GetWindowSize().X;
+}
+
+float GetWindowHeight()
+{
+	return GetWindowSize().Y;
+}
+
+bool IsCurrentWindowEnded(ImSlateContext& g)
+{
+	return g.FrameCount == g.CurrentWindow->LastFrameEnded;
+}
+
+bool IsCurrentWindowEnded()
+{
+	ImSlateContext& g = *GImSlate;
+	return IsCurrentWindowEnded(g);
+}
+
+//////////////////////////////////////////////////////////////////////////
+namespace Internal
+{
+
+	static FItemSlotPod& AddWidgetImpl(ImSlateContext& g, ImStr name = "$__ImslateDummyItem__$", const TSharedRef<SWidget>& InWidget = SNullWidget::NullWidget)
+	{
+		auto ItemId = ImSlateScopedId(name);
+		SWidget* OutWidget = nullptr;
+		FItemSlotPod* Slot = g.CurrentWindow->FindItem(ItemId, &OutWidget);
+		if (!Slot)
+		{
+			FItemSlotPod ItemSlot;
+			auto Widget = InWidget;
+			Slot = &g.CurrentWindow->AddItem(ItemId, Widget);
+			OutWidget = &Widget.Get();
+			*Slot = ItemSlot;
+		}
+		else
+		{
+			FItemSlotPod ItemSlot = *Slot;
+			Slot = &g.CurrentWindow->AddItem(ItemId, OutWidget->AsShared());
+			*Slot = ItemSlot;
+		}
+		return *Slot;
+	}
+
+	static FItemSlotPod& FindOrCreateItemInWindow(ImSlateWindow* CurrentWindow, ImSlateId ItemId, const Internal::FWidgetFactoryType& WidgetConstruct, SWidget*& OutWidget)
+	{
+		check(CurrentWindow);
+		FItemSlotPod* Slot = CurrentWindow->FindItem(ItemId, &OutWidget);
+		if (!Slot)
+		{
+			FItemSlotPod ItemSlot;
+			auto Widget = WidgetConstruct(ItemSlot);
+			Slot = &CurrentWindow->AddItem(ItemId, Widget);
+			OutWidget = &Widget.Get();
+			*Slot = ItemSlot;
+		}
+		else
+		{
+			FItemSlotPod ItemSlot = *Slot;
+			Slot = &CurrentWindow->AddItem(ItemId, OutWidget->AsShared());
+			*Slot = ItemSlot;
+		}
+		return *Slot;
+	}
+
+	SWidget* Item(ImStr Name, const FWidgetFactoryType& WidgetConstruct)
+	{
+		SWidget* WidgetPtr = nullptr;
+		ImSlateContext& g = *GImSlate;
+		if (!IsCurrentWindowEnded(g))
+		{
+			auto ItemId = ImSlateScopedId(Name);
+			auto& Slot = FindOrCreateItemInWindow(g.CurrentWindow, ItemId, WidgetConstruct, WidgetPtr);
+			Slot.ApplyNextItem(g.NextItemData);
+			g.NextItemData.ClearFlags();
+			g.NextItemData.Flags |= ImSlateNextItemDataFlags_NewRow;
+			g.NextItemData.bNewRow = true;
+		}
+		return WidgetPtr;
+	}
+}  // namespace Internal
+
+void FItemSlotPod::ApplyNextItem(const ImSlateNextItemData& NextItemData)
+{
+	// NewLine/SameLine
+	bNewRow = !!(NextItemData.Flags & ImSlateNextItemDataFlags_NewRow);
+
+	// Padding
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_Padding)
+		SlotPadding = NextItemData.SlotPadding;
+
+	// min/max size
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_MaxWidth)
+		MaxWidth = NextItemData.MaxWidth;
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_MaxHeight)
+		MaxHeight = NextItemData.MaxHeight;
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_MinWidth)
+		MinWidth = NextItemData.MinWidth;
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_MinHeight)
+		MinHeight = NextItemData.MinHeight;
+
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_FillWidth)
+	{
+		// fill
+		bFillWidth = NextItemData.bFillWidth;
+		StretchValue = NextItemData.StretchValue;
+	}
+	else if (NextItemData.Flags & ImSlateNextItemDataFlags_Stretch)
+	{
+		// stretch
+		StretchValue = NextItemData.StretchValue;
+	}
+
+	// align to col
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_AlignCol)
+	{
+		bAlignCol = NextItemData.bAlignCol;
+		StretchToCol = NextItemData.StretchToCol;
+	}
+
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_Collapsed)
+		bCollapsed = NextItemData.bCollapsed;
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_HAlign)
+		HAlignment = NextItemData.HAlignment;
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_VAlign)
+		VAlignment = NextItemData.VAlignment;
+
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_Parent)
+		ParentIdx = NextItemData.ParentIdx;
+
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_AspectRatio)
+		AspectRatio = NextItemData.AspectRatio;
+}
+
+void SameLine()
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags &= ~ImSlateNextItemDataFlags_NewRow;
+	g.NextItemData.bNewRow = false;
+}
+void NewLine()
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_NewRow;
+	g.NextItemData.bNewRow = true;
+}
+
+void RightAlign(int32 Col)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_AlignCol;
+	g.NextItemData.bAlignCol = true;
+	g.NextItemData.StretchToCol = Col;
+}
+
+void StretchVal(float Val)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_Stretch;
+	g.NextItemData.bAlignCol = false;
+	g.NextItemData.StretchValue = Val;
+}
+
+void Spacing(float Val)
+{
+	ImSlateContext& g = *GImSlate;
+	if (!IsCurrentWindowEnded(g))
+	{
+		g.NextItemData.Flags |= ImSlateNextItemDataFlags_NewRow | ImSlateNextItemDataFlags_BreakLine | ImSlateNextItemDataFlags_MinHeight;
+		g.NextItemData.bNewRow = true;
+		g.NextItemData.bBreakLine = true;
+		g.NextItemData.SetMinHeight(Val);
+		auto& Slot = Internal::AddWidgetImpl(g);
+		Slot.ApplyNextItem(g.NextItemData);
+		g.NextItemData.ClearFlags();
+		g.NextItemData.Flags |= ImSlateNextItemDataFlags_NewRow;
+		g.NextItemData.bNewRow = true;
+	}
+}
+
+void Dummy(const ImVec2& Size)
+{
+	ImSlateContext& g = *GImSlate;
+	if (!IsCurrentWindowEnded(g))
+	{
+		g.NextItemData.Flags |= ImSlateNextItemDataFlags_MinWidth | ImSlateNextItemDataFlags_MinHeight;
+		g.NextItemData.SetMinWidth(Size.X);
+		g.NextItemData.SetMinHeight(Size.Y);
+		auto& Slot = Internal::AddWidgetImpl(g);
+		g.NextItemData.Flags |= ImSlateNextItemDataFlags_NewRow;
+		g.NextItemData.bNewRow = true;
+	}
+}
+
+bool FoldLine(ImStr Label, const FText& InText, float InHeight /*= 0.f*/)
+{
+	auto ItemPtr = Internal::Item<SImFoldLine>(Label, [&](FItemSlotPod& InItem) {
+		InItem.bNewRow = true;
+		InItem.bBreakLine = true;
+		InItem.SetMinHeight(InHeight);
+		TSharedRef<SImFoldLine> WidgetRef = ImFactoryCreate<UImFoldLine>();
+		return WidgetRef;
+	});
+
+	if (ItemPtr)
+	{
+		ItemPtr->SetText(InText);
+		return ItemPtr->GetIsFolded();
+	}
+	return false;
+}
+
+void Separator()
+{
+}
+
+void Indent(float IndentW /* = 0.0f*/)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_Padding;
+	g.NextItemData.SlotPadding.Left = IndentW;
+}
+
+void Unindent(float IndentW /* = 0.0f*/)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_Padding;
+	g.NextItemData.SlotPadding.Left = -IndentW;
+}
+
+static void SetItemCollapsed(FItemSlotPod& Data, float InWidth, ImSlateCond Cond)
+{
+}
+static void SetItemOpen(FItemSlotPod& Data, bool bOpen, ImSlateCond Cond)
+{
+}
+static void SetItemHAlignment(FItemSlotPod& Data, uint8 HAlign, ImSlateCond Cond)
+{
+}
+static void SetItemVAlignment(FItemSlotPod& Data, uint8 VAlign, ImSlateCond Cond)
+{
+}
+static void SetItemStretchToCol(FItemSlotPod& Data, int32 InCol, ImSlateCond Cond)
+{
+	Data.bAlignCol = true;
+	Data.StretchToCol = InCol;
+}
+static void SetItemMaxHeight(FItemSlotPod& Data, float Val, ImSlateCond Cond)
+{
+}
+static void SetItemMaxWidth(FItemSlotPod& Data, float Val, ImSlateCond Cond)
+{
+}
+
+void SetNextItemMinWidth(float InVal)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_MinWidth;
+	g.NextItemData.SetMinWidth(InVal);
+}
+
+void SetNextItemMinHeight(float InVal)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_MinHeight;
+	g.NextItemData.SetMinHeight(InVal);
+}
+void SetNextItemMinSize(float InWidth, float InHeight)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_MinHeight | ImSlateNextItemDataFlags_MinWidth;
+	g.NextItemData.SetMinWidth(InWidth);
+	g.NextItemData.SetMinHeight(InHeight);
+}
+
+void SetNextItemMaxWidth(float InVal)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_MaxWidth;
+	g.NextItemData.SetMaxWidth(InVal);
+}
+
+void SetNextItemMaxHeight(float InVal)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_MaxWidth;
+	g.NextItemData.SetMaxHeight(InVal);
+}
+void SetNextItemMaxSize(float InWidth, float InHeight)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_MaxHeight | ImSlateNextItemDataFlags_MaxWidth;
+	g.NextItemData.SetMaxWidth(InWidth);
+	g.NextItemData.SetMaxHeight(InHeight);
+}
+
+void SetNextItemFixSize(float InWidth, float InHeight)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_MaxHeight | ImSlateNextItemDataFlags_MaxWidth | ImSlateNextItemDataFlags_MinHeight | ImSlateNextItemDataFlags_MinWidth;
+	g.NextItemData.SetMaxWidth(InWidth).SetMinWidth(InWidth);
+	g.NextItemData.SetMaxHeight(InHeight).SetMinHeight(InHeight);
+}
+
+void SetNextItemAspectRatio(float InRatio)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_AspectRatio;
+	g.NextItemData.SetAspectRatio(InRatio);
+}
+
+void SetNextItemFillWidth(float InFactor)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_FillWidth;
+	g.NextItemData.bFillWidth = true;
+	g.NextItemData.StretchValue = InFactor;
+}
+}  // namespace ImSlate
+
+#include "ImSlateControls.inl"
