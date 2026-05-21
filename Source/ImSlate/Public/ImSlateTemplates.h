@@ -30,6 +30,8 @@
 #include "ImSlateTemplate/ImText.h"
 #include "ImSlateTemplate/ImVirtualComboButton.h"
 #include "ImSlateTemplate/ImVirtualList.h"
+#include "ImSlateTemplate/ImAssetPicker.h"
+#include "ImSlateTemplate/ImClassPicker.h"
 #include "ProtectFieldAccessor.h"
 
 //

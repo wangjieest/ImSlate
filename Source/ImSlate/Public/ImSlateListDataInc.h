@@ -33,6 +33,7 @@ protected:
 
 	virtual void OnPosChanged(float VirtualPos) {}
 	virtual void GenerateDataWidget(int32 InIndex, TSharedRef<SWidget>& InOutWidget) = 0;
+	virtual void ReleaseDataWidget(int32 InIndex, TSharedRef<SWidget>& ReleasedWidget) = 0;
 
 public:
 	void StartFiltering(UWorld* InWorld, const FGMPStructUnion& UnionData) { OnFilterStarted(InWorld, UnionData); }
@@ -41,12 +42,11 @@ public:
 	bool IsHeterogeneous() const { return bHeterogeneous; }
 	bool NeedPrepassItem() const { return bNeedPrepass; }
 
-protected:
-	IMSLATE_API float GetVirtualPos() const;
-
 	void ReloadToPos(float VirtualPos, bool bItemAlign = true) { SetVirtualPos(VirtualPos, bItemAlign, true); }
 	void ScrollToPos(float VirtualPos, bool bItemAlign = false) { SetVirtualPos(VirtualPos, bItemAlign, false); }
 
+protected:
+	IMSLATE_API float GetVirtualPos() const;
 	IMSLATE_API void ScrollToItem(int32 InIndex, bool bCenterAlign = false);
 	IMSLATE_API void UpdateItem(int32 InIndex = -1, bool bReConstructWidget = false);
 
@@ -75,6 +75,10 @@ public:
 	using FWidgetFactoryDelegate = TDelegate<void(DataType&, TSharedRef<S>&)>;
 	void SetWidgetFactory(FWidgetFactoryDelegate f) { OnWidgetBinding = MoveTemp(f); }
 	void SetWidgetFactory(TFunction<void(DataType&, TSharedRef<S>&)> f) { SetWidgetFactory(FWidgetFactoryDelegate::CreateLambda(MoveTemp(f))); }
+
+	using FOnBindingReleaseDelegate = TDelegate<void(int32, TSharedRef<S>)>;
+	void SetOnBindingRelease(FOnBindingReleaseDelegate f) { OnBindingRelease = MoveTemp(f); }
+	void SetOnBindingRelease(TFunction<void(int32, TSharedRef<S>)> f) { SetOnBindingRelease(FOnBindingReleaseDelegate::CreateLambda(MoveTemp(f))); }
 
 	using FItemAxisBindingDelegate = TDelegate<float(int32)>;
 	void SetItemAxisBinding(FItemAxisBindingDelegate f) { ItemAxisBinding = MoveTemp(f); }
@@ -241,6 +245,12 @@ protected:
 		check(CurDataArr.IsValidIndex(InIndex) && OnWidgetBinding.IsBound());
 		OnWidgetBinding.Execute(CurDataArr[InIndex], InOutWidget);
 	}
+	virtual void ReleaseDataWidget(int32 InIndex, TSharedRef<SWidget>& ReleasedWidget) override
+	{
+		//
+		OnBindingRelease.ExecuteIfBound(InIndex, StaticCastSharedRef<S>(ReleasedWidget));
+	}
+
 	virtual float GetItemAxis(int32 Index) const override { return ItemAxisBinding.IsBound() ? ItemAxisBinding.Execute(Index) : FallbackItemAxis; };
 
 	float FallbackItemAxis = 22.f;
@@ -249,6 +259,7 @@ protected:
 	TArray<DataType> OrignalData;
 
 	FOnBindingDataDelegate OnBindingData;
+	FOnBindingReleaseDelegate OnBindingRelease;
 	FOnScrolledEvent OnPosScrolled;
 	FWidgetFactoryDelegate OnWidgetBinding;
 	FItemAxisBindingDelegate ItemAxisBinding;

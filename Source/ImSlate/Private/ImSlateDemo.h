@@ -105,7 +105,6 @@ bool VirualList_Test(ImStr label, TSharedPtr<FImListViewItemBase>& InOutSelected
 
 struct FImComboBoxItem_Test
 	: public IImComboBoxItem
-	, public TSharedFromThis<FImComboBoxItem_Test>
 {
 	FImComboBoxItem_Test(const FString& InName)
 		: Val(InName)

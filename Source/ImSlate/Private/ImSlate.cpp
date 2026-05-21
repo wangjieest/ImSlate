@@ -270,7 +270,7 @@ void EndFrameImpl(ImSlateContext* Ptr)
 			g.CurrentWindow->Active = false;
 
 		// End frame
-		g.ReferencedObjects.SetNum(0, false);
+		g.ReferencedObjects.SetNum(0, EAllowShrinking::No);
 		g.WithinFrameScope = false;
 		g.FrameCountEnded = g.FrameCount;
 
@@ -608,6 +608,9 @@ bool Begin(ImStr Name, bool* bIsOpen, ImWindowFlags Flags, int32 Id)
 	// Init
 	if (bFirstBeginOfTheFrame)
 	{
+		// Begin in-place frame tracking for non-EventDrived panels
+		CurWindow->BeginItemFrame();
+
 		// Initialize
 		CurWindow->Active = true;
 		WindowSelectViewport(CurWindow);
@@ -722,12 +725,18 @@ void End()
 	// Pop from MyWindow stack
 	g.LastItemData = g.CurrentWindowStack.Last().ParentLastItemDataBackup;
 	if (MyWindow->Flags & ImSlateWindowFlags_Popup)
-		g.BeginPopupStack.Pop(false);
+		g.BeginPopupStack.Pop(EAllowShrinking::No);
 	g.CurrentWindowStack.Last().StackSizesOnBegin.CompareWithCurrentState();
-	g.CurrentWindowStack.Pop(false);
+	g.CurrentWindowStack.Pop(EAllowShrinking::No);
 	SetCurrentWindow(g.CurrentWindowStack.Num() == 0 ? nullptr : g.CurrentWindowStack.Last().Window);
 	if (g.CurrentWindow)
 		SetWindowViewport(g.CurrentWindow, g.CurrentWindow->Viewport);
+	// Commit frame in End() — like SlateIM's EndRoot(), all changes finalized during PreTick
+	if (!(MyWindow->Flags & ImSlateWindowFlags_EventDrived))
+	{
+		MyWindow->CommitItemFrame();
+	}
+
 	MyWindow->LastFrameEnded = g.FrameCount;
 	g.IDStack.Pop();
 }
@@ -810,6 +819,18 @@ void SetNextWindowBgAlpha(float Alpha, ImSlateCond Cond)
 	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasBgAlpha;
 	g.NextWindowData.BgAlphaVal = Alpha;
 	g.NextWindowData.BgAlphaCond = Cond ? Cond : ImSlateCond_Always;
+}
+
+void SetCurrentWindowColorAndOpacity(const FLinearColor& InColor)
+{
+	if (auto* MyWindow = GetCurrentWindow())
+		MyWindow->SetColorAndOpacity(InColor);
+}
+
+void SetCurrentWindowForegroundColor(const FSlateColor& InColor)
+{
+	if (auto* MyWindow = GetCurrentWindow())
+		MyWindow->SetForegroundColor(InColor);
 }
 
 void SetNextWindowTitle(const FText& InTitle, ImSlateCond Cond)
@@ -943,20 +964,20 @@ namespace Internal
 	{
 		auto ItemId = ImSlateScopedId(name);
 		SWidget* OutWidget = nullptr;
-		FItemSlotPod* Slot = g.CurrentWindow->FindItem(ItemId, &OutWidget);
-		if (!Slot)
+		int32 ExistingIndex = INDEX_NONE;
+		FItemSlotPod* Slot = g.CurrentWindow->FindItem(ItemId, &OutWidget, &ExistingIndex);
+		if (Slot && g.CurrentWindow->ReuseItem(ItemId, ExistingIndex))
 		{
+			// Reused existing slot in-place
+		}
+		else
+		{
+			// New item or duplicate ID — create new slot
 			FItemSlotPod ItemSlot;
 			auto Widget = InWidget;
 			Slot = &g.CurrentWindow->AddItem(ItemId, Widget);
 			OutWidget = &Widget.Get();
-			*Slot = ItemSlot;
-		}
-		else
-		{
-			FItemSlotPod ItemSlot = *Slot;
-			Slot = &g.CurrentWindow->AddItem(ItemId, OutWidget->AsShared());
-			*Slot = ItemSlot;
+			Slot->Apply(ItemSlot);  // Apply preserves Hash (identity)
 		}
 		return *Slot;
 	}
@@ -964,20 +985,20 @@ namespace Internal
 	static FItemSlotPod& FindOrCreateItemInWindow(ImSlateWindow* CurrentWindow, ImSlateId ItemId, const Internal::FWidgetFactoryType& WidgetConstruct, SWidget*& OutWidget)
 	{
 		check(CurrentWindow);
-		FItemSlotPod* Slot = CurrentWindow->FindItem(ItemId, &OutWidget);
-		if (!Slot)
+		int32 ExistingIndex = INDEX_NONE;
+		FItemSlotPod* Slot = CurrentWindow->FindItem(ItemId, &OutWidget, &ExistingIndex);
+		if (Slot && CurrentWindow->ReuseItem(ItemId, ExistingIndex))
 		{
+			// Reused existing slot in-place
+		}
+		else
+		{
+			// New item or duplicate ID — create new slot
 			FItemSlotPod ItemSlot;
 			auto Widget = WidgetConstruct(ItemSlot);
 			Slot = &CurrentWindow->AddItem(ItemId, Widget);
 			OutWidget = &Widget.Get();
-			*Slot = ItemSlot;
-		}
-		else
-		{
-			FItemSlotPod ItemSlot = *Slot;
-			Slot = &CurrentWindow->AddItem(ItemId, OutWidget->AsShared());
-			*Slot = ItemSlot;
+			Slot->Apply(ItemSlot);  // Apply preserves Hash (identity)
 		}
 		return *Slot;
 	}
@@ -990,7 +1011,10 @@ namespace Internal
 		{
 			auto ItemId = ImSlateScopedId(Name);
 			auto& Slot = FindOrCreateItemInWindow(g.CurrentWindow, ItemId, WidgetConstruct, WidgetPtr);
-			Slot.ApplyNextItem(g.NextItemData);
+			// Register item in tree (assigns current fold context as parent)
+			g.CurrentWindow->SetItemParent(ItemId);
+			if (Slot.ApplyNextItem(g.NextItemData))
+				g.CurrentWindow->MarkPanelLayoutDirty();
 			g.NextItemData.ClearFlags();
 			g.NextItemData.Flags |= ImSlateNextItemDataFlags_NewRow;
 			g.NextItemData.bNewRow = true;
@@ -999,8 +1023,10 @@ namespace Internal
 	}
 }  // namespace Internal
 
-void FItemSlotPod::ApplyNextItem(const ImSlateNextItemData& NextItemData)
+bool FItemSlotPod::ApplyNextItem(const ImSlateNextItemData& NextItemData)
 {
+	const FItemSlotPod Before = *this;
+
 	// NewLine/SameLine
 	bNewRow = !!(NextItemData.Flags & ImSlateNextItemDataFlags_NewRow);
 
@@ -1020,13 +1046,11 @@ void FItemSlotPod::ApplyNextItem(const ImSlateNextItemData& NextItemData)
 
 	if (NextItemData.Flags & ImSlateNextItemDataFlags_FillWidth)
 	{
-		// fill
 		bFillWidth = NextItemData.bFillWidth;
 		StretchValue = NextItemData.StretchValue;
 	}
 	else if (NextItemData.Flags & ImSlateNextItemDataFlags_Stretch)
 	{
-		// stretch
 		StretchValue = NextItemData.StretchValue;
 	}
 
@@ -1049,6 +1073,8 @@ void FItemSlotPod::ApplyNextItem(const ImSlateNextItemData& NextItemData)
 
 	if (NextItemData.Flags & ImSlateNextItemDataFlags_AspectRatio)
 		AspectRatio = NextItemData.AspectRatio;
+
+	return !(*this == Before);
 }
 
 void SameLine()
@@ -1090,7 +1116,8 @@ void Spacing(float Val)
 		g.NextItemData.bBreakLine = true;
 		g.NextItemData.SetMinHeight(Val);
 		auto& Slot = Internal::AddWidgetImpl(g);
-		Slot.ApplyNextItem(g.NextItemData);
+		if (Slot.ApplyNextItem(g.NextItemData))
+			g.CurrentWindow->MarkPanelLayoutDirty();
 		g.NextItemData.ClearFlags();
 		g.NextItemData.Flags |= ImSlateNextItemDataFlags_NewRow;
 		g.NextItemData.bNewRow = true;
@@ -1111,26 +1138,114 @@ void Dummy(const ImVec2& Size)
 	}
 }
 
+struct FFoldMeta
+	: public TSharedFromThis<FFoldMeta>
+	, public ISlateMetaData
+{
+	SLATE_METADATA_TYPE(FFoldMeta, ISlateMetaData)
+public:
+	bool bIsFolded = true;
+	bool bJustClicked = false;
+	TSharedPtr<STextBlock> TextBlock;
+};
+
 bool FoldLine(ImStr Label, const FText& InText, float InHeight /*= 0.f*/)
 {
-	auto ItemPtr = Internal::Item<SImFoldLine>(Label, [&](FItemSlotPod& InItem) {
+	using Internal::Item;
+	auto ItemPtr = Item<SButton>(Label, [&](FItemSlotPod& InItem) {
 		InItem.bNewRow = true;
 		InItem.bBreakLine = true;
-		InItem.SetMinHeight(InHeight);
-		TSharedRef<SImFoldLine> WidgetRef = ImFactoryCreate<UImFoldLine>();
+		InItem.bFillWidth = true;
+		InItem.StretchValue = 1.f;
+		InItem.HAlignment = HAlign_Fill;
+		InItem.VAlignment = VAlign_Center;
+		if (InHeight > 0.f)
+			InItem.SetMinHeight(InHeight);
+
+		TSharedRef<SButton> WidgetRef = ImFactoryCreate<UImButton>();
+		auto Meta = MakeShared<FFoldMeta>();
+		WidgetRef->AddMetadata(Meta);
+		auto Ptr = &Meta.Get();
+
+		WidgetRef->SetContent(SAssignNew(Meta->TextBlock, STextBlock)
+			.Text(FText::FromString(TEXT("\x25B6 ") + InText.ToString()))
+			.Clipping(EWidgetClipping::ClipToBoundsAlways));
+
+		WidgetRef->SetOnClicked(CreateWeakLambda(Ptr, [Ptr] {
+			Ptr->bJustClicked = true;
+			return FReply::Handled();
+		}));
+
 		return WidgetRef;
 	});
 
 	if (ItemPtr)
 	{
-		ItemPtr->SetText(InText);
-		return ItemPtr->GetIsFolded();
+		if (auto Meta = ItemPtr ? ItemPtr->GetMetaData<FFoldMeta>() : TSharedPtr<FFoldMeta>())
+		{
+			if (Meta->bJustClicked)
+			{
+				Meta->bJustClicked = false;
+				Meta->bIsFolded = !Meta->bIsFolded;
+			}
+			// Update arrow text
+			if (Meta->TextBlock.IsValid())
+			{
+				FString Arrow = Meta->bIsFolded ? TEXT("\x25B6 ") : TEXT("\x25BC ");
+				Meta->TextBlock->SetText(FText::FromString(Arrow + InText.ToString()));
+			}
+			return Meta->bIsFolded;
+		}
 	}
-	return false;
+	return true;  // default folded
 }
 
 void Separator()
 {
+}
+
+// Fold indent stack — per-window, reset each Begin/End cycle
+// Safe: ImSlate renders single-threaded, BeginFold/EndFold always paired within Begin/End
+static TArray<float, TInlineAllocator<8>>& GetFoldIndentStack()
+{
+	static TArray<float, TInlineAllocator<8>> Stack;
+	return Stack;
+}
+
+bool BeginFold(ImStr Label, const FText& InText, float IndentWidth)
+{
+	ImSlateContext& g = *GImSlate;
+	ImSlateId FoldId = ImSlateScopedId(Label);
+	bool bIsFolded = FoldLine(Label, InText);
+
+	// FoldLine item is already in the tree (parent set by Item → SetItemParent)
+	// Now push this fold as the parent context for content items
+	if (!bIsFolded)
+	{
+		// Fold open
+		g.CurrentWindow->PushFoldContext(FoldId);
+		GetFoldIndentStack().Push(IndentWidth);
+		Indent(IndentWidth);
+		return true;
+	}
+	else
+	{
+		// Fold closed — mark collapsed, content items not created (short circuit)
+		g.CurrentWindow->SetFoldCollapsed(FoldId, true);
+		return false;
+	}
+}
+
+void EndFold()
+{
+	ImSlateContext& g = *GImSlate;
+	auto& Stack = GetFoldIndentStack();
+	if (Stack.Num() > 0)
+	{
+		if (g.CurrentWindow)
+			g.CurrentWindow->PopFoldContext();
+		Unindent(Stack.Pop());
+	}
 }
 
 void Indent(float IndentW /* = 0.0f*/)

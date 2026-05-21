@@ -102,25 +102,31 @@ public:
 	FSlot& AddSlot(uint32 InKey)
 	{
 		FSlot& NewSlot = Slot(InKey);
-		this->NewChildren.Add(&NewSlot);
-
-		Invalidate(EInvalidateWidget::Layout | EInvalidateWidgetReason::ChildOrder);
-		return NewSlot;
-	}
-
-	FSlot& AddCurrentSlot(uint32 InKey)
-	{
-		FSlot& NewSlot = Slot(InKey);
+		int32 Index = this->Children.Num();
 		this->Children.Add(&NewSlot);
-
+		if (bFrameStarted)
+			FrameOrder.Add(Index);
+		// Always Invalidate — Slate must know about new children (like SlateIM's Slot.SetContent)
 		Invalidate(EInvalidateWidget::Layout | EInvalidateWidgetReason::ChildOrder);
 		return NewSlot;
 	}
 
 	void AddSlot(FSlot* InSlot)
 	{
-		this->NewChildren.Add(InSlot);
+		int32 Index = this->Children.Num();
+		this->Children.Add(InSlot);
+		if (bFrameStarted)
+			FrameOrder.Add(Index);
 		Invalidate(EInvalidateWidget::Layout | EInvalidateWidgetReason::ChildOrder);
+	}
+
+	// EventDrived mode: add directly without frame tracking
+	FSlot& AddCurrentSlot(uint32 InKey)
+	{
+		FSlot& NewSlot = Slot(InKey);
+		this->Children.Add(&NewSlot);
+		Invalidate(EInvalidateWidget::Layout | EInvalidateWidgetReason::ChildOrder);
+		return NewSlot;
 	}
 
 	void AddCurrentSlot(FSlot* InSlot)
@@ -128,6 +134,52 @@ public:
 		this->Children.Add(InSlot);
 		Invalidate(EInvalidateWidget::Layout | EInvalidateWidgetReason::ChildOrder);
 	}
+
+	// Frame lifecycle: non-EventDrived mode
+	void BeginItemFrame()
+	{
+		FrameOrder.Reset();
+		TouchedSlots.Reset();
+		TouchedSlots.Init(false, Children.Num());
+		bFrameStarted = true;
+		bLayoutDirty = false;
+		bFrameOrderIsSequential = true;
+		NextExpectedTouchIndex = 0;
+		FrameBaseChildCount = Children.Num();
+	}
+
+	void MarkLayoutDirty() { bLayoutDirty = true; }
+
+	// Returns true if the slot was successfully touched (first time this frame).
+	// Returns false if already touched (duplicate ID) — caller should create a new slot instead.
+	bool TouchSlot(int32 ChildIndex)
+	{
+		if (TouchedSlots.IsValidIndex(ChildIndex) && TouchedSlots[ChildIndex])
+			return false;  // already touched this frame — duplicate ID
+		if (TouchedSlots.IsValidIndex(ChildIndex))
+			TouchedSlots[ChildIndex] = true;
+		FrameOrder.Add(ChildIndex);
+		// Track if touched indices match the expected non-collapsed sequence
+		if (bFrameOrderIsSequential)
+		{
+			// Skip over collapsed indices to find next expected active index
+			while (NextExpectedTouchIndex < Children.Num()
+				&& IsInCollapsedSubtree(Children[NextExpectedTouchIndex].Hash))
+			{
+				++NextExpectedTouchIndex;
+			}
+			if (ChildIndex != NextExpectedTouchIndex)
+				bFrameOrderIsSequential = false;
+			++NextExpectedTouchIndex;
+		}
+		return true;
+	}
+
+	// Items added before this count are from previous frame (visible to FindItem)
+	// Items at or after this count were added during current frame (invisible to FindItem)
+	int32 GetFrameBaseChildCount() const { return FrameBaseChildCount; }
+
+	bool CommitItemFrame();
 
 	FSlot& InsertSlot(uint32 InKey, int32 Index = INDEX_NONE)
 	{
@@ -171,7 +223,13 @@ protected:
 	virtual FChildren* GetChildren() override;
 
 	mutable TChildrenLayout<FSlot> Children;
-	mutable TChildrenLayout<FSlot> NewChildren;
+	TArray<int32, TInlineAllocator<64>> FrameOrder;
+	TBitArray<> TouchedSlots;
+	bool bFrameStarted = false;
+	bool bLayoutDirty = false;
+	bool bFrameOrderIsSequential = true;
+	int32 NextExpectedTouchIndex = 0;
+	int32 FrameBaseChildCount = 0;
 
 	void OnScrollFraction(float InFraction);
 	bool OnScrollOffset(float InOffset);
@@ -221,6 +279,19 @@ protected:
 	};
 
 	FCachedItem CachedItems;
+
+	// Tree structure: each item knows its parent fold via ImSlateId
+	TMap<ImSlateId, ImSlateId> ItemParentMap;           // ItemId → ParentFoldId (0 = root)
+	TSet<ImSlateId> CollapsedFoldIds;                   // folds that are currently collapsed
+	TArray<ImSlateId, TInlineAllocator<4>> FoldContextStack;  // current fold nesting during frame build
+
+	bool IsInCollapsedSubtree(ImSlateId ItemId) const;
+
+public:
+	void SetItemParent(ImSlateId ItemId);               // assign current fold context as parent
+	void PushFoldContext(ImSlateId FoldId);
+	void PopFoldContext();
+	void SetFoldCollapsed(ImSlateId FoldId, bool bCollapsed);
 
 protected:
 	ImSlateWindow* Window = nullptr;

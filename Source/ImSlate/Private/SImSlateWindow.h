@@ -150,8 +150,16 @@ public:
 
 	void BringWindowToFront();
 
-	FItemSlotPod* FindItem(ImSlateId InId, SWidget** OutWidget = nullptr);
+	void BeginItemFrame();
+	void CommitItemFrame();
+	void MarkPanelLayoutDirty();
+	void SetItemParent(ImSlateId ItemId);
+	void PushFoldContext(ImSlateId FoldId);
+	void PopFoldContext();
+	void SetFoldCollapsed(ImSlateId FoldId, bool bCollapsed);
+	FItemSlotPod* FindItem(ImSlateId InId, SWidget** OutWidget = nullptr, int32* OutChildIndex = nullptr);
 	FItemSlotPod& AddItem(ImSlateId InId, const TSharedRef<SWidget>& Item);
+	bool ReuseItem(ImSlateId InId, int32 ExistingChildIndex);
 	void AddExistItem(ImSlateId InId, FItemSlotPod* InExistSlot);
 
 	SImViewportGame* GetViewportGame() const { return ViewportGame; }

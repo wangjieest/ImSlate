@@ -5,8 +5,8 @@ bool UInGameUIHelper::InitInGameUIManager(UObject* Ctx, UDataTable* Table, TSubc
 	TArray<FInGameUIRegisterInfo*> RegisterInfos;
 	if (Table && Table->GetRowStruct() == TBaseStructure<FInGameUIRegisterInfo>::Get())
 	{
-		UE_LOG(LogInGameUIManager, Log, TEXT("UInGameUIManager::InitInGameUIManager Start"));		
 		static const FString ContextString(TEXT("UInGameUIManager::InGameRegisterInfoTable"));
+		UE_LOG(LogInGameUIManager, Log, TEXT("%s"), *ContextString);		
 		Table->GetAllRows<FInGameUIRegisterInfo>(ContextString, RegisterInfos);
 	}
 

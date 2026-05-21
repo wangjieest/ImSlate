@@ -13,6 +13,7 @@
 
 #if WITH_EDITOR
 #include "Editor/LevelEditor/Public/ILevelEditor.h"
+#include "Editor/LevelEditor/Public/SLevelViewport.h"
 #endif
 
 namespace ImSlate

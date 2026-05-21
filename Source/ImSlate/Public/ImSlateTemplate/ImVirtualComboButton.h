@@ -8,7 +8,7 @@
 #include "ImSlateFactory.h"
 #include "ImSlateListDataInc.h"
 #include "Sound/SlateSound.h"
-#include "GMP/GMPUnion.h"
+#include "GMPCore.h"
 
 namespace ImSlate
 {

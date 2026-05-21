@@ -20,7 +20,8 @@ public:
 	SImButton();
 
 	/** @return An image that represents this button's border*/
-	virtual const FSlateBrush* GetBorder() const override;
+	// GetBorder() no longer virtual in UE 5.7, remove override
+	virtual const FSlateBrush* GetBorder() const;
 
 	/**
 	 * Construct this widget

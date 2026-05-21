@@ -54,7 +54,7 @@ int32 SImSlatePanel::RemoveSlot(uint32 InKey)
 void SImSlatePanel::ClearChildren()
 {
 	Children.Empty();
-	NewChildren.Empty();
+	FrameOrder.Reset();
 
 	Invalidate(EInvalidateWidget::LayoutAndVolatility);
 	MarkPrepassAsDirty();
@@ -62,7 +62,6 @@ void SImSlatePanel::ClearChildren()
 
  SImSlatePanel::SImSlatePanel()
 	: Children(this)
-	, NewChildren(this)
 {
 	SetCanTick(false);
 	bCanSupportFocus = false;
@@ -71,7 +70,174 @@ void SImSlatePanel::ClearChildren()
 SImSlatePanel::~SImSlatePanel()
 {
 	Children.ResetSlots();
-	NewChildren.ResetSlots(true);
+}
+
+bool SImSlatePanel::CommitItemFrame()
+{
+	if (!bFrameStarted)
+		return false;
+	bFrameStarted = false;
+
+	const int32 NumFrame = FrameOrder.Num();
+	const int32 NumChildren = Children.Num();
+
+	const bool bHasNewItems = (NumChildren > FrameBaseChildCount);
+
+	// Count collapsed items in Children
+	int32 NumCollapsed = 0;
+	for (int32 i = 0; i < NumChildren; ++i)
+	{
+		if (IsInCollapsedSubtree(Children[i].Hash))
+			++NumCollapsed;
+	}
+
+	// Fast path: active items + collapsed items = total children, same order, no new items
+	if ((NumFrame + NumCollapsed) == NumChildren && !bHasNewItems && bFrameOrderIsSequential)
+	{
+		if (bLayoutDirty)
+		{
+			Invalidate(EInvalidateWidget::Layout);
+			MarkPrepassAsDirty();
+		}
+		// else: zero cost — nothing changed, Slate uses cached geometry
+		return false;
+	}
+
+	// Determine what actually changed
+	TSet<int32> UsedSet;
+	UsedSet.Reserve(NumFrame);
+	for (int32 Idx : FrameOrder)
+		UsedSet.Add(Idx);
+
+	// Collapsed fold children count as "used" — don't remove them
+	const int32 TotalUsed = UsedSet.Num() + NumCollapsed;
+	const bool bNeedsRemove = (TotalUsed < NumChildren);
+	const bool bNeedsReorder = !bFrameOrderIsSequential;
+
+	if (bNeedsReorder || bNeedsRemove)
+	{
+		// Full rebuild: steal pointers, reorder, keep collapsed, delete truly unused
+		TArray<FSlot*> OldPtrs;
+		OldPtrs.SetNumUninitialized(NumChildren);
+		FSlot** RawData = Children.Slots.GetData();
+		for (int32 i = 0; i < NumChildren; ++i)
+		{
+			OldPtrs[i] = RawData[i];
+			RawData[i] = nullptr;
+		}
+		Children.Empty();
+
+		// Re-add active items in frame order
+		for (int32 Idx : FrameOrder)
+		{
+			Children.Add(OldPtrs[Idx]);
+			OldPtrs[Idx] = nullptr;
+		}
+
+		// Re-add items in collapsed subtrees (keep them alive)
+		for (int32 i = 0; i < OldPtrs.Num(); ++i)
+		{
+			if (OldPtrs[i] && IsInCollapsedSubtree(OldPtrs[i]->Hash))
+			{
+				Children.Add(OldPtrs[i]);
+				OldPtrs[i] = nullptr;
+			}
+		}
+
+		// Delete truly unused
+		for (FSlot* Ptr : OldPtrs)
+		{
+			if (Ptr)
+			{
+				ResetSlotBase(Ptr);
+				delete Ptr;
+			}
+		}
+	}
+	// else: items were just appended in order — Children is already correct, no Empty+Add needed
+
+	// Rebuild cache (always, since indices may have changed or new items added)
+	CachedItems = FCachedItem();
+	for (int32 i = 0; i < Children.Num(); ++i)
+	{
+		CachedItems.Add(Children[i].Hash, i);
+	}
+
+	Invalidate(EInvalidateWidgetReason::ChildOrder | EInvalidateWidgetReason::Paint);
+	return true;
+}
+
+bool SImSlatePanel::IsInCollapsedSubtree(ImSlateId ItemId) const
+{
+	const ImSlateId* ParentPtr = ItemParentMap.Find(ItemId);
+	if (!ParentPtr || *ParentPtr == 0)
+		return false;  // root level
+
+	ImSlateId ParentId = *ParentPtr;
+	if (CollapsedFoldIds.Contains(ParentId))
+		return true;  // direct parent is collapsed
+
+	return IsInCollapsedSubtree(ParentId);  // check ancestors
+}
+
+void SImSlatePanel::SetItemParent(ImSlateId ItemId)
+{
+	ImSlateId ParentId = FoldContextStack.Num() > 0 ? FoldContextStack.Last() : 0;
+	ItemParentMap.FindOrAdd(ItemId) = ParentId;
+}
+
+void SImSlatePanel::PushFoldContext(ImSlateId FoldId)
+{
+	// Opening a fold — remove from collapsed set, un-collapse children
+	if (CollapsedFoldIds.Remove(FoldId) > 0)
+	{
+		for (int32 i = 0; i < Children.Num(); ++i)
+		{
+			const TSharedRef<SWidget>& Widget = Children[i].GetWidget();
+			if (Widget == SNullWidget::NullWidget)
+				continue;
+			ImSlateId ChildHash = Children[i].Hash;
+			const ImSlateId* ParentPtr = ItemParentMap.Find(ChildHash);
+			if (ParentPtr && *ParentPtr == FoldId && !IsInCollapsedSubtree(ChildHash))
+			{
+				Widget->SetVisibility(EVisibility::Visible);
+			}
+		}
+		bLayoutDirty = true;
+	}
+	FoldContextStack.Push(FoldId);
+}
+
+void SImSlatePanel::PopFoldContext()
+{
+	if (FoldContextStack.Num() > 0)
+		FoldContextStack.Pop();
+}
+
+void SImSlatePanel::SetFoldCollapsed(ImSlateId FoldId, bool bCollapsed)
+{
+	if (bCollapsed)
+	{
+		bool bAlreadyCollapsed = false;
+		CollapsedFoldIds.Add(FoldId, &bAlreadyCollapsed);
+		if (!bAlreadyCollapsed)
+		{
+			for (int32 i = 0; i < Children.Num(); ++i)
+			{
+				const TSharedRef<SWidget>& Widget = Children[i].GetWidget();
+				if (Widget != SNullWidget::NullWidget && IsInCollapsedSubtree(Children[i].Hash))
+				{
+					Widget->SetVisibility(EVisibility::Collapsed);
+				}
+			}
+			bLayoutDirty = true;
+		}
+	}
+	else
+	{
+		PushFoldContext(FoldId);  // reuse un-collapse logic
+		PopFoldContext();         // but don't keep it on the stack
+	}
 }
 
 void SImSlatePanel::Construct(const FArguments& InArgs, SImSlateWindow* InParent)
@@ -130,13 +296,14 @@ void SImSlatePanel::OnArrangeChildren(const FGeometry& AllottedGeometry, FArrang
 	const auto PanelSize = AllottedGeometry.GetLocalSize();
 	const auto PanelHeight = PanelSize.Y;
 
-	ScrollHandle->SetState(ScrollOffset / TotalActualSize.Y, PanelHeight / TotalActualSize.Y);
+	const float SafeTotalHeight = FMath::Max(TotalActualSize.Y, 1.f);
+	ScrollHandle->SetState(ScrollOffset / SafeTotalHeight, PanelHeight / SafeTotalHeight);
 
 	const bool bShowScrollBar = !bHideScrollBar && ScrollHandle->IsNeeded();
 	const auto PanelWidth = PanelSize.X - (bShowScrollBar ? ScrollBarWidth : 0.f);
 	ON_SCOPE_EXIT
 	{
-		ScrollHandle->SetState(ScrollOffset / TotalActualSize.Y, PanelHeight / TotalActualSize.Y);
+		ScrollHandle->SetState(ScrollOffset / SafeTotalHeight, PanelHeight / SafeTotalHeight);
 		if (bShowScrollBar)
 		{
 			ArrangedChildren.AddWidget(EVisibility::Visible, AllottedGeometry.MakeChild(ScrollHandle.ToSharedRef(), FVector2D(PanelWidth, 0.f), FVector2D(ScrollBarWidth, PanelHeight)));
@@ -186,25 +353,7 @@ void SImSlatePanel::OnArrangeChildren(const FGeometry& AllottedGeometry, FArrang
 	};
 
 	FRowInfo CurRowInfo;
-	int32 RowIdx = 0;
 	auto ArrangeCurrentRow = [&] /* return should continue next */ {
-		const auto DesiredRowHeight = RowHeights[RowIdx++];
-#if WITH_EDITOR && 0
-		struct FRowHeightScope
-		{
-			const float& Desired;
-			const float& Calculated;
-			FRowHeightScope(const float& InDesired, const float& InCalculated)
-				: Desired(InDesired)
-				, Calculated(InCalculated)
-			{
-				EnsureEqual();
-			}
-			~FRowHeightScope() { EnsureEqual(); }
-			void EnsureEqual() const { ensure(Desired == Calculated); }
-		} RoheightScope(DesiredRowHeight, CurRowInfo.RowMaxHeight);
-#endif
-
 		ON_SCOPE_EXIT
 		{
 			ItemArrangingOffset += CurRowInfo.RowMaxHeight;
@@ -329,7 +478,7 @@ void SImSlatePanel::OnArrangeChildren(const FGeometry& AllottedGeometry, FArrang
 		if (bArrangeOnNewRow)
 			ColumnIdx = 0;
 
-		// if (CurChild.GetWidget()->GetVisibility() != EVisibility::Collapsed)
+		if (CurChild.GetWidget()->GetVisibility() != EVisibility::Collapsed)
 		{
 			auto& SlotPadding = CurChild.SlotPadding;
 			FVector2D ChildDesiredSize = CurChild.GetWidget()->GetDesiredSize();
@@ -439,6 +588,13 @@ void SImSlatePanel::CacheDesiredSize(float LayoutScaleMultiplier)
 		bPrevBreak = CurChild.bBreakLine;
 	}
 	UpdateDesiredSize();
+
+	// Clamp scroll offset when content size changes (e.g. fold/unfold)
+	{
+		float PanelHeight = GetCachedGeometry().GetLocalSize().Y;
+		float MaxScroll = FMath::Max(0.f, TotalActualSize.Y - PanelHeight);
+		ScrollOffset = FMath::Clamp(ScrollOffset, 0.f, MaxScroll);
+	}
 
 	RowHeights.Add(TotalActualSize.Y);
 	if ((Window->Flags & ImSlateWindowFlags_NoScrollbar) == 0 && ScrollHandle->IsNeeded())

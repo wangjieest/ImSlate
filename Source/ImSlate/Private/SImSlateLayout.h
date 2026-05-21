@@ -4,9 +4,15 @@
 
 #include "Layout/Children.h"
 #include "UnrealCompatibility.h"
+#include "PrivateFieldAccessor.h"
 
 namespace ImSlate
 {
+namespace ImSlateInternal
+{
+	GS_PRIVATEACCESS_MEMBER(FChildren, Owner, SWidget*)
+}  // namespace ImSlateInternal
+
 void ResetSlotBase(FSlotBase* InSlot);
 
 template<typename SlotType>
@@ -22,7 +28,7 @@ public:
 	TChildrenLayout& operator=(TChildrenLayout&& Other)
 	{
 		PRAGMA_DISABLE_DEPRECATION_WARNINGS
-		Owner = Other.Owner;
+		GetOwnerPtr() = Other.GetOwnerPtr();
 		PRAGMA_ENABLE_DEPRECATION_WARNINGS
 		bEmptying = Other.bEmptying;
 		Slots = MoveTemp(Other.Slots);
@@ -63,18 +69,24 @@ public:
 
 	void RemoveAt(int32 Index)
 	{
-		if (!bEmptying)
+		if (!bEmptying && ensure(Slots.IsValidIndex(Index)))
 		{
 			Slots.RemoveAt(Index);
 		}
 	}
-
 	bool RemoveFirst(int32 InCnt = 1)
 	{
 		bool bRet = false;
-		if (!bEmptying)
+		if (!bEmptying && ensure(InCnt > 0))
 		{
-			Slots.RemoveAt(0, InCnt);
+			if (Slots.Num() <= InCnt)
+			{
+				Empty();
+			}
+			else
+			{
+				Slots.RemoveAt(0, InCnt);
+			}
 			bRet = true;
 		}
 		return bRet;
@@ -83,9 +95,16 @@ public:
 	bool RemoveLast(int32 InCnt = 1)
 	{
 		bool bRet = false;
-		if (!bEmptying)
+		if (!bEmptying && ensure(InCnt > 0))
 		{
-			Slots.RemoveAt(Slots.Num() - InCnt, InCnt);
+			if (Slots.Num() <= InCnt)
+			{
+				Empty();
+			}
+			else
+			{
+				Slots.RemoveAt(Slots.Num() - InCnt, InCnt);
+			}
 			bRet = true;
 		}
 		return bRet;
@@ -112,7 +131,7 @@ public:
 			}
 			Slots.Empty();
 		}
-		if(bResetOwner)
+		if (bResetOwner)
 			GetOwnerPtr() = nullptr;
 	}
 
@@ -160,7 +179,7 @@ private:
 	bool bEmptying;
 
 	PRAGMA_DISABLE_DEPRECATION_WARNINGS
-	SWidget*& GetOwnerPtr() { return Owner; }
+	SWidget*& GetOwnerPtr() { return ImSlateInternal::PrivateAccess::Owner(*this); }
 	PRAGMA_ENABLE_DEPRECATION_WARNINGS
 };
 
@@ -176,9 +195,10 @@ private:
 	}
 
 	PRAGMA_DISABLE_DEPRECATION_WARNINGS
-	SWidget*& GetOwnerPtr() { return Owner; }
+	SWidget*& GetOwnerPtr() { return ImSlateInternal::PrivateAccess::Owner(*this); }
 	PRAGMA_ENABLE_DEPRECATION_WARNINGS
 	friend class SImSlateViewport;
+
 public:
 	TImSlateChildren(SWidget* InOwner, bool InbChangesInvalidatePrepass = true)
 		: FChildren(InOwner)

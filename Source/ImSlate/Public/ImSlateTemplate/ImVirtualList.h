@@ -3,6 +3,7 @@
 #include "CoreMinimal.h"
 
 #include "Components/Widget.h"
+#include "Components/ScrollBox.h"
 #include "ImSlateFactory.h"
 #include "ImSlateListDataInc.h"
 #include "ImSlateWidgetPool.h"
@@ -40,6 +41,8 @@ public:
 
 	UFUNCTION(BlueprintImplementableEvent, Category = "ImSlateDataStorage")
 	void OnGenerateWidget(int32 InIndex, UUserWidget*& InOutWidget);
+	UFUNCTION(BlueprintImplementableEvent, Category = "ImSlateDataStorage")
+	void OnReleaseWidget(int32 InIndex, UUserWidget* ReleasedWidget);
 
 	UFUNCTION(BlueprintImplementableEvent, Category = "ImSlateDataStorage")
 	void OnSetData(int32 InIndex, UUserWidget* Widget);
@@ -112,6 +115,8 @@ protected:
 
 	UFUNCTION(BlueprintCallable, BlueprintNativeEvent, Category = "ImSlateDataStorage")
 	void OnGenerateWidget(int32 InIndex, UUserWidget*& InOutWidget);
+	UFUNCTION(BlueprintCallable, BlueprintNativeEvent, Category = "ImSlateDataStorage")
+	void OnReleaseWidget(int32 InIndex, UUserWidget* ReleasedWidget);
 
 	UFUNCTION(BlueprintCallable, BlueprintNativeEvent, Category = "ImSlateDataStorage")
 	void OnSetData(int32 InIndex, UUserWidget* Widget);
@@ -132,6 +137,7 @@ private:
 	virtual float OnGetItemAxis_Implementation(int32 InIndex);
 	virtual float OnGetItemHeight_Implementation(int32 InIndex);
 	virtual void OnGenerateWidget_Implementation(int32 InIndex, UUserWidget*& InOutWidget);
+	virtual void OnReleaseWidget_Implementation(int32 InIndex, UUserWidget* ReleasedWidget);
 	virtual void OnSetData_Implementation(int32 InIndex, UUserWidget* Widget);
 };
 
@@ -146,11 +152,11 @@ class IMSLATE_API UImVirtualList
 public:
 	UImVirtualList();
 
-    // Set the buffer rows (a few more rows outside the visible area)
+	// Set the buffer rows (a few more rows outside the visible area)
 	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
 	void SetOverCountRowNum(int32 InNum);
 
-    // Set the Tile mode and Item width
+	// Set the Tile mode and Item width
 	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
 	void SetTileWidth(float InWidth);
 
@@ -160,19 +166,37 @@ public:
 	// make sure item is at least be visible
 	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
 	void ScrollToItem(int32 InDataIndex, bool bCenterAlign = false);
+	
+	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
+	float GetVirtualPos() const;
 
-    // Update specified data, default is to update all visible data
+	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
+	float GetCachedTotalAxis(bool bFullItems = false) const;
+	
+	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
+	float GetVisibleAeraAxis() const;
+
+	// Update specified data, default is to update all visible data
 	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
 	void Update(int32 InDataIndex = -1, bool bRefreshItem = false);
-
-	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
-	void SetDataStorage(class UImSlateDataStorageBase* InStorage, float InVirtualPos = -0.f, float InTileWidth = 0.f);
 
 	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
 	void ShowScrollBar(ECheckBoxState IsAlwaysShow);
 
 	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
 	void SetScrollbarInfo(bool bTrackAlwaysVisible, float Thickness = 16.f);
+
+	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
+	bool IsItemOffsetVisible(int32 InIndex, float InRelativePos = -0.f) const;
+
+	UFUNCTION(BlueprintCallable, Category = "ImVirtualList")
+	float GetItemPosition(int32 InIndex);
+	
+	UFUNCTION(BlueprintCallable, Category = "ImVirtualList|DataStorage")
+	void SetDataStorage(class UImSlateDataStorageBase* InStorage, float InVirtualPos = -0.f, float InTileWidth = 0.f);
+
+	UFUNCTION(BlueprintCallable, Category = "ImVirtualList|DataStorage")
+	void SetAnimateScrollDuration(float InAnimateDuration);
 
 public:
 	void SetNativeBindingData(TSharedPtr<ImSlate::IImSlateListData> InBindingData, float InVirtualPos = -0.f, float InTileWidth = 0.f);
@@ -195,26 +219,40 @@ protected:
 	UFUNCTION(BlueprintCallable, Category = "ImVirtualList|WidgetPool")
 	void ResetPool();
 
+	DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnVirtualPosChangedDelegate, float, NewPos);
+	UPROPERTY(BlueprintAssignable, Category = "ImVirtualList")
+	FOnVirtualPosChangedDelegate OnVirtualPosChanged;
+
+	UPROPERTY(BlueprintAssignable, Category = "ImVirtualList")
+	FOnUserScrolledEvent OnUserScrolled;
+
+	/** Called when the scrollbar visibility has changed */
+	UPROPERTY(BlueprintAssignable, Category = "ImVirtualList")
+	FOnScrollBarVisibilityChangedEvent OnScrollBarVisibilityChanged;
+
+#if WITH_EDITORONLY_DATA
+	// only used in editor preview
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ImVirtualList|EditorPreview", meta = (UIMin = "0"))
+	int32 EditorPreviewItemCount = 50;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ImVirtualList|EditorPreview", meta = (UIMin = "10"))
+	float EditorPreviewItemHeight = 50.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ImVirtualList|EditorPreview")
+	int32 EditorPreviewItemWidth = -1.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ImVirtualList|EditorPreview", meta = (UIMin = "0"))
+	float EditorPreviewVirtualPos = 0.f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ImVirtualList|EditorPreview")
+	TSubclassOf<UWidget> EditorPreviewWidgetClass;
+	UPROPERTY(Transient)
+	FUWidgetPool UWidgetPool;
+	TSharedPtr<ImSlate::IImSlateListData> BindingData;
+#endif
+
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "ImVirtualList|Background")
 	TSubclassOf<UUserWidget> BackgroundWidgetClass;
 	UPROPERTY(Transient)
 	mutable UUserWidget* BackgroundWidget = nullptr;
 	UFUNCTION(BlueprintCallable, Category = "ImVirtualList|Background")
 	UUserWidget* GetBackgroundWidget();
-
-#if WITH_EDITORONLY_DATA
-	// only used in editor preview
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ImVirtualList|EditorPreview", meta = (UIMin = "0"))
-	int32 EditorPreviewCount = 0;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ImVirtualList|EditorPreview", meta = (UIMin = "0"))
-	float EditorPreviewVirtualPos = 0.f;
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "ImVirtualList|EditorPreview")
-	TSubclassOf<UWidget> EditorPreviewWidgetClass;
-
-	UPROPERTY(Transient)
-	FUWidgetPool UWidgetPool;
-	TSharedPtr<ImSlate::IImSlateListData> BindingData;
-#endif
 
 	UPROPERTY(Transient)
 	UImSlateDataStorageBase* DataStorage = nullptr;

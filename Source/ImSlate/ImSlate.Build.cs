@@ -36,6 +36,8 @@ public class ImSlate : ModuleRules
 			"ApplicationCore",
 			"AppFramework",
 			"RenderCore",
+			"EnhancedInput",
+			"AssetRegistry",
             //"AnimatedTexture",
 			// ... add private dependencies that you statically link with here ...
 		});
@@ -44,6 +46,7 @@ public class ImSlate : ModuleRules
 			PrivateDependencyModuleNames.AddRange(new string[] {
 				"UnrealEd",
 				"LevelEditor",
+				"PropertyEditor",
 			});
 		}
 		DynamicallyLoadedModuleNames.AddRange(new string[] {

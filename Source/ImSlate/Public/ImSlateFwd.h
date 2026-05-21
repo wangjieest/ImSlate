@@ -9,7 +9,7 @@
 #if defined(UE_BUILD_DEBUGGAME)
 DECLARE_LOG_CATEGORY_EXTERN(LogImSlate, Log, All);
 #else
-DECLARE_LOG_CATEGORY_EXTERN(LogImSlate, Log, Warning);
+DECLARE_LOG_CATEGORY_EXTERN(LogImSlate, Log, All);
 #endif
 
 class UWidget;
@@ -74,7 +74,71 @@ enum ImSlateWindowFlags_
 };
 // clang-format on
 
-using ImStr = FAnsiStringView;
+struct ImStr
+{
+	void* operator new(size_t) = delete;
+	void* operator new[](size_t) = delete;
+
+	// String literals — array reference, compile-time safe
+	template<int32 N> ImStr(const char (&Literal)[N]) : Kind(Ansi) { new (&AnsiRef) FAnsiStringView(Literal, N - 1); }
+	template<int32 N> ImStr(const TCHAR (&Literal)[N]) : Kind(TChar) { new (&TCharRef) FStringView(Literal, N - 1); }
+
+	// Views — zero cost reference
+	ImStr(FAnsiStringView InView) : Kind(Ansi) { new (&AnsiRef) FAnsiStringView(InView); }
+	ImStr(FStringView InView) : Kind(TChar) { new (&TCharRef) FStringView(InView); }
+
+	// FString — explicit only, prevents implicit temp construction
+	explicit ImStr(const FString& InStr) : Kind(TChar) { new (&TCharRef) FStringView(InStr); }
+
+	// const char* — ANSI pointer, safe (no conversion needed)
+	ImStr(const char* InStr) : Kind(Ansi) { new (&AnsiRef) FAnsiStringView(InStr); }
+
+	// Dangerous sources — compile error
+	ImStr(const TCHAR*) = delete;
+	ImStr(FString&&) = delete;
+
+	operator FAnsiStringView() const { return Resolve(); }
+	const char* GetData() const { return Resolve().GetData(); }
+	int32 Len() const { return Resolve().Len(); }
+	bool StartsWith(FAnsiStringView Prefix) const { auto R = Resolve(); return R.Len() >= Prefix.Len() && FCStringAnsi::Strncmp(R.GetData(), Prefix.GetData(), Prefix.Len()) == 0; }
+
+private:
+	FAnsiStringView Resolve() const
+	{
+		if (Kind == Ansi) return AnsiRef;
+		if (bResolved) return Resolved;
+
+		auto SrcData = TCharRef.GetData();
+		auto SrcLen = TCharRef.Len();
+		if (SrcLen == 0) return FAnsiStringView();
+
+		auto ConvLen = FPlatformString::ConvertedLength<char>(SrcData, SrcLen);
+		char* Dest = Inline;
+		if (ConvLen >= InlineSize)
+		{
+			Heap.SetNumUninitialized(ConvLen + 1);
+			Dest = Heap.GetData();
+		}
+		FPlatformString::Convert(Dest, ConvLen + 1, SrcData, SrcLen);
+		Dest[ConvLen] = '\0';
+		Resolved = FAnsiStringView(Dest, ConvLen);
+		bResolved = true;
+		return Resolved;
+	}
+
+	enum EKind : uint8 { Ansi, TChar } Kind;
+	union
+	{
+		FAnsiStringView AnsiRef;
+		FStringView TCharRef;
+	};
+
+	static constexpr int32 InlineSize = 64;
+	mutable char Inline[InlineSize];
+	mutable TArray<char> Heap;
+	mutable FAnsiStringView Resolved;
+	mutable bool bResolved = false;
+};
 using ImSlateId = uint32;
 
 struct ImVec2 : public FVector2D
@@ -457,9 +521,25 @@ public:
 		bFillWidth = 1;
 	}
 
-	friend bool operator==(const FItemSlotPod& Lhs, const FItemSlotPod& Rhs) { return FMemory::Memcmp(&Lhs, &Rhs, sizeof(Lhs)) == 0; }
+	friend bool operator==(const FItemSlotPod& Lhs, const FItemSlotPod& Rhs)
+	{
+		// Per-field comparison of LAYOUT properties only
+		// Hash is identity (ImSlateId), not layout — excluded
+		return Lhs.SlotPadding == Rhs.SlotPadding
+			&& Lhs.MaxWidth == Rhs.MaxWidth && Lhs.MaxHeight == Rhs.MaxHeight
+			&& Lhs.MinWidth == Rhs.MinWidth && Lhs.MinHeight == Rhs.MinHeight
+			&& Lhs.FlagBits == Rhs.FlagBits
+			&& Lhs.StretchToCol == Rhs.StretchToCol
+			&& Lhs.ParentIdx == Rhs.ParentIdx
+			&& Lhs.AspectRatio == Rhs.AspectRatio;
+	}
 	bool Equal(const FItemSlotPod& Other) const { return *this == Other; }
-	void Apply(const FItemSlotPod& Other) { *this = Other; }
+	void Apply(const FItemSlotPod& Other)
+	{
+		uint32 SavedHash = Hash;  // Hash is identity, not layout
+		*this = Other;
+		Hash = SavedHash;
+	}
 
 	auto& SetAspectRatio(float InAspectRatio)
 	{
@@ -516,7 +596,8 @@ public:
 
 	bool IsFullRow() const { return bNewRow && bBreakLine; }
 
-	void ApplyNextItem(const ImSlateNextItemData& NextItemData);
+	// Returns true if any layout property actually changed
+	bool ApplyNextItem(const ImSlateNextItemData& NextItemData);
 };
 
 namespace Murmur3

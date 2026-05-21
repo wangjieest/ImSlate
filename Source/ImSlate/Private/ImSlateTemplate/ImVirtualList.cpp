@@ -85,6 +85,18 @@ public:
 		}
 	}
 
+	virtual void ReleaseDataWidget(int32 InIndex, TSharedRef<SWidget>& ReleasedWidget) override
+	{
+		if (ensure(Proxy.IsValid()))
+		{
+			UUserWidget* UserWidget = ImSlate::SImSlateVirtualItem::TryGetUserWidget(ReleasedWidget);
+			if (UserWidget)
+			{
+				Proxy->OnReleaseWidget(InIndex, UserWidget);
+			}
+		}
+	}
+
 	virtual float GetItemAxis(int32 InIndex = 0) const override
 	{
 		if (ensure(Proxy.IsValid()))
@@ -207,6 +219,14 @@ void UImSlateDataStorageBase::OnGenerateWidget_Implementation(int32 InIndex, UUs
 	}
 }
 
+void UImSlateDataStorageBase::OnReleaseWidget_Implementation(int32 InIndex, UUserWidget* ReleasedWidget)
+{
+	if (auto Inc = VirtualListInc)
+	{
+		IImVirtualListInc::Execute_OnReleaseWidget(Inc, InIndex, ReleasedWidget);
+	}
+}
+
 void UImSlateDataStorageBase::SetItemAxis(float InAxis, bool bRefreshWidget)
 {
 	BindingData->SetItemDefaultAxis(InAxis, bRefreshWidget);
@@ -304,6 +324,33 @@ void UImVirtualList::SetScrollbarInfo(bool bTrackAlwaysVisible, float Thickness)
 	}
 }
 
+void UImVirtualList::SetAnimateScrollDuration(float InAnimateDuration)
+{
+	if (auto VirtualList = GetNativeWidget())
+	{
+		VirtualList->SetAnimateScrollDuration(InAnimateDuration);
+	}
+}
+
+bool UImVirtualList::IsItemOffsetVisible(int32 InIndex, float InRelativePos) const
+{
+	if (auto VirtualList = GetNativeWidget())
+	{
+		return VirtualList->IsItemOffsetVisible(InIndex, InRelativePos);
+	}
+	return false;
+}
+
+float UImVirtualList::GetItemPosition(int32 InIndex)
+{
+	if (auto VirtualList = GetNativeWidget())
+	{
+		return VirtualList->GetDataOffset(InIndex);
+	}
+	
+	return 0;
+}
+
 void UImVirtualList::ScrollToPos(float InVirtualPos, bool bItemAlign)
 {
 	if (auto VirtualList = GetNativeWidget())
@@ -318,6 +365,33 @@ void UImVirtualList::ScrollToItem(int32 InDataIndex, bool bCenterAlign)
 	{
 		VirtualList->ScrollToItem(InDataIndex, bCenterAlign);
 	}
+}
+
+float UImVirtualList::GetVirtualPos() const
+{
+	if (auto VirtualList = GetNativeWidget())
+	{
+		return VirtualList->GetVirtualPos();
+	}
+	return 0.f;
+}
+
+float UImVirtualList::GetCachedTotalAxis(bool bFullItems) const
+{
+	if (auto VirtualList = GetNativeWidget())
+	{
+		return VirtualList->GetCachedTotalAxis(bFullItems);
+	}
+	return -0.f;
+}
+
+float UImVirtualList::GetVisibleAeraAxis() const
+{
+	if (auto VirtualList = GetNativeWidget())
+	{
+		return VirtualList->GetVisibleAxis();
+	}
+	return -0.f;
 }
 
 void UImVirtualList::Update(int32 InDataIndex, bool bReConstruct)
@@ -396,7 +470,7 @@ void UImVirtualList::SynchronizeProperties()
 			Inst = UGenericSingletons::CreateInstance<UUserWidget>(GetWorld(), ImSlate::GetTypeClass(BackgroundWidgetClass));
 		}
 		MyVirtualList->SetBackgroundContent(Inst ? Inst->TakeWidget() : SNullWidget::NullWidget);
-		MyVirtualList->Invalidate(EInvalidateWidgetReason::Paint);
+		MyVirtualList->Invalidate(EInvalidateWidgetReason::LayoutAndVolatility);
 		BackgroundWidget = Inst;
 	}
 #endif
@@ -406,12 +480,13 @@ void UImVirtualList::OnSynchronizeProperties_Implementation()
 {
 #if WITH_EDITORONLY_DATA && WITH_EDITOR
 	using namespace ImSlate;
-	if (GIsEditor && IsDesignTime() && (MyVirtualList || !GetWorld()->IsGameWorld()) && EditorPreviewCount >= 0 && EditorPreviewWidgetClass.Get())
+	if (GIsEditor && IsDesignTime() && (MyVirtualList || !GetWorld()->IsGameWorld()) && EditorPreviewItemCount >= 0 && EditorPreviewWidgetClass.Get())
 	{
 		auto WidgetRef = RebuildWidget();
 		struct FSharedData
 		{
 		};
+		MyVirtualList->SetTileOrthVal(EditorPreviewItemWidth);
 
 		auto BindingDataRef = MakeShared<TImSlateListArray<TSharedPtr<FSharedData>>>(false);
 		BindingDataRef->SetOnBindingData([](int32 DataIndex, const TSharedRef<SWidget>& WidgetRef, TSharedPtr<FSharedData>& DataRef) {});
@@ -419,12 +494,13 @@ void UImVirtualList::OnSynchronizeProperties_Implementation()
 			//
 			InOutWidget = ImFactoryCreate(EditorPreviewWidgetClass, &UWidgetPool);
 		});
-		BindingDataRef->SetItemAxisBinding([](int32 InIndex) { return 22.f; });
+		BindingDataRef->SetItemAxisBinding([this](int32 InIndex) { return EditorPreviewItemHeight; });
 		TArray<TSharedPtr<FSharedData>> Datas;
-		for (auto i = 0; i < EditorPreviewCount; ++i)
+		for (auto i = 0; i < EditorPreviewItemCount; ++i)
 			Datas.Add(MakeShared<FSharedData>());
 		BindingDataRef->Reload(Datas);
 		GetNativeWidget()->SetData(BindingData);
+		BindingDataRef->ScrollToPos(EditorPreviewVirtualPos);
 		BindingData = BindingDataRef;
 	}
 #endif
@@ -440,7 +516,10 @@ TSharedRef<ImSlate::SImSlateVirtualList> UImVirtualList::ConstructImWidget() con
 {
 	using namespace ImSlate;
 	auto WidgetRef = SNew(SImSlateVirtualList)
-						.WorldCtxPtr(GetWorld());
+						.WorldCtxPtr(GetWorld())
+						.OnUserScrolled(FOnUserScrolled::CreateWeakLambda(this, [this](float Val) { OnUserScrolled.Broadcast(Val); }))
+						.OnScrollBarVisibilityChanged(FOnScrollBarVisibilityChanged::CreateWeakLambda(this, [this](EVisibility Vis) { OnScrollBarVisibilityChanged.Broadcast(ConvertRuntimeToSerializedVisibility(Vis)); }))
+						.OnVirtualPosChanged(FOnVirtualPosChanged::CreateWeakLambda(this, [this](float Val) { OnVirtualPosChanged.Broadcast(Val); }));
 #if WIDGET_INCLUDE_RELFECTION_METADATA
 	// We only need to do this once, when the slate widget is created.
 	WidgetRef->AddMetadata<FReflectionMetaData>(MakeShared<FReflectionMetaData>(GetFName(), GetClass(), (UObject*)this, GetSourceAssetOrClass()));

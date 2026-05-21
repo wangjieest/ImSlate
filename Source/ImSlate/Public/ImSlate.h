@@ -65,6 +65,10 @@ IMSLATE_API void				SetNextWindowTopmost(bool Topmost, ImSlateCond Cond = 0);
 IMSLATE_API void				SetNextWindowFocus();
 IMSLATE_API void				SetNextWindowBgAlpha(float Alpha, ImSlateCond Cond = 0);
 IMSLATE_API void				SetNextWindowTitle(const FText& InTitle, ImSlateCond Cond = 0);
+
+// Set current window colors (call after Begin())
+IMSLATE_API void				SetCurrentWindowColorAndOpacity(const FLinearColor& InColor);
+IMSLATE_API void				SetCurrentWindowForegroundColor(const FSlateColor& InColor);
 IMSLATE_API void				SetNextWindowResizeCallback(ImSlateResizeCallback CustomCallback);
 
 IMSLATE_API void				SetNextWindowContentSize(const ImVec2& InSize);
@@ -107,6 +111,11 @@ IMSLATE_API void				Unindent(float indent_w = 0.0f);									// move content pos
 IMSLATE_API void				NewLine();															// undo a SameLine() or force a new line when in an horizontal-layout context.
 IMSLATE_API void				Separator();														// horizontal separator
 IMSLATE_API bool				FoldLine(ImStr Label, const FText& InText, float InHeight = 0.f);
+
+// BeginFold/EndFold: auto-indent fold regions, returns true if expanded (draw children then call EndFold)
+// Usage: if (ImSlate::BeginFold("id", TEXT("Category"))) { /* children */ ImSlate::EndFold(); }
+IMSLATE_API bool				BeginFold(ImStr Label, const FText& InText, float IndentWidth = 16.f);
+IMSLATE_API void				EndFold();
 
 IMSLATE_API void				SetNextItemAspectRatio(float InRatio);
 IMSLATE_API void				SetNextItemFillWidth(float InFactor);
@@ -157,5 +166,12 @@ IMSLATE_API ImSliderStatus_	InputRotator(ImStr Label, FRotator& ValRef, FRotator
 IMSLATE_API bool ComboBox(ImStr Label, int32& InOutCurIdx, const TSharedRef<class FImListDataComboImpl>& InDataStore, ImSlateComboFlags_ Flags = ImSlateComboFlags_None, const ImVec2& InSize = ImVec2(0, 0));
 
 IMSLATE_API bool ComboBoxForEnum(ImStr Label, int64& InOutCurIdx, UEnum* EnumPtr, ImSlateComboFlags_ Flags = ImSlateComboFlags_None, const ImVec2& InSize = ImVec2(0, 0));
+
+// Asset/Class Pickers
+// Editor: wraps SObjectPropertyEntryBox/SClassPropertyEntryBox from PropertyEditor
+// Non-Editor: falls back to InputText with path string
+IMSLATE_API bool AssetPicker(ImStr Label, FSoftObjectPath& InOutPath, UClass* FilterClass = nullptr, const ImVec2& InSize = ImVec2(0, 0));
+IMSLATE_API bool ClassPicker(ImStr Label, FSoftClassPath& InOutPath, UClass* MetaClass = nullptr, const ImVec2& InSize = ImVec2(0, 0));
+
 // clang-format on
 }  // namespace ImSlate

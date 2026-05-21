@@ -26,6 +26,8 @@
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/SCompoundWidget.h"
 #include "Widgets/Text/STextBlock.h"
+#include "Application/ThrottleManager.h"
+#include "XConsoleManager.h"
 #if ENGINE_MAJOR_VERSION >= 5
 #include "Layout/ChildrenBase.h"
 #endif
@@ -36,7 +38,7 @@ extern SImViewportGame* GetGameViewportImpl();
 
 bool bSupportImViewportHost = true;
 #if WITH_EDITOR
-FAutoConsoleVariableRef CVar_SupportImViewportHost(TEXT("z.imslate.multiview"), bSupportImViewportHost, TEXT(""));
+FXConsoleVariableRef CVar_SupportImViewportHost(TEXT("imslate.multiview"), bSupportImViewportHost, TEXT(""));
 #endif
 
 class FViewportPopupHolder
@@ -168,6 +170,7 @@ protected:
 	}
 };
 
+static int32 DisableThrottleCnt = 0;
 template<typename Base = SCompoundWidget>
 class SImSlateDragingBase : public Base
 {
@@ -209,6 +212,10 @@ public:
 		if (!DragParameters.IsSet())
 		{
 			DragParameters = FDragParameters(Target->GetCachedGeometry().GetAbsolutePosition(), MouseEvent.GetScreenSpacePosition(), MouseEvent.GetPointerIndex());
+			if (DisableThrottleCnt++ == 0)
+			{
+				FSlateThrottleManager::Get().DisableThrottle(true);
+			}
 			return FReply::Handled();
 		}
 		return FReply::Handled();
@@ -231,6 +238,10 @@ public:
 		if (DragParameters->PointerIndex == MouseEvent.GetPointerIndex())
 		{
 			DragParameters.Reset();
+			if (--DisableThrottleCnt == 0)
+			{
+				FSlateThrottleManager::Get().DisableThrottle(false);
+			}
 			return FReply::Handled();
 		}
 		return FReply::Handled();
@@ -374,7 +385,8 @@ public:
 				.HeightOverride(ComputeDesiredSize(0.f).Y)
 				[
 					SNew(SBorder)
-					.BorderImage(MakeAttributeWeakLambda(this, [this]() { return this->HeaderBrush(); }))
+					// UE 5.7: Use TAttribute::CreateSP for Slate widgets (non-UObject types)
+					//.BorderImage(TAttribute<const FSlateBrush*>::CreateSP(this, &SImHeaderArea::HeaderBrush))
 					.Visibility(EVisibility::SelfHitTestInvisible)
 					.Content()
 					[
@@ -395,7 +407,8 @@ public:
 						.AutoWidth()
 						[
 							SNew(STextBlock)
-							.Text(MakeAttributeWeakLambda(this, [this] { return Target->GetTitleText(); }))
+							// UE 5.7: Use TAttribute::CreateSP for member access in Slate widgets
+							.Text(TAttribute<FText>::CreateSP(Target, &SImSlateWindow::GetTitleText))
 							.ColorAndOpacity(FLinearColor::White)
 						]
 						+ SHorizontalBox::Slot()
@@ -412,7 +425,10 @@ public:
 						[
 							SNew(SButton)
 							.Text(NSLOCTEXT("ImSlate", "CloseIcon", "X"))
-							.Visibility(MakeAttributeWeakLambda(this, [this] { return Target->ShouldShowCloseButton() ? EVisibility::Visible : EVisibility::Collapsed; }))
+							// UE 5.7: Use TAttribute::CreateLambda with this pointer capture to access member variable
+							.Visibility(TAttribute<EVisibility>::CreateLambda([this]() {
+								return this->Target->ShouldShowCloseButton() ? EVisibility::Visible : EVisibility::Collapsed;
+							}))
 							.OnClicked(this, &SImHeaderArea::OnCloseBtnClick)
 						]
 					]
@@ -573,39 +589,6 @@ FText SImSlateWindow::GetTitleText() const
 
 bool SImSlateWindow::CustomPrepass(float LayoutScaleMultiplier)
 {
-	bool bChildOrderChanged = false;
-	static auto ProcessChildren = [](auto& Chldren, auto& NewChildren) {
-		do
-		{
-			if (NewChildren.Slots.Num() != Chldren.Slots.Num())
-				break;
-			bool bDifferentWidget = false;
-			for (auto i = 0; i < Chldren.Slots.Num(); ++i)
-			{
-				if (Chldren.Slots[i].GetWidget() != NewChildren.Slots[i].GetWidget())
-				{
-					bDifferentWidget = true;
-					break;
-				}
-				Chldren.Slots[i].Apply(NewChildren.Slots[i]);
-			}
-			if (bDifferentWidget)
-				break;
-			NewChildren.ResetSlots();
-			return false;
-		} while (false);
-
-		Chldren.ResetSlots();
-		Chldren.Slots = MoveTemp(NewChildren.Slots);
-		return true;
-	};
-
-	if (!(Flags & ImSlateWindowFlags_EventDrived) && (!WITH_EDITOR || (FSlateThrottleManager::Get().IsAllowingExpensiveTasks() /*&& !!ChildPanel->NewChildren.Num()*/)))
-	{
-		bChildOrderChanged = ProcessChildren(ChildPanel->Children, ChildPanel->NewChildren);
-	}
-	if (bChildOrderChanged)
-		Invalidate(EInvalidateWidgetReason::ChildOrder);
 	return true;
 }
 
@@ -839,7 +822,51 @@ void SImSlateWindow::BringWindowToFront()
 	}
 }
 
-FItemSlotPod* SImSlateWindow::FindItem(ImSlateId InId, SWidget** OutWidget)
+void SImSlateWindow::BeginItemFrame()
+{
+	if (!(Flags & ImSlateWindowFlags_EventDrived) && ChildPanel)
+	{
+		ChildPanel->BeginItemFrame();
+	}
+}
+
+void SImSlateWindow::CommitItemFrame()
+{
+	if (ChildPanel)
+	{
+		ChildPanel->CommitItemFrame();
+	}
+}
+
+void SImSlateWindow::SetItemParent(ImSlateId ItemId)
+{
+	if (ChildPanel) ChildPanel->SetItemParent(ItemId);
+}
+
+void SImSlateWindow::PushFoldContext(ImSlateId FoldId)
+{
+	if (ChildPanel) ChildPanel->PushFoldContext(FoldId);
+}
+
+void SImSlateWindow::PopFoldContext()
+{
+	if (ChildPanel) ChildPanel->PopFoldContext();
+}
+
+void SImSlateWindow::SetFoldCollapsed(ImSlateId FoldId, bool bCollapsed)
+{
+	if (ChildPanel) ChildPanel->SetFoldCollapsed(FoldId, bCollapsed);
+}
+
+void SImSlateWindow::MarkPanelLayoutDirty()
+{
+	if (ChildPanel)
+	{
+		ChildPanel->MarkLayoutDirty();
+	}
+}
+
+FItemSlotPod* SImSlateWindow::FindItem(ImSlateId InId, SWidget** OutWidget, int32* OutChildIndex)
 {
 	auto FindIdx = ChildPanel->CachedItems.FindIndexById(InId);
 	if (FindIdx != INDEX_NONE)
@@ -850,9 +877,17 @@ FItemSlotPod* SImSlateWindow::FindItem(ImSlateId InId, SWidget** OutWidget)
 			return nullptr;
 		}
 
+		// During frame build, only find items from previous frame (not same-frame additions)
+		if (ChildPanel->bFrameStarted && FindIdx >= ChildPanel->GetFrameBaseChildCount())
+		{
+			return nullptr;
+		}
+
 		auto Slot = &ChildPanel->Children[FindIdx];
 		if (OutWidget)
 			*OutWidget = &Slot->GetWidget().Get();
+		if (OutChildIndex)
+			*OutChildIndex = FindIdx;
 		return Slot;
 	}
 	return nullptr;
@@ -861,14 +896,29 @@ FItemSlotPod* SImSlateWindow::FindItem(ImSlateId InId, SWidget** OutWidget)
 FItemSlotPod& SImSlateWindow::AddItem(ImSlateId InId, const TSharedRef<SWidget>& Item)
 {
 	if (!(Flags & ImSlateWindowFlags_EventDrived))
-		ChildPanel->CachedItems.Add(InId, ChildPanel->NewChildren.Num());
+	{
+		int32 NewIndex = ChildPanel->Children.Num();
+		ChildPanel->CachedItems.Add(InId, NewIndex);
+	}
 	return !!(Flags & ImSlateWindowFlags_EventDrived) ? ChildPanel->AddCurrentSlot(InId)[Item] : ChildPanel->AddSlot(InId)[Item];
+}
+
+bool SImSlateWindow::ReuseItem(ImSlateId InId, int32 ExistingChildIndex)
+{
+	if (!(Flags & ImSlateWindowFlags_EventDrived))
+	{
+		return ChildPanel->TouchSlot(ExistingChildIndex);
+	}
+	return true;
 }
 
 void SImSlateWindow::AddExistItem(ImSlateId InId, FItemSlotPod* InExistSlot)
 {
 	if (!(Flags & ImSlateWindowFlags_EventDrived))
-		ChildPanel->CachedItems.Add(InId, ChildPanel->NewChildren.Num());
+	{
+		int32 NewIndex = ChildPanel->Children.Num();
+		ChildPanel->CachedItems.Add(InId, NewIndex);
+	}
 	!!(Flags & ImSlateWindowFlags_EventDrived) ? ChildPanel->AddCurrentSlot(static_cast<SImSlatePanel::FSlot*>(InExistSlot)) : ChildPanel->AddSlot(static_cast<SImSlatePanel::FSlot*>(InExistSlot));
 }
 
@@ -952,11 +1002,13 @@ FReply SImSlateWindow::OnPreviewMouseButtonDown(const FGeometry& MyGeometry, con
 
 FReply SImSlateWindow::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
-	if (MouseEvent.IsMouseButtonDown(EKeys::LeftMouseButton))
+	// Slate routes events leaf→root. If we reach here, no child widget handled the click.
+	// Safe to start drag detection for window movement.
+	if (MouseEvent.IsMouseButtonDown(EKeys::LeftMouseButton) && !(Flags & ImSlateWindowFlags_NoMove))
 	{
 		return FReply::Handled().DetectDrag(this->AsShared(), EKeys::LeftMouseButton).PreventThrottling();
 	}
-	return SImSlateWindowBase::OnMouseButtonDown(MyGeometry, MouseEvent);
+	return FReply::Unhandled();
 }
 
 float SImSlateWindow::GetTitleHeight() const

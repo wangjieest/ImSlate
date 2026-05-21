@@ -1,4 +1,4 @@
-﻿#include "InGameUIManager.h"
+#include "InGameUIManager.h"
 #include "Components/CanvasPanelSlot.h"
 #include "GenericSingletons.h"
 //#include "ResourceLoader.h"
@@ -25,14 +25,13 @@ bool UInGameUIManager::InitUIManager(const TArray<FInGameUIRegisterInfo*>& RowIt
 		return false;
 	}
 
-	// 初始化注册表
-	for (const auto Item : RowItems)
+	for (const auto& Item : RowItems)
 	{
 		RegisterWidget(*Item);
 	}
 	// WidgetPool.SetWorld(Ctx->GetWorld());
 
-	MainPanel = NewObject<UInGameMainPanelBase>(GetWorld(),  GetManPanerlClass(OverrideCls), "Main Panel");
+	MainPanel = NewObject<UInGameMainPanelBase>(GetWorld(),  GetManPanelClass(OverrideCls), "Main Panel");
 	MainPanel->AddToGame(GetWorld(), DefaultZOrder);
 	UE_LOG(LogInGameUIManager, Log, TEXT("Success Initial InGameUIManager And Create CanvasPanel To Viewport!"));
 	return true;
@@ -40,8 +39,6 @@ bool UInGameUIManager::InitUIManager(const TArray<FInGameUIRegisterInfo*>& RowIt
 
 bool UInGameUIManager::ShowWidgetByName(FName InName, const FGMPStructUnion& InPayload, bool bBringToTop, const FOnShownComplete& OnComplete, const FOnShownFailed& OnFailed)
 {
-	
-	// 若UI已创建，直接设置可见性
 	if (IsUICreated(InName))
 	{
 		UE_LOG(LogInGameUIManager, Log, TEXT("Widget(%s) is Already Created!"), *InName.ToString());
@@ -67,7 +64,6 @@ bool UInGameUIManager::ShowWidgetByName(FName InName, const FGMPStructUnion& InP
 	}
 
 	const FSoftObjectPath& ObjPath = GlobalUIMap[InName].ToSoftObjectPath();
-	//UResourceLoader::AsyncResolve(GetWorld(), ObjPath, CreateWeakLambda(this, [this, InPayload, InName, OnComplete, OnFailed](const FResResolveResult& ResResolveResult) { 
 	UGenericSingletons::AsyncLoadCls(ObjPath.ToString(), this, [this, InPayload, InName, OnComplete, OnFailed](UClass* WidgetClass) { 
 		if (WidgetClass && ensure(WidgetClass->ImplementsInterface(UInGameUIInc::StaticClass())))
 		{
@@ -88,7 +84,6 @@ bool UInGameUIManager::ShowWidgetByName(FName InName, const FGMPStructUnion& InP
 				ActivateWidgetStack.Add(InName);
 				UE_LOG(LogInGameUIManager, Log, TEXT("Success Create Widget(%s)!"), *InName.ToString());
 
-				// 调用Invoke
 				IInGameUIInc::Execute_OnShown(CreatedWidgetMap[InName], InPayload);
 				OnComplete.ExecuteIfBound();
 			}
@@ -107,7 +102,6 @@ bool UInGameUIManager::ShowWidgetByName(FName InName, const FGMPStructUnion& InP
 	return true;
 }
 
-// 注册
 bool UInGameUIManager::RegisterWidget(const FInGameUIRegisterInfo& RegInfo)
 {
 	if (IsUIRegisted(RegInfo.RegName))
@@ -131,7 +125,6 @@ bool UInGameUIManager::UnregisterWidget(const FInGameUIRegisterInfo& RegInfo)
 }
 
 
-// 设置可见性
 void UInGameUIManager::SetWidgetVisibility(FName InName, ESlateVisibility InVisibility)
 {
 	if (!IsUICreated(InName))
@@ -192,7 +185,7 @@ void UInGameUIManager::HiddenAll()
 	}
 }
 
-UClass* UInGameUIManager::GetManPanerlClass(TSubclassOf<UInGameMainPanelBase> InCls)
+UClass* UInGameUIManager::GetManPanelClass(TSubclassOf<UInGameMainPanelBase> InCls)
 {
 	if (InCls)
 	{
@@ -249,14 +242,12 @@ void UInGameMainPanelBase::OnSlotAdded(UPanelSlot* InSlot)
 void UInGameMainPanelBase::OnSlotRemoved(UPanelSlot* InSlot)
 {
 	/*
-	* 防止手动对Widget Ref RemoveFromParent
-	* 强制更新UI Manager信息
-	* 兜底操作
+	* Avoid Widget reference RemoveFromParent
+	* Force refresh UI Manager info
 	*/
 	UE_LOG(LogInGameUIManager, Warning, TEXT("Slot Remove, Slot Content Is %s"), *FString(InSlot->Content->GetClass()->GetName()));
 	UClass* UMGClass = InSlot->Content->GetClass();
 
-	// 确保Slot Content实现UInGameUIInc接口
 	if (ensure(UMGClass->ImplementsInterface(UInGameUIInc::StaticClass())))
 	{
 		FName WidgetName = InSlot->Content->GetFName();
@@ -272,12 +263,16 @@ void UInGameMainPanelBase::OnSlotRemoved(UPanelSlot* InSlot)
 		}
 		else
 		{
-			// 理论上不应该走到这里
 			UE_LOG(LogInGameUIManager, Error, TEXT("Slot Remove, UnKnown Error"), *WidgetName.ToString());
 		}
 	}
 	
 	Super::OnSlotRemoved(InSlot);
+}
+
+void UInGameMainPanelBase::OnWidgetBecomeTop(UWidget* NewTopWidget, UWidget* OldTop)
+{
+	
 }
 
 void UInGameMainPanelBase::OnLeaveWorld(UWorld* InWorld)

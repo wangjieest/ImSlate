@@ -191,7 +191,7 @@ bool UInGameToastManager::DequeueToast(float DeltaSeconds)
 	if (ItemPtr->LeftDuration <= 0.f)
 	{
 		auto Widget = ItemPtr->Widget;
-
+		OnHideWidget(Widget, ItemPtr->StructUnion);
 		ToastQueue.RemoveAt(0);
 		return true;
 	}

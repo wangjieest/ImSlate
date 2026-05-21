@@ -12,16 +12,25 @@ class IMSLATE_API SImFoldLine : public STextBlock
 {
 public:
 	using FArguments = STextBlock::FArguments;
-	void Construct(const FArguments& Args, bool bInIsFolded = false)
+	void Construct(const FArguments& Args, bool bInIsFolded = true)
 	{
 		bIsFolded = bInIsFolded;
-		return STextBlock::Construct(Args);
+		STextBlock::Construct(Args);
+		SetVisibility(EVisibility::Visible);  // STextBlock defaults to HitTestInvisible — make clickable
 	}
 	bool GetIsFolded() const { return bIsFolded; }
 	void SetFold(bool bInIsFolded = true) { bIsFolded = bInIsFolded; }
 
+	// Override SetText to prepend fold indicator
+	void SetTextWithFoldIndicator(const FText& InText);
+
 protected:
-	bool bIsFolded = false;
+	bool bIsFolded = true;
+	FText OriginalText;
+
+	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FCursorReply OnCursorQuery(const FGeometry& MyGeometry, const FPointerEvent& CursorEvent) const override;
+
 	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled)
 		const override;
 	friend class UImFoldLine;

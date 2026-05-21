@@ -6,22 +6,51 @@
 
 #include "Widgets/SInvalidationPanel.h"
 
+void SImFoldLine::SetTextWithFoldIndicator(const FText& InText)
+{
+	OriginalText = InText;
+	FString Arrow = bIsFolded ? TEXT("\x25B6 ") : TEXT("\x25BC ");
+	SetText(FText::FromString(Arrow + InText.ToString()));
+}
+
+FReply SImFoldLine::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+	{
+		bIsFolded = !bIsFolded;
+		SetTextWithFoldIndicator(OriginalText);
+		return FReply::Handled();
+	}
+	return FReply::Unhandled();
+}
+
+FCursorReply SImFoldLine::OnCursorQuery(const FGeometry& MyGeometry, const FPointerEvent& CursorEvent) const
+{
+	return FCursorReply::Cursor(EMouseCursor::Hand);
+}
+
 int32 SImFoldLine::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled)
 	const
 {
-#if 0
-	const FSlateBrush* BrushResource = BorderImage.Get();
-	if (BrushResource && BrushResource->DrawAs != ESlateBrushDrawType::NoDrawType)
-	{
-		FSlateDrawElement::MakeBox(OutDrawElements,
-								   LayerId,
-								   AllottedGeometry.ToPaintGeometry(),
-								   BrushResource,
-								   ESlateDrawEffect::None,
-								   BrushResource->GetTint(InWidgetStyle) * InWidgetStyle.GetColorAndOpacityTint() /* * BorderBackgroundColor.Get().GetColor(InWidgetStyle)*/);
-	}
-#endif
-	return STextBlock::OnPaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
+	// Draw header background — subtle bar like ImGui's CollapsingHeader
+	static FSlateBrush HeaderBrush;
+	HeaderBrush.DrawAs = ESlateBrushDrawType::RoundedBox;
+	HeaderBrush.OutlineSettings.RoundingType = ESlateBrushRoundingType::FixedRadius;
+	HeaderBrush.OutlineSettings.CornerRadii = FVector4(3.f, 3.f, 3.f, 3.f);
+
+	FLinearColor BgColor = bIsFolded
+		? FLinearColor(0.188f, 0.188f, 0.188f, 0.6f)   // folded: darker
+		: FLinearColor(0.25f, 0.25f, 0.25f, 0.6f);      // expanded: slightly lighter
+
+	FSlateDrawElement::MakeBox(
+		OutDrawElements,
+		LayerId,
+		AllottedGeometry.ToPaintGeometry(),
+		&HeaderBrush,
+		ESlateDrawEffect::None,
+		BgColor);
+
+	return STextBlock::OnPaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId + 1, InWidgetStyle, bParentEnabled);
 }
 
 TSharedRef<SImFoldLine> UImFoldLine::ConstructImWidget() const
@@ -102,6 +131,9 @@ TSharedRef<SImFoldLine> UImFoldLine::ConstructImWidget() const
 	MyStealTextBlock->BorderImage.SetImage(MyStealTextBlock.Get(), &Background);
 
 	const_cast<UImFoldLine*>(this)->Super::SynchronizeTextLayoutProperties(*MyStealTextBlock);
+
+	// Ensure hit-testable for click-to-fold interaction
+	MyStealTextBlock->SetVisibility(EVisibility::Visible);
 
 	return MyStealTextBlock;
 }

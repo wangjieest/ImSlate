@@ -6,7 +6,7 @@
 
 #include "Blueprint/UserWidget.h"
 #include "Blueprint/UserWidgetPool.h"
-#include "GMP/GMPUnion.h"
+#include "GMPCore.h"
 #include "ImSlateWidgetPool.h"
 #include "Modules/ModuleManager.h"
 #include "Tickable.h"
@@ -50,14 +50,14 @@ struct FInGameToastItem
 {
 	GENERATED_BODY()
 public:
-	UPROPERTY(BlueprintReadOnly, Category = "XToastManager")
+	UPROPERTY(BlueprintReadOnly, Category = "InGameToast")
 	FGMPStructUnion StructUnion;
-	UPROPERTY(BlueprintReadOnly, Category = "XToastManager")
+	UPROPERTY(BlueprintReadOnly, Category = "InGameToast")
 	float LeftDuration = 3.f;
-	UPROPERTY(BlueprintReadWrite, Category = "XToastManager")
+	UPROPERTY(BlueprintReadWrite, Category = "InGameToast")
 	float FadingDuration = 1.f;
 	UPROPERTY()
-	UWidget* Widget = nullptr;
+	TObjectPtr<UWidget> Widget = nullptr;
 };
 
 UCLASS(Abstract, Blueprintable)
@@ -65,41 +65,41 @@ class UInGameToastManager : public UObject
 {
 	GENERATED_BODY()
 public:
-	UFUNCTION(BlueprintCallable, Category = "XToastManager", meta = (CustomClassPinPicker, WorldContext = "InWorldContext"))
+	UFUNCTION(BlueprintCallable, Category = "InGameToast", meta = (CustomClassPinPicker, WorldContext = "InWorldContext"))
 	static UInGameToastManager* GetSingleton(UObject* InWorldContext, UPARAM(meta = (AllowAbstract = false)) TSubclassOf<UInGameToastManager> InClass = nullptr);
 
-	UFUNCTION(BlueprintCallable, Category = "XToastManager", meta = (AutoCreateRefTerm = "Union"))
+	UFUNCTION(BlueprintCallable, Category = "InGameToast", meta = (AutoCreateRefTerm = "Union", AdvancedDisplay = "Union"))
 	void ShowToast(const FGMPStructUnion& Union);
 
 	virtual void PostInitProperties() override;
 
 public:
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "XToastManager", Meta = (MetaClass = "/Script/UMG.Widget", MustImplement = "/Script/XToastManager.XToastWidgetInc"))
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "InGameToast", Meta = (MetaClass = "/Script/UMG.Widget", MustImplement = "/Script/InGameToast.XToastWidgetInc"))
 	FSoftObjectPath ToastWidgetPath;
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "XToastManager")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "InGameToast")
 	float DefaultDuration = 3.f;
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "XToastManager")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "InGameToast")
 	float QueueCount = 1;
 
 	static void AddReferencedObjects(UObject* InThis, FReferenceCollector& Collector);
 
 protected:
-	UFUNCTION(BlueprintNativeEvent, Category = "XToastManager")
+	UFUNCTION(BlueprintNativeEvent, Category = "InGameToast")
 	void OnShowWidget(UWidget* OutWidget, const FGMPStructUnion& Union);
-	UFUNCTION(BlueprintNativeEvent, Category = "XToastManager")
+	UFUNCTION(BlueprintNativeEvent, Category = "InGameToast")
 	void OnHideWidget(UWidget* InWidget, const FGMPStructUnion& Union);
 
-	UFUNCTION(BlueprintNativeEvent, Category = "XToastManager")
+	UFUNCTION(BlueprintNativeEvent, Category = "InGameToast")
 	void OnAllocWidget(UWidget*& OutWidget);
-	UFUNCTION(BlueprintNativeEvent, Category = "XToastManager")
+	UFUNCTION(BlueprintNativeEvent, Category = "InGameToast")
 	void OnFreeWidget(UWidget* InWidget);
 
-	UFUNCTION(BlueprintCallable, Category = "XToastManager")
+	UFUNCTION(BlueprintCallable, Category = "InGameToast")
 	UWidget* GerWidgetFromPool(TSubclassOf<UWidget> InWidgetClass);
-	UFUNCTION(BlueprintCallable, Category = "XToastManager")
+	UFUNCTION(BlueprintCallable, Category = "InGameToast")
 	void ReleaseWidgetToPool(UWidget* Widget);
 
-	UFUNCTION(BlueprintNativeEvent, Category = "XToastManager")
+	UFUNCTION(BlueprintNativeEvent, Category = "InGameToast")
 	void OnWidgetClassLoaded(TSubclassOf<UWidget> InWidgetClass);
 	UPROPERTY(Transient, BlueprintReadWrite)
 	TSubclassOf<UWidget> WidgetClass = nullptr;

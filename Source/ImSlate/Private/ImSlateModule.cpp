@@ -88,7 +88,6 @@ struct FWorldContextRoot : public ImSlateContext
 			this->Viewports.Add(SNew(SImViewportGame, 1023)
 								.GameViewportClient(Viewport)
 								.Visibility(EVisibility::SelfHitTestInvisible));
-			Viewport->OnTick().AddRaw(this, &FWorldContextRoot::Tick);
 			WeakViewPortClient = Viewport;
 		}
 #if WITH_EDITOR
@@ -108,23 +107,21 @@ struct FWorldContextRoot : public ImSlateContext
 									.LevelEditor(IncLevelEditor)
 									.Visibility(EVisibility::SelfHitTestInvisible));
 			}
-			GEditor->OnPostEditorTick().AddRaw(this, &FWorldContextRoot::TickEditor);
-			BeginFrameImpl(0.01f, this);
 		}
 #endif
+		// Unified tick: drive from Slate PreTick so Draw completes before DrawWindows
+		if (FSlateApplication::IsInitialized())
+		{
+			FSlateApplication::Get().OnPreTick().AddRaw(this, &FWorldContextRoot::SlatePreTick);
+		}
+		BeginFrameImpl(0.01f, this);
 	}
 	~FWorldContextRoot()
 	{
-		if (WeakViewPortClient.IsValid())
+		if (FSlateApplication::IsInitialized())
 		{
-			WeakViewPortClient->OnTick().RemoveAll(this);
+			FSlateApplication::Get().OnPreTick().RemoveAll(this);
 		}
-#if WITH_EDITOR
-		if (GIsEditor)
-		{
-			GEditor->OnPostEditorTick().RemoveAll(this);
-		}
-#endif
 		for (auto& Viewport : this->Viewports)
 		{
 			Viewport->RemoveAllWindow();
@@ -143,27 +140,36 @@ struct FWorldContextRoot : public ImSlateContext
 	GMP::TSignal<false, float, UWorld*> ImSlateSignals;
 
 protected:
-	void Tick(float DeltaTime)
+	void EnsureViewportWidget()
 	{
+		if (Viewports.Num() == 0 && !WeakViewPortClient.IsValid())
+		{
+			if (auto Viewport = RawWorldPtr ? RawWorldPtr->GetGameViewport() : nullptr)
+			{
+				Viewports.Add(SNew(SImViewportGame, 1023)
+							.GameViewportClient(Viewport)
+							.Visibility(EVisibility::SelfHitTestInvisible));
+				WeakViewPortClient = Viewport;
+			}
+		}
+	}
+
+	void SlatePreTick(float DeltaTime)
+	{
+		// Guard GWorld for this root's World context (PIE, Editor, Game)
+		TGuardValue<UWorld*> WorldGuard(reinterpret_cast<UWorld*&>(GWorld), RawWorldPtr);
+
+		EnsureViewportWidget();
+
 		if (this->bIsFrameStarted)
 		{
-			// Ending frame will produce render output that we capture and store for later use. This also puts context to
-			// state in which it does not allow to draw controls, so we want to immediately start a new frame.
 			EndFrameImpl(this);
 		}
 
-		// Begin a new frame and set the context back to a state in which it allows to draw controls.
 		BeginFrameImpl(DeltaTime, this);
 		ImSlateSignals.FireWithSigSource(RawWorldPtr, DeltaTime, RawWorldPtr);
 	}
-#if WITH_EDITOR
-	void TickEditor(float DeltaTime)
-	{
-		static_assert(sizeof(UWorld*) == sizeof(GWorld), "err");
-		TGuardValue<UWorld*> WroldGuard(reinterpret_cast<UWorld*&>(GWorld), RawWorldPtr);
-		Tick(DeltaTime);
-	}
-#endif
+
 	TWeakObjectPtr<UGameViewportClient> WeakViewPortClient;
 };
 }  // namespace ImSlate
@@ -254,7 +260,7 @@ UWorld* GetWorldChecked(const UObject* InCtx)
 			return World;
 		};
 
-		FWorldContext* WorldContext = GEngine->GetWorldContextFromPIEInstance(FMath::Max(0, (int32)GPlayInEditorID));
+		FWorldContext* WorldContext = GEngine->GetWorldContextFromPIEInstance(FMath::Max(0, UE::GetPlayInEditorID()));
 		if (ensure(WorldContext && (WorldContext->WorldType == EWorldType::PIE /* || WorldContext->WorldType == EWorldType::Game*/)))
 		{
 			World = WorldContext->World();

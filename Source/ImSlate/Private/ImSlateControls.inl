@@ -681,7 +681,7 @@ ImSliderStatus_ NumericGeneric(ImStr Label,  //
 		}));
 
 		Ptr->ChangedValue = ValRef;
-		WidgetRef->SetValue(MakeAttributeWeakLambda(Ptr, [Ptr]() { return TOptional<T>(Ptr->ChangedValue); }));
+		WidgetRef->SetValue(TAttribute<TOptional<T>>::CreateSPLambda(Meta, [Ptr]() { return TOptional<T>(Ptr->ChangedValue); }));
 		return WidgetRef;
 	});
 
@@ -909,9 +909,9 @@ bool Image(ImStr Label, UObject* InTexture, const ImVec2& InSize)
 
 		Meta->ImageBrush = FSlateImageBrush(InTexture, BrushSize);
 		WidgetRef->SetImage(&Meta->ImageBrush);
-		auto Ptr = &Meta.Get();
 
-		WidgetRef->SetImage(MakeAttributeWeakLambda(Ptr, [Ptr]() { return (const FSlateBrush*)&Ptr->ImageBrush; }));
+		// UE 5.7: Use TAttribute::CreateLambda for non-UObject types with lambda capture
+		WidgetRef->SetImage(TAttribute<const FSlateBrush*>::CreateLambda([Meta]() { return (const FSlateBrush*)&Meta->ImageBrush; }));
 		WidgetRef->AddMetadata(Meta);
 		return WidgetRef;
 	});
@@ -1355,6 +1355,116 @@ ImSliderStatus_ InputRotator(ImStr Label,
 			break;
 	}
 	return StateOut;
+}
+
+//////////////////////////////////////////////////////////////////////////
+// Asset/Class Pickers — thin bridge to SImAssetPicker / SImClassPicker
+//////////////////////////////////////////////////////////////////////////
+
+struct FAssetPickerMeta
+	: public TSharedFromThis<FAssetPickerMeta>
+	, public ISlateMetaData
+{
+	SLATE_METADATA_TYPE(FAssetPickerMeta, ISlateMetaData)
+public:
+	bool bHasChanged = false;
+	FSoftObjectPath ChangedPath;
+};
+
+bool AssetPicker(ImStr Label, FSoftObjectPath& InOutPath, UClass* FilterClass, const ImVec2& InSize)
+{
+	auto ItemPtr = Item<SImAssetPicker>(Label, [&](FItemSlotPod& InItem) {
+		InItem.bFillWidth = true;
+		InItem.StretchValue = 1.f;
+		InItem.HAlignment = HAlign_Fill;
+		InItem.VAlignment = VAlign_Center;
+
+		auto Meta = MakeShared<FAssetPickerMeta>();
+		Meta->ChangedPath = InOutPath;
+		auto Ptr = &Meta.Get();
+
+		TSharedRef<SImAssetPicker> WidgetRef = SNew(SImAssetPicker)
+			.FilterClass(FilterClass)
+			.ObjectPath(InOutPath.ToString())
+			.OnAssetPathChanged_Lambda([Ptr](const FSoftObjectPath& NewPath) {
+				Ptr->ChangedPath = NewPath;
+				Ptr->bHasChanged = true;
+			});
+
+		SetDesiredSize(WidgetRef, InSize);
+		WidgetRef->AddMetadata(Meta);
+		return WidgetRef;
+	});
+
+	bool RetVal = false;
+	if (auto Meta = GetMetaData<FAssetPickerMeta>(ItemPtr))
+	{
+		if (Meta->bHasChanged)
+		{
+			RetVal = true;
+			InOutPath = Meta->ChangedPath;
+			Meta->bHasChanged = false;
+		}
+		else
+		{
+			ItemPtr->SetObjectPath(InOutPath.ToString());
+		}
+	}
+	return RetVal;
+}
+
+struct FClassPickerMeta
+	: public TSharedFromThis<FClassPickerMeta>
+	, public ISlateMetaData
+{
+	SLATE_METADATA_TYPE(FClassPickerMeta, ISlateMetaData)
+public:
+	bool bHasChanged = false;
+	FSoftClassPath ChangedPath;
+};
+
+bool ClassPicker(ImStr Label, FSoftClassPath& InOutPath, UClass* MetaClass, const ImVec2& InSize)
+{
+	auto ItemPtr = Item<SImClassPicker>(Label, [&](FItemSlotPod& InItem) {
+		InItem.bFillWidth = true;
+		InItem.StretchValue = 1.f;
+		InItem.HAlignment = HAlign_Fill;
+		InItem.VAlignment = VAlign_Center;
+
+		auto Meta = MakeShared<FClassPickerMeta>();
+		Meta->ChangedPath = InOutPath;
+		auto Ptr = &Meta.Get();
+
+		const UClass* SelectedClass = InOutPath.TryLoadClass<UObject>();
+
+		TSharedRef<SImClassPicker> WidgetRef = SNew(SImClassPicker)
+			.MetaClass(MetaClass)
+			.SelectedClass(SelectedClass)
+			.OnClassPathChanged_Lambda([Ptr](const FSoftClassPath& NewPath) {
+				Ptr->ChangedPath = NewPath;
+				Ptr->bHasChanged = true;
+			});
+
+		SetDesiredSize(WidgetRef, InSize);
+		WidgetRef->AddMetadata(Meta);
+		return WidgetRef;
+	});
+
+	bool RetVal = false;
+	if (auto Meta = GetMetaData<FClassPickerMeta>(ItemPtr))
+	{
+		if (Meta->bHasChanged)
+		{
+			RetVal = true;
+			InOutPath = Meta->ChangedPath;
+			Meta->bHasChanged = false;
+		}
+		else
+		{
+			ItemPtr->SetClassPath(InOutPath);
+		}
+	}
+	return RetVal;
 }
 
 }  // namespace ImSlate
