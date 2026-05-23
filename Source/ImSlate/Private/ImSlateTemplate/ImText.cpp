@@ -75,7 +75,7 @@ TSharedRef<STextBlock> UImTextBlock::ConstructImWidget() const
 	// UWidget
 
 	// MyStealTextBlock->SetText(TextBinding);
-	MyStealTextBlock->SetFont(GetFont());
+	MyStealTextBlock->SetFont(ImSlate::ScaleImSlateFont(GetFont()));
 	MyStealTextBlock->SetStrikeBrush(&GetStrikeBrush());
 	MyStealTextBlock->SetColorAndOpacity(GetColorAndOpacity());
 	MyStealTextBlock->SetShadowOffset(GetShadowOffset());

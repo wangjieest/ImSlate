@@ -309,15 +309,21 @@ ImSlateContext* GetGImSlate()
 
 TSharedPtr<void> ImSlateTicker::BindDelegate(ImSlateTicker::FOnTickWithWorld Delegate, UWorld* InWorld)
 {
-	auto& g = *GetGImSlate(InWorld);
-	auto Elm = g.ImSlateSignals.Connect((UObject*)nullptr, MoveTemp(Delegate));
-	return g.ImSlateSignals.BindSignalConnection(Elm);
+	if (auto* Ptr = GetGImSlate(InWorld))
+	{
+		auto Elm = Ptr->ImSlateSignals.Connect((UObject*)nullptr, MoveTemp(Delegate));
+		return Ptr->ImSlateSignals.BindSignalConnection(Elm);
+	}
+	return nullptr;
 }
 TSharedPtr<void> ImSlateTicker::BindDelegate(ImSlateTicker::FOnTick Delegate, UWorld* InWorld)
 {
-	auto& g = *GetGImSlate(InWorld);
-	auto Elm = g.ImSlateSignals.Connect((UObject*)nullptr, MoveTemp(Delegate));
-	return g.ImSlateSignals.BindSignalConnection(Elm);
+	if (auto* Ptr = GetGImSlate(InWorld))
+	{
+		auto Elm = Ptr->ImSlateSignals.Connect((UObject*)nullptr, MoveTemp(Delegate));
+		return Ptr->ImSlateSignals.BindSignalConnection(Elm);
+	}
+	return nullptr;
 }
 
 }  // namespace ImSlate

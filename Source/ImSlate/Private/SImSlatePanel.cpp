@@ -5,9 +5,23 @@
 #include "Layout/Margin.h"
 #include "SImSlateWindow.h"
 #include "Types/SlateEnums.h"
+#include "XConsoleManager.h"
+
+float GImSlateLayoutScale = (PLATFORM_ANDROID || PLATFORM_IOS) ? 2.f : 1.f;
+static FAutoConsoleVariableRef CVar_ImSlateLayoutScale(
+	TEXT("imslate.LayoutScale"),
+	GImSlateLayoutScale,
+	TEXT("Content layout scale for ImSlate panels. 1.0 = default. >1.0 = larger widgets/text."));
+XMetaVar(TEXT("imslate.LayoutScale"), DisplayName, TEXT("UI Scale"))(ClampMin, 0.5)(ClampMax, 4.0)(UIMin, 0.5)(UIMax, 4.0);
 
 namespace ImSlate
 {
+
+float GetImSlateEffectiveScale()
+{
+	float SystemDPI = SImSlateViewport::StaticGetDPIScaleFactorAtPoint(FVector2D::ZeroVector);
+	return FMath::Max(SystemDPI * GImSlateLayoutScale, 1.f);
+}
 extern void PrepassInternal(const TSharedRef<SWidget>& InWidget, float LayoutScaleMultiplier);
 
 //////////////////////////////////////////////////////////////////////////
@@ -235,8 +249,35 @@ void SImSlatePanel::SetFoldCollapsed(ImSlateId FoldId, bool bCollapsed)
 	}
 	else
 	{
-		PushFoldContext(FoldId);  // reuse un-collapse logic
-		PopFoldContext();         // but don't keep it on the stack
+		if (CollapsedFoldIds.Remove(FoldId) > 0)
+		{
+			// Recursively restore visibility of all descendants
+			TArray<ImSlateId> FoldsToRestore;
+			FoldsToRestore.Add(FoldId);
+
+			while (FoldsToRestore.Num() > 0)
+			{
+				ImSlateId CurrentFold = FoldsToRestore.Pop();
+				for (int32 i = 0; i < Children.Num(); ++i)
+				{
+					ImSlateId ChildHash = Children[i].Hash;
+					if (ItemParentMap.FindRef(ChildHash) == CurrentFold)
+					{
+						const TSharedRef<SWidget>& Widget = Children[i].GetWidget();
+						if (Widget != SNullWidget::NullWidget && !IsInCollapsedSubtree(ChildHash))
+						{
+							Widget->SetVisibility(EVisibility::SelfHitTestInvisible);
+						}
+						// If this child is itself an expanded fold, restore its children too
+						if (!CollapsedFoldIds.Contains(ChildHash))
+						{
+							FoldsToRestore.Add(ChildHash);
+						}
+					}
+				}
+			}
+			bLayoutDirty = true;
+		}
 	}
 }
 
@@ -292,6 +333,8 @@ void SImSlatePanel::OnArrangeChildren(const FGeometry& AllottedGeometry, FArrang
 {
 	if (Children.Num() <= 0)
 		return;
+
+	const_cast<SImSlatePanel*>(this)->ScrollBarWidth = 12.f * FMath::Max(GImSlateLayoutScale, 1.f);
 
 	const auto PanelSize = AllottedGeometry.GetLocalSize();
 	const auto PanelHeight = PanelSize.Y;

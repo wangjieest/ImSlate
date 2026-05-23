@@ -27,7 +27,7 @@ TSharedRef<SSpinBox<float>> UImSpinBox::ConstructImWidget() const
 {
 	auto MyStealSpinBox = SNew(SSpinBox<float>)
 							.Style(&GetWidgetStyle())
-							.Font(GetFont())
+							.Font(ImSlate::ScaleImSlateFont(GetFont()))
 							.ClearKeyboardFocusOnCommit(GetClearKeyboardFocusOnCommit())
 							.SelectAllTextOnCommit(GetSelectAllTextOnCommit())
 							.Justification(GetJustification())

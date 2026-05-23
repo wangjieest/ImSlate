@@ -2,6 +2,10 @@
 #include "SImSlateWindow.h"
 
 #include "SImSlatePanel.h"
+#include "Widgets/Layout/SDPIScaler.h"
+
+
+
 #include "SImSlateViewport.h"
 #include "SImViewportGame.h"
 #include "SImViewportHost.h"
@@ -407,8 +411,8 @@ public:
 						.AutoWidth()
 						[
 							SNew(STextBlock)
-							// UE 5.7: Use TAttribute::CreateSP for member access in Slate widgets
 							.Text(TAttribute<FText>::CreateSP(Target, &SImSlateWindow::GetTitleText))
+							.Font(ImSlate::GetImSlateDefaultFont(12))
 							.ColorAndOpacity(FLinearColor::White)
 						]
 						+ SHorizontalBox::Slot()
@@ -454,7 +458,10 @@ public:
 
 	TAttribute<FVector2D> MinSizeAttr;
 	TOptional<float> TitleHeight;
-	float GetTitleHeight() const { return TitleHeight.Get(24.f); }
+	float GetTitleHeight() const
+	{
+		return TitleHeight.Get(24.f) * ImSlate::GetImSlateEffectiveScale();
+	}
 
 public:
 	const FSlateBrush* HeaderBrush() { return &TitleBrush; }
@@ -690,6 +697,8 @@ void SImSlateWindow::MoveToViewport(SImSlateViewport* InViewport)
 
 		Viewport = InViewport;
 		ViewportOwned = !bTargetGameview;
+		// Prevent Appearing re-trigger on viewport switch (keep window "active")
+		LastFrameActive = GImSlate->FrameCount;
 	}
 }
 
@@ -1011,9 +1020,16 @@ FReply SImSlateWindow::OnMouseButtonDown(const FGeometry& MyGeometry, const FPoi
 	return FReply::Unhandled();
 }
 
+FReply SImSlateWindow::OnMouseWheel(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	return ChildPanel->OnMouseWheel(ChildPanel->GetCachedGeometry(), MouseEvent);
+}
+
 float SImSlateWindow::GetTitleHeight() const
 {
-	return !(Flags & ImSlateWindowFlags_NoTitleBar) ? TitleHeight : 0.f;
+	if (Flags & ImSlateWindowFlags_NoTitleBar)
+		return 0.f;
+	return TitleHeight * ImSlate::GetImSlateEffectiveScale();
 }
 
 FReply SImSlateWindow::OnDragDetected(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
@@ -1034,8 +1050,8 @@ void SImSlateWindow::OnArrangeChildren(const FGeometry& AllottedGeometry, FArran
 	if (bool bShowHeaderHandle = !(Flags & ImSlateWindowFlags_NoTitleBar) && ArrangedChildren.Accepts(HeaderHandleVis))
 	{
 		FVector2D HeaderSize = AllottedGeometry.GetLocalSize();
-		OffsetHeight = TitleHeight;
-		HeaderSize.Y = TitleHeight;
+		OffsetHeight = GetTitleHeight();
+		HeaderSize.Y = OffsetHeight;
 		ArrangedChildren.AddWidget(HeaderHandleVis, AllottedGeometry.MakeChild(HeaderHandle.ToSharedRef(), FVector2D::ZeroVector, HeaderSize));
 	}
 
@@ -1099,7 +1115,7 @@ int32 SImSlateWindow::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedG
 
 		auto HeaderHandleVis = HeaderHandle->GetVisibility();
 		const bool bShowHeaderHandle = !(Flags & ImSlateWindowFlags_NoTitleBar) && ArrangedChildren.Accepts(HeaderHandleVis);
-		const float HeaderHeight = bShowHeaderHandle ? TitleHeight : 0.f;
+		const float HeaderHeight = bShowHeaderHandle ? GetTitleHeight() : 0.f;
 
 		auto ChildPanelVis = ChildPanel->GetVisibility();
 		const bool bShowContent = ArrangedChildren.Accepts(ChildPanelVis);

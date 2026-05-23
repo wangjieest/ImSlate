@@ -312,6 +312,7 @@ TSharedRef<SImCheckBox> UImCheckBox::ConstructImWidget() const
 	MyStealCheckBox->SetStyle(&GetWidgetStyle(), &ExtraStyle);
 	MyStealCheckBox->SetIsChecked(GetCheckedState());
 
+
 	return MyStealCheckBox;
 }
 

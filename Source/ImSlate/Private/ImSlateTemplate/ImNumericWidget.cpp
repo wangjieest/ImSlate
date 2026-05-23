@@ -109,7 +109,7 @@ TSharedRef<SImNumericWidget<T>> UImSlateNumericWidget::ConstructImWidget() const
 							.BorderForegroundColor(BorderForegroundColor)
 							.BorderBackgroundColor(BorderBackgroundColor)
 							.EditableTextBoxStyle(&EditableTextBoxStyle)
-							.Font(Font)
+							.Font(ImSlate::ScaleImSlateFont(Font))
 							.SpinBoxStyle(&SpinBoxStyle)
 							.AllowSpin(true)
 							.MinValue(TOptional<T>())

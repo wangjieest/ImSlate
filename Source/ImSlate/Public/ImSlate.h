@@ -66,9 +66,10 @@ IMSLATE_API void				SetNextWindowFocus();
 IMSLATE_API void				SetNextWindowBgAlpha(float Alpha, ImSlateCond Cond = 0);
 IMSLATE_API void				SetNextWindowTitle(const FText& InTitle, ImSlateCond Cond = 0);
 
-// Set current window colors (call after Begin())
+// Set current window properties (call after Begin())
 IMSLATE_API void				SetCurrentWindowColorAndOpacity(const FLinearColor& InColor);
 IMSLATE_API void				SetCurrentWindowForegroundColor(const FSlateColor& InColor);
+IMSLATE_API void				SetCurrentWindowContentScale(const FVector2D& InScale);
 IMSLATE_API void				SetNextWindowResizeCallback(ImSlateResizeCallback CustomCallback);
 
 IMSLATE_API void				SetNextWindowContentSize(const ImVec2& InSize);
@@ -116,6 +117,10 @@ IMSLATE_API bool				FoldLine(ImStr Label, const FText& InText, float InHeight = 
 // Usage: if (ImSlate::BeginFold("id", TEXT("Category"))) { /* children */ ImSlate::EndFold(); }
 IMSLATE_API bool				BeginFold(ImStr Label, const FText& InText, float IndentWidth = 16.f);
 IMSLATE_API void				EndFold();
+
+// TitleLine: standalone title bar control (use with ImSlateWindowFlags_NoTitleLine)
+// Returns true if close button was clicked (when bOpen != nullptr)
+IMSLATE_API bool				TitleLine(ImStr Label, const FText& InText, bool* bOpen = nullptr);
 
 IMSLATE_API void				SetNextItemAspectRatio(float InRatio);
 IMSLATE_API void				SetNextItemFillWidth(float InFactor);

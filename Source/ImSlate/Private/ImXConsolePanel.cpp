@@ -493,14 +493,14 @@ bool UImXConsolePanel::MatchesSearch(const FString& Name, const FString& Help) c
 		   Help.Contains(SearchFilter, ESearchCase::IgnoreCase);
 }
 
-static constexpr float XConsoleRowHeight = 32.f;
+static constexpr float XConsoleRowHeight = 48.f;
 
 bool UImXConsolePanel::DrawFold(const FString& Id, const FString& DisplayText)
 {
 	bool& bFolded = FoldStates.FindOrAdd(Id, true);
 	FString Arrow = bFolded ? TEXT("\x25B6 ") : TEXT("\x25BC ");
-	ImSlate::SetNextItemMinHeight(XConsoleRowHeight);
-	if (ImSlate::TextButton(FStringView(Id), FText::FromString(Arrow + DisplayText)))
+	ImSlate::SetNextItemFillWidth(1.f);
+	if (ImSlate::TextButton(FStringView(Id), FText::FromString(Arrow + DisplayText), ImVec2(0, XConsoleRowHeight)))
 		bFolded = !bFolded;
 	return !bFolded;
 }
@@ -508,12 +508,10 @@ bool UImXConsolePanel::DrawFold(const FString& Id, const FString& DisplayText)
 void UImXConsolePanel::DrawSearchBar()
 {
 	ImSlate::SetNextItemFillWidth(0.7f);
-	ImSlate::SetNextItemMinHeight(XConsoleRowHeight);
-	ImSlate::InputText("##XConsoleSearch", SearchFilter);
+	ImSlate::InputText("##XConsoleSearch", SearchFilter, ImVec2(0, XConsoleRowHeight));
 
 	ImSlate::SameLine();
-	ImSlate::SetNextItemMinSize(80.f, XConsoleRowHeight);
-	if (ImSlate::Button("Refresh"))
+	if (ImSlate::Button("Refresh", ImVec2(80.f, XConsoleRowHeight)))
 		bNeedsRefresh = true;
 }
 
@@ -531,8 +529,7 @@ void UImXConsolePanel::DrawCommandEntry(FImXConsoleCommandInfo& Info)
 	FString LeafDisplay = (Meta && Meta->SelfMeta.HasMeta(TEXT("DisplayName")))
 		? Meta->SelfMeta.GetMeta(TEXT("DisplayName"))
 		: Info.LeafName;
-	ImSlate::SetNextItemMinHeight(XConsoleRowHeight);
-	if (ImSlate::TextButton("CmdName", FText::FromString(LeafDisplay)))
+	if (ImSlate::TextButton("CmdName", FText::FromString(LeafDisplay), ImVec2(0, XConsoleRowHeight)))
 		ExecuteCommand(Info);
 
 	// Parameters — each on same line, fill remaining width
@@ -626,8 +623,7 @@ void UImXConsolePanel::DrawVariableEntry(FImXConsoleVariableInfo& Info)
 	FString DisplayLabel = (SelfMeta && SelfMeta->HasMeta(TEXT("DisplayName")))
 		? SelfMeta->GetMeta(TEXT("DisplayName"))
 		: Info.LeafName;
-	ImSlate::SetNextItemMinHeight(XConsoleRowHeight);
-	ImSlate::TextButton("VarName", FText::FromString(DisplayLabel));
+	ImSlate::TextButton("VarName", FText::FromString(DisplayLabel), ImVec2(0, XConsoleRowHeight));
 	ImSlate::SameLine();
 
 	FString WidgetId = FString::Printf(TEXT("##val_%s"), *Info.Name);

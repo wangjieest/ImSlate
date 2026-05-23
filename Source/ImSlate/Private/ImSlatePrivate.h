@@ -300,6 +300,9 @@ struct ImSlateContext
 	ImSlateLastItemData											LastItemData;								// Storage for last submitted item (setup by ItemAdd)
 	ImSlateItemFlags											CurrentItemFlags = 0;						// == g.ItemFlagsStack.back()
 
+	float														CurrentIndent = 0.f;
+	TArray<float, TInlineAllocator<4>>							IndentStack;
+
 	bool														bIsFrameStarted = false;
 	bool														bIsFrameEnded = true;
 	int32														PIEInstanceID = -1;

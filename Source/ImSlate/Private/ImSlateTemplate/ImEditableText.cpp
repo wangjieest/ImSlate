@@ -1,5 +1,6 @@
 // Copyright ImSlate, Inc. All Rights Reserved.
 #include "ImSlateTemplate/ImEditableText.h"
+#include "SImSlateViewport.h"
 
 // SImEditableText
 int32 SImEditableText::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled)
@@ -182,6 +183,8 @@ TSharedRef<SEditableText> UImEditableText::ConstructImWidget() const
 
 	//TAttribute<FText> TextBinding = PROPERTY_BINDING(FText, Text);
 	//TAttribute<FText> HintTextBinding = PROPERTY_BINDING(FText, HintText);
+
+	MyStealEditableText->SetFont(ImSlate::GetImSlateDefaultFont());
 
 	MyStealEditableText->SetText(GetText());
 	MyStealEditableText->SetHintText(GetHintText());

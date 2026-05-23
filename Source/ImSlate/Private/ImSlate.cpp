@@ -26,6 +26,8 @@
 
 DEFINE_LOG_CATEGORY(LogImSlate);
 
+extern float GImSlateLayoutScale;
+
 namespace ImSlate
 {
 namespace ImSlateInternal
@@ -552,6 +554,10 @@ bool Begin(ImStr Name, bool* bIsOpen, ImWindowFlags Flags, int32 Id)
 	const bool bWindowJustCreated = FindOrCreateWindow(Name, Flags, CurWindow);
 	g.WindowStack.Push(CurWindow);
 
+	// Save and reset indent for this window
+	g.IndentStack.Push(g.CurrentIndent);
+	g.CurrentIndent = 0.f;
+
 	const auto CurFrame = g.FrameCount;
 	const bool bFirstBeginOfTheFrame = (CurWindow->LastFrameActive != CurFrame);
 	bool bWindowJustActivatedByUser = (CurWindow->LastFrameActive < CurFrame - 1);
@@ -705,6 +711,10 @@ void End()
 	ImSlateWindow* MyWindow = g.CurrentWindow;
 	check(MyWindow);
 
+	// Restore indent from before this window's Begin
+	if (g.IndentStack.Num() > 0)
+		g.CurrentIndent = g.IndentStack.Pop();
+
 	g.NextItemData.ClearFlags();
 
 	// Error checking: verify that user hasn't called End() too many times!
@@ -831,6 +841,12 @@ void SetCurrentWindowForegroundColor(const FSlateColor& InColor)
 {
 	if (auto* MyWindow = GetCurrentWindow())
 		MyWindow->SetForegroundColor(InColor);
+}
+
+void SetCurrentWindowContentScale(const FVector2D& InScale)
+{
+	if (auto* MyWindow = GetCurrentWindow())
+		MyWindow->SetContentScale(InScale);
 }
 
 void SetNextWindowTitle(const FText& InTitle, ImSlateCond Cond)
@@ -1011,6 +1027,13 @@ namespace Internal
 		{
 			auto ItemId = ImSlateScopedId(Name);
 			auto& Slot = FindOrCreateItemInWindow(g.CurrentWindow, ItemId, WidgetConstruct, WidgetPtr);
+			// Apply global indent to left padding
+			if (g.CurrentIndent > 0.f)
+			{
+				g.NextItemData.Flags |= ImSlateNextItemDataFlags_Padding;
+				g.NextItemData.SlotPadding.Left = g.CurrentIndent;
+			}
+
 			// Register item in tree (assigns current fold context as parent)
 			g.CurrentWindow->SetItemParent(ItemId);
 			if (Slot.ApplyNextItem(g.NextItemData))
@@ -1158,7 +1181,7 @@ bool FoldLine(ImStr Label, const FText& InText, float InHeight /*= 0.f*/)
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 		if (InHeight > 0.f)
 			InItem.SetMinHeight(InHeight);
 
@@ -1169,6 +1192,7 @@ bool FoldLine(ImStr Label, const FText& InText, float InHeight /*= 0.f*/)
 
 		WidgetRef->SetContent(SAssignNew(Meta->TextBlock, STextBlock)
 			.Text(FText::FromString(TEXT("\x25B6 ") + InText.ToString()))
+			.Font(GetImSlateDefaultFont())
 			.Clipping(EWidgetClipping::ClipToBoundsAlways));
 
 		WidgetRef->SetOnClicked(CreateWeakLambda(Ptr, [Ptr] {
@@ -1222,7 +1246,8 @@ bool BeginFold(ImStr Label, const FText& InText, float IndentWidth)
 	// Now push this fold as the parent context for content items
 	if (!bIsFolded)
 	{
-		// Fold open
+		// Fold open — restore visibility of collapsed children
+		g.CurrentWindow->SetFoldCollapsed(FoldId, false);
 		g.CurrentWindow->PushFoldContext(FoldId);
 		GetFoldIndentStack().Push(IndentWidth);
 		Indent(IndentWidth);
@@ -1248,18 +1273,43 @@ void EndFold()
 	}
 }
 
+bool TitleLine(ImStr Label, const FText& InText, bool* bOpen)
+{
+	bool bCloseClicked = false;
+
+	// Title text — fill width
+	float Scale = GetImSlateEffectiveScale();
+	float BarHeight = 12.f * Scale * 2.5f;
+
+	SetNextItemFillWidth(1.f);
+	TextButton(Label, InText, ImVec2(0, BarHeight));
+
+	// Close button
+	if (bOpen)
+	{
+		SameLine();
+		FString CloseId = FString::Printf(TEXT("X##close_%.*hs"), Label.Len(), Label.GetData());
+		if (Button(FStringView(CloseId), ImVec2(BarHeight, BarHeight)))
+		{
+			*bOpen = false;
+			bCloseClicked = true;
+		}
+	}
+
+	return bCloseClicked;
+}
+
 void Indent(float IndentW /* = 0.0f*/)
 {
 	ImSlateContext& g = *GImSlate;
-	g.NextItemData.Flags |= ImSlateNextItemDataFlags_Padding;
-	g.NextItemData.SlotPadding.Left = IndentW;
+	g.CurrentIndent += IndentW;
 }
 
 void Unindent(float IndentW /* = 0.0f*/)
 {
 	ImSlateContext& g = *GImSlate;
-	g.NextItemData.Flags |= ImSlateNextItemDataFlags_Padding;
-	g.NextItemData.SlotPadding.Left = -IndentW;
+	g.CurrentIndent -= IndentW;
+	g.CurrentIndent = FMath::Max(g.CurrentIndent, 0.f);
 }
 
 static void SetItemCollapsed(FItemSlotPod& Data, float InWidth, ImSlateCond Cond)

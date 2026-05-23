@@ -73,6 +73,7 @@ void SImViewportHost::SetWindowSize(SImSlateWindow* InWindow, TOptional<FVector2
 	if (!InSize.IsSet())
 		return;
 
+	InWindow->ActualSize = InSize.GetValue();
 	if (auto OwnerWindow = WeakOwner.Pin())
 	{
 		OwnerWindow->Resize(InSize.GetValue());

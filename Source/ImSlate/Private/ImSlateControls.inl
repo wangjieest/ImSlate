@@ -147,12 +147,16 @@ bool TextButton(ImStr InLabel, const FText& InText, const ImVec2& InSize)
 		InItem.bFillWidth = false;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		TSharedRef<SButton> WidgetRef = ImFactoryCreate<UImButton>();
 		auto Meta = MakeShared<FButtonMeta>();
+		WidgetRef->SetHAlign(HAlign_Center);
+		WidgetRef->SetVAlign(VAlign_Center);
 		WidgetRef->SetContent(SAssignNew(Meta->TextBlock, STextBlock)
 								.Text(InText)
+								.Font(GetImSlateDefaultFont())
+								.Justification(ETextJustify::Center)
 								.Clipping(EWidgetClipping::ClipToBoundsAlways));
 		SetDesiredSize(WidgetRef, InSize);
 
@@ -191,7 +195,7 @@ bool ImageButton(ImStr Label, UObject* InTexture, const ImVec2& InSize)
 	auto ItemPtr = Item<SImageButton>(Label, [&](FItemSlotPod& InItem) {
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 		InItem.bFillWidth = false;
 
 		FString LabelStr = FString(Label.Len(), Label.GetData());
@@ -257,6 +261,7 @@ bool ImageButton(ImStr Label, UObject* InTexture, const ImVec2& InSize)
 
 		WidgetRef->SetContent(SNew(STextBlock)
 								.Text(FText::FromString(LabelStr))
+								.Font(GetImSlateDefaultFont())
 								.Clipping(EWidgetClipping::ClipToBoundsAlways));
 
 		auto Ptr = &Meta.Get();
@@ -282,7 +287,7 @@ bool Text(ImStr Label, const FText& InText, const ImVec2& InSize, bool bAutoWrap
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		TSharedRef<STextBlock> WidgetRef = ImFactoryCreate<UImTextBlock>();
 		WidgetRef->SetText(InText);
@@ -305,7 +310,7 @@ bool InputText(ImStr Label, FString& InStr, const ImVec2& InSize /* = ImVec2(0, 
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		FString LabelStr = FString(Label.Len(), Label.GetData());
 		TSharedRef<SEditableText> WidgetRef = ImFactoryCreate<UImEditableText>();
@@ -383,7 +388,7 @@ ImSliderStatus_ InputFloat(ImStr Label, decltype(FVector::ZeroVector.X)& ValRef,
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		FString LabelStr = FString(Label.Len(), Label.GetData());
 		TSharedRef<SSpinBoxFloat> WidgetRef = ImFactoryCreate<UImSpinBox>();
@@ -604,7 +609,7 @@ ImSliderStatus_ NumericGeneric(ImStr Label,  //
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		TSharedRef<SImNumericWidget<T>> WidgetRef = ImFactoryCreate<UImNumbericWidgetType<T>>();
 
@@ -774,7 +779,7 @@ bool CheckBox(ImStr Label, bool& bIsChecked, const ImVec2& InSize)
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		TSharedRef<SCheckBox> WidgetRef = ImFactoryCreate<UImCheckBox>();
 
@@ -821,7 +826,7 @@ bool CheckBox(ImStr Label, ECheckBoxState& CheckState, const ImVec2& InSize)
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		TSharedRef<SCheckBox> WidgetRef = ImFactoryCreate<UImCheckBox>();
 
@@ -890,7 +895,7 @@ bool Image(ImStr Label, UObject* InTexture, const ImVec2& InSize)
 	auto ItemPtr = Item<SImage>(Label, [&](FItemSlotPod& InItem) {
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 		InItem.bFillWidth = false;
 
 		FString LabelStr = FString(Label.Len(), Label.GetData());
@@ -948,7 +953,7 @@ bool ComboBox(ImStr Label, TSharedPtr<IImComboBoxItem>& InOutSelected, const FCo
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		FString LabelStr = FString(Label.Len(), Label.GetData());
 		TSharedRef<SImComboBox> WidgetRef = ImFactoryCreate<UImComboButton>();
@@ -993,7 +998,7 @@ bool ComboBox(ImStr Label, int32& InOutCurrentIndex, const TSharedRef<FImListDat
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		FString LabelStr = FString(Label.Len(), Label.GetData());
 		TSharedRef<SImVirtualComboBox> WidgetRef = ImFactoryCreate<UImVirtualComboButton>();
@@ -1035,7 +1040,7 @@ bool ComboBoxForEnum(ImStr Label, int64& InOutIdx, UEnum* EnumPtr, ImSlateComboF
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		FString LabelStr = FString(Label.Len(), Label.GetData());
 		TSharedRef<SImVirtualComboBox> WidgetRef = ImFactoryCreate<UImVirtualComboButton>();
@@ -1132,7 +1137,7 @@ bool ListBox(ImStr Label, int32& SelectedItem, const TArray<FString>& InSource, 
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		auto Meta = MakeShared<FListBoxMeta>();
 		auto MetaPtr = &Meta.Get();
@@ -1199,7 +1204,7 @@ bool VirtualList(ImStr Label, const TSharedRef<IImSlateListData>& InDataStore, c
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		TSharedRef<SImSlateVirtualList> WidgetRef = SNew(SImSlateVirtualList);
 		SetDesiredSize(WidgetRef, InSize);
@@ -1377,7 +1382,7 @@ bool AssetPicker(ImStr Label, FSoftObjectPath& InOutPath, UClass* FilterClass, c
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		auto Meta = MakeShared<FAssetPickerMeta>();
 		Meta->ChangedPath = InOutPath;
@@ -1429,7 +1434,7 @@ bool ClassPicker(ImStr Label, FSoftClassPath& InOutPath, UClass* MetaClass, cons
 		InItem.bFillWidth = true;
 		InItem.StretchValue = 1.f;
 		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Center;
+		InItem.VAlignment = VAlign_Fill;
 
 		auto Meta = MakeShared<FClassPickerMeta>();
 		Meta->ChangedPath = InOutPath;

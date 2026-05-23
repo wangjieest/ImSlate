@@ -113,6 +113,29 @@ auto ImFactoryCreate(const UObject* InCtx = nullptr)
 	auto CDO = static_cast<U*>(UGenericSingletons::GetSingletonImpl(GetDefaultClass<U>(), WorldCtx));
 	return CDO->ConstructWidget(CDO, WorldCtx);
 }
+// Scale helper for all ImSlate controls
+IMSLATE_API float GetImSlateEffectiveScale();
+
+inline FSlateFontInfo GetImSlateDefaultFont(int32 BaseSize = 10)
+{
+	int32 ScaledSize = FMath::RoundToInt(BaseSize * FMath::Max(GetImSlateEffectiveScale(), 1.f));
+	return FCoreStyle::GetDefaultFontStyle("Regular", ScaledSize);
+}
+
+inline FSlateFontInfo ScaleImSlateFont(const FSlateFontInfo& InFont)
+{
+	if (!InFont.HasValidFont())
+		return GetImSlateDefaultFont();
+	float Scale = GetImSlateEffectiveScale();
+	if (Scale > 1.f)
+	{
+		FSlateFontInfo Scaled = InFont;
+		Scaled.Size = FMath::RoundToInt(Scaled.Size * Scale);
+		return Scaled;
+	}
+	return InFont;
+}
+
 }  // namespace ImSlate
 
 #if !UE_SERVER
