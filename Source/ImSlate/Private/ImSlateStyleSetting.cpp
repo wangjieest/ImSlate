@@ -86,6 +86,7 @@ void UXImSlateStyleSetting::PreloadClasses() const
 	ModifyDefault(ImSlateEditableTextBox);
 	ModifyDefault(ImSlateCollisionData);
 	ModifyDefault(ImVirtualList);
+	ModifyDefault(ImSearchBox);
 #endif
 }
 

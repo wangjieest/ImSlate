@@ -507,8 +507,22 @@ bool UImXConsolePanel::DrawFold(const FString& Id, const FString& DisplayText)
 
 void UImXConsolePanel::DrawSearchBar()
 {
+	static TArray<FString> SearchNames;
+	if (bNeedsRefresh || SearchNames.IsEmpty())
+	{
+		SearchNames.Reset();
+		for (auto& [Cat, SubCats] : CommandTree)
+			for (auto& [Sub, Cmds] : SubCats)
+				for (auto& Cmd : Cmds)
+					SearchNames.Add(Cmd.LeafName);
+		for (auto& [Cat, SubCats] : VariableTree)
+			for (auto& [Sub, Vars] : SubCats)
+				for (auto& Var : Vars)
+					SearchNames.Add(Var.LeafName);
+	}
+
 	ImSlate::SetNextItemFillWidth(0.7f);
-	ImSlate::InputText("##XConsoleSearch", SearchFilter, ImVec2(0, XConsoleRowHeight));
+	ImSlate::SearchBox("##XConsoleSearch", SearchFilter, &SearchNames, nullptr, ImVec2(0, XConsoleRowHeight));
 
 	ImSlate::SameLine();
 	if (ImSlate::Button("Refresh", ImVec2(80.f, XConsoleRowHeight)))

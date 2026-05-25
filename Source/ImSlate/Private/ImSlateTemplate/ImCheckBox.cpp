@@ -1,6 +1,8 @@
 // Copyright ImSlate, Inc. All Rights Reserved.
 #include "ImSlateTemplate/ImCheckBox.h"
 
+#include "Widgets/Layout/SBox.h"
+
 SImCheckBox::SImCheckBox()
 {
 }
@@ -88,13 +90,18 @@ void SImCheckBox::BuildCheckBox(TSharedRef<SWidget> InContent)
 			.VAlign(VAlign_Center)
 			.HAlign(HAlign_Center)
 			[
-				SNew(SImage)
-				.Image(this, &SImCheckBox::OnGetCheckImage)
+				SNew(SBox)
+				.WidthOverride(Style->UncheckedImage.ImageSize.X * ImSlate::GetImSlateEffectiveScale())
+				.HeightOverride(Style->UncheckedImage.ImageSize.Y * ImSlate::GetImSlateEffectiveScale())
+				[
+					SNew(SImage)
+					.Image(this, &SImCheckBox::OnGetCheckImage)
 #if UE_5_00_OR_LATER
-				.ColorAndOpacity(this, &SImCheckBox::GetForegroundColor)
+					.ColorAndOpacity(this, &SImCheckBox::GetForegroundColor)
 #else
-				.ColorAndOpacity(this, &SImCheckBox::OnGetForegroundColor)
+					.ColorAndOpacity(this, &SImCheckBox::OnGetForegroundColor)
 #endif
+				]
 			]
 			+ SHorizontalBox::Slot()
 			.Padding(TAttribute<FMargin>(this, &SImCheckBox::OnGetPadding))

@@ -97,23 +97,14 @@ bool SImSlatePanel::CommitItemFrame()
 
 	const bool bHasNewItems = (NumChildren > FrameBaseChildCount);
 
-	// Count collapsed items in Children
-	int32 NumCollapsed = 0;
-	for (int32 i = 0; i < NumChildren; ++i)
-	{
-		if (IsInCollapsedSubtree(Children[i].Hash))
-			++NumCollapsed;
-	}
-
-	// Fast path: active items + collapsed items = total children, same order, no new items
-	if ((NumFrame + NumCollapsed) == NumChildren && !bHasNewItems && bFrameOrderIsSequential)
+	// Fast path: all active items = total children, same order, no new items
+	if (NumFrame == NumChildren && !bHasNewItems && bFrameOrderIsSequential)
 	{
 		if (bLayoutDirty)
 		{
 			Invalidate(EInvalidateWidget::Layout);
 			MarkPrepassAsDirty();
 		}
-		// else: zero cost — nothing changed, Slate uses cached geometry
 		return false;
 	}
 
@@ -123,14 +114,12 @@ bool SImSlatePanel::CommitItemFrame()
 	for (int32 Idx : FrameOrder)
 		UsedSet.Add(Idx);
 
-	// Collapsed fold children count as "used" — don't remove them
-	const int32 TotalUsed = UsedSet.Num() + NumCollapsed;
-	const bool bNeedsRemove = (TotalUsed < NumChildren);
+	const bool bNeedsRemove = (UsedSet.Num() < NumChildren);
 	const bool bNeedsReorder = !bFrameOrderIsSequential;
 
 	if (bNeedsReorder || bNeedsRemove)
 	{
-		// Full rebuild: steal pointers, reorder, keep collapsed, delete truly unused
+		// Steal pointers, reorder active items, delete unused
 		TArray<FSlot*> OldPtrs;
 		OldPtrs.SetNumUninitialized(NumChildren);
 		FSlot** RawData = Children.Slots.GetData();
@@ -148,21 +137,12 @@ bool SImSlatePanel::CommitItemFrame()
 			OldPtrs[Idx] = nullptr;
 		}
 
-		// Re-add items in collapsed subtrees (keep them alive)
-		for (int32 i = 0; i < OldPtrs.Num(); ++i)
-		{
-			if (OldPtrs[i] && IsInCollapsedSubtree(OldPtrs[i]->Hash))
-			{
-				Children.Add(OldPtrs[i]);
-				OldPtrs[i] = nullptr;
-			}
-		}
-
-		// Delete truly unused
+		// Delete unused — collapsed children NOT protected, recreated on expand
 		for (FSlot* Ptr : OldPtrs)
 		{
 			if (Ptr)
 			{
+				ItemParentMap.Remove(Ptr->Hash);
 				ResetSlotBase(Ptr);
 				delete Ptr;
 			}
@@ -202,23 +182,8 @@ void SImSlatePanel::SetItemParent(ImSlateId ItemId)
 
 void SImSlatePanel::PushFoldContext(ImSlateId FoldId)
 {
-	// Opening a fold — remove from collapsed set, un-collapse children
-	if (CollapsedFoldIds.Remove(FoldId) > 0)
-	{
-		for (int32 i = 0; i < Children.Num(); ++i)
-		{
-			const TSharedRef<SWidget>& Widget = Children[i].GetWidget();
-			if (Widget == SNullWidget::NullWidget)
-				continue;
-			ImSlateId ChildHash = Children[i].Hash;
-			const ImSlateId* ParentPtr = ItemParentMap.Find(ChildHash);
-			if (ParentPtr && *ParentPtr == FoldId && !IsInCollapsedSubtree(ChildHash))
-			{
-				Widget->SetVisibility(EVisibility::Visible);
-			}
-		}
-		bLayoutDirty = true;
-	}
+	// Opening a fold — children will be created fresh this frame
+	CollapsedFoldIds.Remove(FoldId);
 	FoldContextStack.Push(FoldId);
 }
 
@@ -232,50 +197,15 @@ void SImSlatePanel::SetFoldCollapsed(ImSlateId FoldId, bool bCollapsed)
 {
 	if (bCollapsed)
 	{
-		bool bAlreadyCollapsed = false;
-		CollapsedFoldIds.Add(FoldId, &bAlreadyCollapsed);
-		if (!bAlreadyCollapsed)
-		{
-			for (int32 i = 0; i < Children.Num(); ++i)
-			{
-				const TSharedRef<SWidget>& Widget = Children[i].GetWidget();
-				if (Widget != SNullWidget::NullWidget && IsInCollapsedSubtree(Children[i].Hash))
-				{
-					Widget->SetVisibility(EVisibility::Collapsed);
-				}
-			}
-			bLayoutDirty = true;
-		}
+		CollapsedFoldIds.Add(FoldId);
+		// Children will be deleted by CommitItemFrame (not in FrameOrder next frame)
+		bLayoutDirty = true;
 	}
 	else
 	{
 		if (CollapsedFoldIds.Remove(FoldId) > 0)
 		{
-			// Recursively restore visibility of all descendants
-			TArray<ImSlateId> FoldsToRestore;
-			FoldsToRestore.Add(FoldId);
-
-			while (FoldsToRestore.Num() > 0)
-			{
-				ImSlateId CurrentFold = FoldsToRestore.Pop();
-				for (int32 i = 0; i < Children.Num(); ++i)
-				{
-					ImSlateId ChildHash = Children[i].Hash;
-					if (ItemParentMap.FindRef(ChildHash) == CurrentFold)
-					{
-						const TSharedRef<SWidget>& Widget = Children[i].GetWidget();
-						if (Widget != SNullWidget::NullWidget && !IsInCollapsedSubtree(ChildHash))
-						{
-							Widget->SetVisibility(EVisibility::SelfHitTestInvisible);
-						}
-						// If this child is itself an expanded fold, restore its children too
-						if (!CollapsedFoldIds.Contains(ChildHash))
-						{
-							FoldsToRestore.Add(ChildHash);
-						}
-					}
-				}
-			}
+			// Children will be recreated next frame when BeginFold returns true
 			bLayoutDirty = true;
 		}
 	}

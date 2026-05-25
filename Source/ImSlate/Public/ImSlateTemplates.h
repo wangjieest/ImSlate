@@ -32,6 +32,7 @@
 #include "ImSlateTemplate/ImVirtualList.h"
 #include "ImSlateTemplate/ImAssetPicker.h"
 #include "ImSlateTemplate/ImClassPicker.h"
+#include "ImSlateTemplate/ImSearchBox.h"
 #include "ProtectFieldAccessor.h"
 
 //

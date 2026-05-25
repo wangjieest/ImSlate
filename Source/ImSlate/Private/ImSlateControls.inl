@@ -28,6 +28,7 @@
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Views/SListView.h"
+#include "ImSlateTemplate/ImSearchBox.h"
 
 namespace ImSlate
 {
@@ -354,6 +355,104 @@ bool InputText(ImStr Label, FString& InStr, const ImVec2& InSize /* = ImVec2(0, 
 	}
 	return RetVal;
 }
+
+// ==================== SearchBox ====================
+
+struct FSearchBoxMeta : public TSharedFromThis<FSearchBoxMeta>, public ISlateMetaData
+{
+	SLATE_METADATA_TYPE(FSearchBoxMeta, ISlateMetaData)
+
+	TArray<FString> History;
+	FString PrevInput;
+	static constexpr int32 MaxHistory = 32;
+	static constexpr int32 MaxVisible = 8;
+
+	void AddToHistory(const FString& Str)
+	{
+		if (Str.IsEmpty()) return;
+		History.Remove(Str);
+		History.Insert(Str, 0);
+		if (History.Num() > MaxHistory)
+			History.SetNum(MaxHistory);
+	}
+
+	TArray<FString> Filter(const FString& Input, const TArray<FString>* Src, const TFunction<void(const FString&, TArray<FString>&)>& Cb)
+	{
+		TArray<FString> Result;
+		if (Input.IsEmpty())
+		{
+			Result = History;
+		}
+		else if (Cb)
+		{
+			Cb(Input, Result);
+		}
+		else if (Src)
+		{
+			TArray<FString> ContainsMatches;
+			for (const FString& S : *Src)
+			{
+				if (S.StartsWith(Input, ESearchCase::IgnoreCase))
+					Result.Add(S);
+				else if (S.Contains(Input, ESearchCase::IgnoreCase))
+					ContainsMatches.Add(S);
+			}
+			Result.Append(ContainsMatches);
+		}
+		if (Result.Num() > MaxVisible)
+			Result.SetNum(MaxVisible);
+		return Result;
+	}
+};
+
+bool SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestions, TFunction<void(const FString&, TArray<FString>&)> SuggestionCallback, const ImVec2& InSize)
+{
+	auto ItemPtr = Item<SImSearchBox>(Label, [&](FItemSlotPod& InItem) {
+		InItem.bFillWidth = true;
+		InItem.StretchValue = 1.f;
+		InItem.HAlignment = HAlign_Fill;
+		InItem.VAlignment = VAlign_Fill;
+
+		TSharedRef<SImSearchBox> WidgetRef = ImFactoryCreate<UImSearchBox>();
+		WidgetRef->SetText(FText::FromString(InOutStr));
+		SetDesiredSize(WidgetRef, InSize);
+
+		auto Meta = MakeShared<FSearchBoxMeta>();
+		WidgetRef->AddMetadata(Meta);
+		return WidgetRef;
+	});
+
+	bool bRetVal = false;
+	if (ItemPtr)
+	{
+		auto SearchBox = static_cast<SImSearchBox*>(ItemPtr);
+		auto Meta = GetMetaData<FSearchBoxMeta>(ItemPtr);
+
+		// Detect text change and update suggestions
+		FString CurrentText = SearchBox->GetText().ToString();
+		if (Meta && CurrentText != Meta->PrevInput)
+		{
+			Meta->PrevInput = CurrentText;
+			auto Filtered = Meta->Filter(CurrentText, Suggestions, SuggestionCallback);
+			SearchBox->SetSuggestions(Filtered);
+		}
+
+		// Check for commit (Enter or suggestion click)
+		if (SearchBox->HasPendingCommit())
+		{
+			InOutStr = SearchBox->ConsumeCommit();
+			if (Meta) Meta->AddToHistory(InOutStr);
+			bRetVal = true;
+		}
+		else if (!ItemPtr->HasAnyUserFocus().IsSet() && InOutStr != CurrentText)
+		{
+			SearchBox->SetText(FText::FromString(InOutStr));
+		}
+	}
+	return bRetVal;
+}
+
+// ==================== Float/Numeric ====================
 
 struct FFloatMeta
 	: public TSharedFromThis<FFloatMeta>

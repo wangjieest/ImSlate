@@ -1192,7 +1192,7 @@ bool FoldLine(ImStr Label, const FText& InText, float InHeight /*= 0.f*/)
 
 		WidgetRef->SetContent(SAssignNew(Meta->TextBlock, STextBlock)
 			.Text(FText::FromString(TEXT("\x25B6 ") + InText.ToString()))
-			.Font(GetImSlateDefaultFont())
+			.Font(GetImSlateDefaultFont(12))
 			.Clipping(EWidgetClipping::ClipToBoundsAlways));
 
 		WidgetRef->SetOnClicked(CreateWeakLambda(Ptr, [Ptr] {

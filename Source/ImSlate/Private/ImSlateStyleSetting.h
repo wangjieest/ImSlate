@@ -91,6 +91,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, config)
 	TSubclassOf<UImVirtualList> ImVirtualList = UImVirtualList::StaticClass();
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, config)
+	TSubclassOf<UImSearchBox> ImSearchBox = UImSearchBox::StaticClass();
+
 public:
 	void PreloadClasses() const;
 	virtual void PostLoad() override;

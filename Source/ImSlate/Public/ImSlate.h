@@ -145,6 +145,9 @@ IMSLATE_API bool			Image(ImStr Label, UObject* InTexture, const ImVec2& InSize =
 // Inputs
 IMSLATE_API bool			InputText(ImStr Label, FString& InStr, const ImVec2& InSize = ImVec2(0, 0), ImSlateInputTextFlags_ Flags = ImSlateInputTextFlags_None);
 
+// SearchBox: InputText with history and suggestion dropdown
+IMSLATE_API bool			SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestions = nullptr, TFunction<void(const FString&, TArray<FString>&)> SuggestionCallback = nullptr, const ImVec2& InSize = ImVec2(0, 0));
+
 IMSLATE_API bool			Button(ImStr Label, const ImVec2& InSize = ImVec2(0, 0));
 IMSLATE_API bool			TextButton(ImStr Label, const FText& InText, const ImVec2& InSize = ImVec2(0, 0));
 inline		bool			TextButton(ImStr Label, const FString& InStr, const ImVec2& InSize = ImVec2(0, 0)) { return TextButton(Label, FText::FromString(InStr), InSize); }
