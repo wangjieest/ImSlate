@@ -92,11 +92,11 @@ public:
 	virtual FReply OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
 	virtual FReply OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
 	virtual FReply OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
-
 	void Show(const FVirtualKeyboardShowParams& Params);
 	void Hide(bool bCommit);
 	bool IsShowing() const { return bVisible; }
 	void UpdateSuggestionsAsync(TArray<FString> InResults);
+	void SyncFromEditor(const FString& Text);
 
 	static TSharedPtr<SImSlateVirtualKeyboard> Get();
 	static bool ShouldUseVirtualKeyboard();
@@ -110,6 +110,8 @@ private:
 	EShiftState ShiftState = EShiftState::Default;
 	int32 CurrentLayer = 0;
 	EKeyboardType KeyboardType = EKeyboardType::QWERTY;
+	EKeyboardLayoutMode CachedLayoutMode = EKeyboardLayoutMode::FullScreen;
+	bool bLayoutModeInitialized = false;
 	FString CurrentText;
 	int32 CursorPosition = 0;
 	FString OriginalText;
@@ -131,6 +133,7 @@ private:
 	TSharedPtr<class SOverlay> RootOverlay;
 	TSharedPtr<class SImSlateKeyPopup> ActivePopup;
 	TSharedPtr<class SWidget> SwipeVisual;
+	const FVirtualKeyDef* ActiveKeyDef = nullptr;
 	TMap<FString, TSharedPtr<class STextBlock>> SwipeDirectionTexts;
 	TWeakPtr<class SImSlateKey> ActiveLongPressKey;
 

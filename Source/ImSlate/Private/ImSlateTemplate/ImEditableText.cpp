@@ -26,6 +26,37 @@ void SImEditableText::SetBorderImage(const TAttribute<const FSlateBrush*>& InBru
 	BorderImage.SetImage(*this, InBrushAttribute);
 }
 
+FReply SImEditableText::OnKeyChar(const FGeometry& MyGeometry, const FCharacterEvent& InCharacterEvent)
+{
+	FReply Reply = SEditableText::OnKeyChar(MyGeometry, InCharacterEvent);
+	if (auto Keyboard = ImSlate::SImSlateVirtualKeyboard::Get())
+	{
+		if (Keyboard->IsShowing())
+			Keyboard->SyncFromEditor(GetText().ToString());
+	}
+	return Reply;
+}
+
+FReply SImEditableText::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
+{
+	if (auto Keyboard = ImSlate::SImSlateVirtualKeyboard::Get())
+	{
+		if (Keyboard->IsShowing())
+		{
+			const FKey Key = InKeyEvent.GetKey();
+			if (Key == EKeys::Enter)  { Keyboard->Hide(true);  return FReply::Handled(); }
+			if (Key == EKeys::Escape) { Keyboard->Hide(false); return FReply::Handled(); }
+		}
+	}
+	FReply Reply = SEditableText::OnKeyDown(MyGeometry, InKeyEvent);
+	if (auto Keyboard = ImSlate::SImSlateVirtualKeyboard::Get())
+	{
+		if (Keyboard->IsShowing())
+			Keyboard->SyncFromEditor(GetText().ToString());
+	}
+	return Reply;
+}
+
 FReply SImEditableText::OnFocusReceived(const FGeometry& MyGeometry, const FFocusEvent& InFocusEvent)
 {
 	if (ImSlate::SImSlateVirtualKeyboard::ShouldUseVirtualKeyboard())

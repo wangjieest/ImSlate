@@ -35,6 +35,7 @@ void SImSlateKey::Construct(const FArguments& InArgs)
 {
 	KeyDef = InArgs._KeyDef;
 	bShiftActive = InArgs._bShiftActive;
+	bShiftSingleShot = InArgs._bShiftSingleShot;
 	OnKeyInput = InArgs._OnKeyInput;
 	OnKeyAction = InArgs._OnKeyAction;
 	OnLongPress = InArgs._OnLongPress;
@@ -106,26 +107,31 @@ int32 SImSlateKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeom
 	else if (KeyDef->Action == EVirtualKeyAction::Shift)
 	{
 		float S = IconSize;
-		// Arrow outline
+		bool bSingleShot = bShiftSingleShot.Get(false);
+		FVector2D ArrowCenter = bSingleShot ? FVector2D(Center.X, Center.Y - S * 0.15f) : Center;
+
 		TArray<FVector2D> Points;
-		Points.Add(Center + FVector2D(0, -S));
-		Points.Add(Center + FVector2D(S * 0.8f, S * 0.2f));
-		Points.Add(Center + FVector2D(S * 0.3f, S * 0.2f));
-		Points.Add(Center + FVector2D(S * 0.3f, S * 0.7f));
-		Points.Add(Center + FVector2D(-S * 0.3f, S * 0.7f));
-		Points.Add(Center + FVector2D(-S * 0.3f, S * 0.2f));
-		Points.Add(Center + FVector2D(-S * 0.8f, S * 0.2f));
-		Points.Add(Center + FVector2D(0, -S));
+		Points.Add(ArrowCenter + FVector2D(0, -S));
+		Points.Add(ArrowCenter + FVector2D(S * 0.8f, S * 0.2f));
+		Points.Add(ArrowCenter + FVector2D(S * 0.3f, S * 0.2f));
+		Points.Add(ArrowCenter + FVector2D(S * 0.3f, S * 0.7f));
+		Points.Add(ArrowCenter + FVector2D(-S * 0.3f, S * 0.7f));
+		Points.Add(ArrowCenter + FVector2D(-S * 0.3f, S * 0.2f));
+		Points.Add(ArrowCenter + FVector2D(-S * 0.8f, S * 0.2f));
+		Points.Add(ArrowCenter + FVector2D(0, -S));
 
 		if (bShift)
-		{
-			// Filled: draw as box (filled look via thicker lines)
 			FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(), Points, ESlateDrawEffect::None, IconColor, true, 3.f);
-		}
 		else
-		{
-			// Outline only
 			FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(), Points, ESlateDrawEffect::None, FLinearColor(0.6f, 0.6f, 0.6f), true, 1.5f);
+
+		if (bSingleShot)
+		{
+			float UnderY = ArrowCenter.Y + S * 0.9f;
+			TArray<FVector2D> Line;
+			Line.Add(FVector2D(Center.X - S * 0.6f, UnderY));
+			Line.Add(FVector2D(Center.X + S * 0.6f, UnderY));
+			FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(), Line, ESlateDrawEffect::None, IconColor, false, 2.f);
 		}
 		bDrawnIcon = true;
 	}
@@ -298,6 +304,14 @@ void SImSlateKey::HandleRelease(const FGeometry& MyGeometry, const FVector2D& Sc
 			else
 				FireInput(Entry->Label);
 		}
+		else
+		{
+			// Fallback: no swipe configured for this direction → input default Value
+			if (KeyDef->Action != EVirtualKeyAction::Char)
+				FireAction(KeyDef->Action);
+			else
+				FireInput(KeyDef->GetInputValue(bShiftActive.Get(false)));
+		}
 		return;
 	}
 
@@ -333,20 +347,26 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 
 	FVector2D Delta = ScreenPos - PressStartPos;
 	float SwipeThreshold = 8.f * GetImSlateEffectiveScale();
+	bool bIsSpaceOrDel = (KeyDef->Action == EVirtualKeyAction::Space || KeyDef->Action == EVirtualKeyAction::Backspace);
 
-	bool bCanLongPress = KeyDef->LongPressChars.Num() > 0 || KeyDef->Action == EVirtualKeyAction::Space || KeyDef->Action == EVirtualKeyAction::Backspace;
+	// Space/Del: immediate step-drag when finger crosses threshold (no long-press wait)
+	if (!bLongPressHandled && !bSwipeActive && bIsSpaceOrDel && Delta.Size() >= SwipeThreshold)
+	{
+		bLongPressHandled = true;
+		LongPressAnchorPos = PressStartPos;
+	}
 
-	// Not yet long-pressed: check for long-press trigger
+	// Other keys: long-press check while finger stays near start
+	bool bCanLongPress = KeyDef->LongPressChars.Num() > 0;
 	if (!bLongPressHandled && !bSwipeActive && Delta.Size() < SwipeThreshold)
 	{
 		if (bCanLongPress && FPlatformTime::Seconds() - PressStartTime >= LongPressThreshold)
 		{
 			bLongPressHandled = true;
 			LongPressAnchorPos = ScreenPos;
-			if (KeyDef->Action != EVirtualKeyAction::Space && KeyDef->Action != EVirtualKeyAction::Backspace)
-				OnLongPress.ExecuteIfBound(*KeyDef, MyGeometry);
+			OnLongPress.ExecuteIfBound(*KeyDef, MyGeometry);
 		}
-		if (!bSwipeVisualShown && Delta.Size() >= SwipeThreshold * 0.5f && KeyDef->Swipe.HasAny() && KeyDef->Action != EVirtualKeyAction::Backspace && KeyDef->Action != EVirtualKeyAction::Space)
+		if (!bSwipeVisualShown && Delta.Size() >= SwipeThreshold * 0.5f && KeyDef->Swipe.HasAny() && !bIsSpaceOrDel)
 		{
 			bSwipeVisualShown = true;
 			OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry);
@@ -356,23 +376,24 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 		return;
 	}
 
-	// Long-press active: handle candidate selection, space cursor, or backspace drag
+	// Drag active: Space = cursor step, Del = delete/undo step, LongPress = popup drag
 	if (bLongPressHandled)
 	{
+		float XOffset = ScreenPos.X - LongPressAnchorPos.X;
+		float StepW = 12.f * GetImSlateEffectiveScale();
+
 		if (KeyDef->Action == EVirtualKeyAction::Space)
-			goto HandleSpaceCursor;
-		if (KeyDef->Action == EVirtualKeyAction::Backspace)
 		{
-			float XOffset = ScreenPos.X - LongPressAnchorPos.X;
-			float StepW = 12.f * GetImSlateEffectiveScale();
-			// Left drag = delete, Right drag = undo
-			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Backspace); LongPressAnchorPos.X -= StepW; XOffset += StepW; }
-			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::UndoBackspace); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
-			return;
+			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Right); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
+			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Left);  LongPressAnchorPos.X -= StepW; XOffset += StepW; }
 		}
-		if (LongPressCharCount > 0)
+		else if (KeyDef->Action == EVirtualKeyAction::Backspace)
 		{
-			float XOffset = ScreenPos.X - LongPressAnchorPos.X;
+			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Backspace);     LongPressAnchorPos.X -= StepW; XOffset += StepW; }
+			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::UndoBackspace); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
+		}
+		else if (LongPressCharCount > 0)
+		{
 			float CellW = LongPressCellWidth > 0.f ? LongPressCellWidth : 44.f * GetImSlateEffectiveScale();
 			int32 HalfCount = LongPressCharCount / 2;
 			int32 Index = FMath::Clamp(FMath::RoundToInt(XOffset / CellW) + HalfCount, 0, LongPressCharCount - 1);
@@ -381,7 +402,8 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 		return;
 	}
 
-	if (!bSwipeVisualShown && KeyDef->Swipe.HasAny() && KeyDef->Action != EVirtualKeyAction::Backspace && KeyDef->Action != EVirtualKeyAction::Space)
+	// Swipe visual for regular keys
+	if (!bSwipeVisualShown && KeyDef->Swipe.HasAny() && !bIsSpaceOrDel)
 	{
 		bSwipeVisualShown = true;
 		OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry);
@@ -389,69 +411,12 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 	if (bSwipeVisualShown)
 		OnMoveVisual.ExecuteIfBound(Delta, Delta.Size() >= SwipeThreshold);
 
-	// Space long-press drag → cursor control (inner/outer zone)
-	HandleSpaceCursor:
-	if (bLongPressHandled && KeyDef->Action == EVirtualKeyAction::Space)
-	{
-		float KbWidth = KeyboardWidthGetter.Get(GetCachedGeometry().GetAbsoluteSize().X);
-		float HalfWidth = KbWidth * 0.5f;
-		float XOffset = ScreenPos.X - LongPressAnchorPos.X;
-		float InnerStep = HalfWidth * 0.06f;
-		float OuterThreshold = HalfWidth * 0.75f;  // inner 75%, outer 25%
-		float DeadZone = HalfWidth * 0.05f;
-
-		if (FMath::Abs(XOffset) > OuterThreshold)
-		{
-			// Outer zone: continuous auto-scroll
-			bWasInOuterZone = true;
-			int32 Dir = XOffset > 0 ? 1 : -1;
-			if (Dir != LastCursorZone)
-			{
-				LastCursorZone = Dir;
-				OnSpaceCursorZone.ExecuteIfBound(Dir);
-			}
-		}
-		else if (bWasInOuterZone)
-		{
-			// Transition: outer → inner, stop auto-scroll
-			if (LastCursorZone != 0)
-			{
-				LastCursorZone = 0;
-				OnSpaceCursorZone.ExecuteIfBound(0);
-			}
-			// Once close enough to anchor, reset to allow inner stepping again
-			if (FMath::Abs(XOffset) < DeadZone)
-			{
-				bWasInOuterZone = false;
-				LongPressAnchorPos.X = ScreenPos.X;
-			}
-		}
-		else
-		{
-			// Inner zone: step-by-step
-			while (XOffset > InnerStep)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Right); LongPressAnchorPos.X += InnerStep; XOffset -= InnerStep; }
-			while (XOffset < -InnerStep) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Left);  LongPressAnchorPos.X -= InnerStep; XOffset += InnerStep; }
-		}
-		return;
-	}
-
-	if (bLongPressHandled && LongPressCharCount > 0)
-	{
-		float XOffset = ScreenPos.X - LongPressAnchorPos.X;
-		float CellW = LongPressCellWidth > 0.f ? LongPressCellWidth : 44.f * GetImSlateEffectiveScale();
-		int32 HalfCount = LongPressCharCount / 2;
-		int32 Index = FMath::Clamp(FMath::RoundToInt(XOffset / CellW) + HalfCount, 0, LongPressCharCount - 1);
-		OnLongPressMove.ExecuteIfBound(Index);
-		return;
-	}
-
 	if (Delta.Size() < SwipeThreshold)
 		return;
 
 	ESwipeDirection Dir = DetectSwipe(Delta);
 	if (Dir == ESwipeDirection::None) return;
 
-	// Track direction but don't fire yet — wait for release
 	ActiveSwipeDir = Dir;
 	bSwipeActive = true;
 }

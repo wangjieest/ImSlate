@@ -27,9 +27,11 @@ public:
 	SLATE_BEGIN_ARGS(SImSlateKey)
 		: _KeyDef()
 		, _bShiftActive(false)
+		, _bShiftSingleShot(false)
 	{}
 		SLATE_ARGUMENT(const FVirtualKeyDef*, KeyDef)
 		SLATE_ATTRIBUTE(bool, bShiftActive)
+		SLATE_ATTRIBUTE(bool, bShiftSingleShot)
 		SLATE_EVENT(FOnVirtualKeyPressed, OnKeyInput)
 		SLATE_EVENT(FOnVirtualKeyAction, OnKeyAction)
 		SLATE_EVENT(FOnVirtualKeyLongPress, OnLongPress)
@@ -60,6 +62,7 @@ public:
 private:
 	const FVirtualKeyDef* KeyDef = nullptr;
 	TAttribute<bool> bShiftActive;
+	TAttribute<bool> bShiftSingleShot;
 	FOnVirtualKeyPressed OnKeyInput;
 	FOnVirtualKeyAction OnKeyAction;
 	FOnVirtualKeyLongPress OnLongPress;
