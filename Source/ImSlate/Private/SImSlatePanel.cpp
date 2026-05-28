@@ -3,6 +3,7 @@
 
 #include "Layout/LayoutUtils.h"
 #include "Layout/Margin.h"
+#include "SImSlateViewport.h"
 #include "SImSlateWindow.h"
 #include "Types/SlateEnums.h"
 #include "XConsoleManager.h"

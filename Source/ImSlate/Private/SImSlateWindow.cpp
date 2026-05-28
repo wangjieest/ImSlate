@@ -734,6 +734,11 @@ void SImSlateWindow::SetBgAlpha(float InAlpha)
 	// SetRenderOpacity(BackgroudAlpha);
 }
 
+void SImSlateWindow::SetBgColor(const FLinearColor& InColor)
+{
+	ContentBackgroundBrush.TintColor = InColor;
+}
+
 void SImSlateWindow::SetWindowSize(FVector2D InSize)
 {
 	RequiredSize = InSize;
@@ -989,6 +994,26 @@ void SImSlateWindow::CacheDesiredSize(float LayoutScaleMultiplier)
 	{
 		ActualPos -= SetWindowPosPivot.GetValue() * ActualSize;
 		SetWindowPosPivot.Reset();
+	}
+
+	if (Viewport && !ViewportOwned)
+	{
+		FVector2D ViewportSize = Viewport->GetCachedGeometry().GetLocalSize();
+		if (ViewportSize.X > 0 && ViewportSize.Y > 0)
+		{
+			if (SetWindowSizeAllowFlags & ImSlateCond_FirstClearMask)
+			{
+				ActualSize.X = FMath::Min(ActualSize.X, ViewportSize.X);
+				ActualSize.Y = FMath::Min(ActualSize.Y, ViewportSize.Y);
+			}
+			if (!(Flags & ImSlateWindowFlags_NoTitleBar))
+			{
+				constexpr float MinGrabWidth = 50.f;
+				float TitleH = GetTitleHeight();
+				ActualPos.X = FMath::Clamp(ActualPos.X, -(ActualSize.X - MinGrabWidth), ViewportSize.X - MinGrabWidth);
+				ActualPos.Y = FMath::Clamp(ActualPos.Y, 0.f, FMath::Max(0.f, ViewportSize.Y - TitleH));
+			}
+		}
 	}
 
 #if 0

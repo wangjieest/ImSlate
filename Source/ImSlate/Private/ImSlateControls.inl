@@ -29,6 +29,7 @@
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Views/SListView.h"
 #include "ImSlateTemplate/ImSearchBox.h"
+#include "ImSlateTemplate/ImVirtualKeyboard.h"
 
 namespace ImSlate
 {
@@ -111,6 +112,9 @@ public:
 	FButtonStyle MyStyle;
 	TSharedPtr<STextBlock> TextBlock = nullptr;
 
+	FText TooltipText;
+	double PressStartTime = 0.0;
+
 protected:
 #if !IMSLATE_USING_GCROOT_REFERENCE
 	virtual void AddReferencedObjects(FReferenceCollector& Collector)
@@ -183,6 +187,32 @@ bool TextButton(ImStr InLabel, const FText& InText, const ImVec2& InSize)
 			else
 			{
 				Meta->TextBlock->SetText(InText);
+			}
+
+			if (!GImSlate->NextItemTooltip.IsEmpty() && Meta->TooltipText.IsEmpty())
+				Meta->TooltipText = GImSlate->NextItemTooltip;
+
+			if (!Meta->TooltipText.IsEmpty())
+			{
+				ImSlateContext& g = *GImSlate;
+				if (ItemPtr->IsPressed())
+				{
+					if (Meta->PressStartTime == 0.0)
+						Meta->PressStartTime = FPlatformTime::Seconds();
+					else if (!g.LongPressTooltip.bVisible && FPlatformTime::Seconds() - Meta->PressStartTime > 0.5)
+					{
+						g.LongPressTooltip.bVisible = true;
+						g.LongPressTooltip.Text = Meta->TooltipText;
+						auto Geo = ItemPtr->GetCachedGeometry();
+						g.LongPressTooltip.AbsolutePosition = Geo.GetAbsolutePosition() + FVector2D(0, Geo.GetAbsoluteSize().Y);
+					}
+				}
+				else
+				{
+					Meta->PressStartTime = 0.0;
+					if (g.LongPressTooltip.bVisible)
+						g.LongPressTooltip.bVisible = false;
+				}
 			}
 		}
 	}
@@ -376,36 +406,76 @@ struct FSearchBoxMeta : public TSharedFromThis<FSearchBoxMeta>, public ISlateMet
 			History.SetNum(MaxHistory);
 	}
 
+	int32 LastHistoryCount = 0;
+
+	static bool MatchesAllTerms(const FString& Candidate, const TArray<FString>& Terms)
+	{
+		for (const FString& Term : Terms)
+		{
+			if (!Term.IsEmpty() && !Candidate.Contains(Term, ESearchCase::IgnoreCase))
+				return false;
+		}
+		return true;
+	}
+
 	TArray<FString> Filter(const FString& Input, const TArray<FString>* Src, const TFunction<void(const FString&, TArray<FString>&)>& Cb)
 	{
+		TArray<FString> HistoryMatches;
 		TArray<FString> Result;
-		if (Input.IsEmpty())
+
+		TArray<FString> Terms;
+		Input.ParseIntoArray(Terms, TEXT(" "), true);
+
+		// History matches first
+		for (const FString& H : History)
 		{
-			Result = History;
+			if (Terms.Num() == 0 || MatchesAllTerms(H, Terms))
+				HistoryMatches.Add(H);
 		}
-		else if (Cb)
+
+		// Source/callback matches (exclude duplicates from history)
+		TArray<FString> SourceMatches;
+		if (Terms.Num() > 0)
 		{
-			Cb(Input, Result);
-		}
-		else if (Src)
-		{
-			TArray<FString> ContainsMatches;
-			for (const FString& S : *Src)
+			if (Cb)
 			{
-				if (S.StartsWith(Input, ESearchCase::IgnoreCase))
-					Result.Add(S);
-				else if (S.Contains(Input, ESearchCase::IgnoreCase))
-					ContainsMatches.Add(S);
+				Cb(Input, SourceMatches);
 			}
-			Result.Append(ContainsMatches);
+			else if (Src)
+			{
+				TArray<FString> StartsWithMatches;
+				TArray<FString> ContainsMatches;
+				for (const FString& S : *Src)
+				{
+					if (!MatchesAllTerms(S, Terms))
+						continue;
+					if (S.StartsWith(Terms[0], ESearchCase::IgnoreCase))
+						StartsWithMatches.Add(S);
+					else
+						ContainsMatches.Add(S);
+				}
+				SourceMatches.Append(StartsWithMatches);
+				SourceMatches.Append(ContainsMatches);
+			}
+			SourceMatches.RemoveAll([&](const FString& S) { return HistoryMatches.Contains(S); });
 		}
+
+		LastHistoryCount = FMath::Min(HistoryMatches.Num(), MaxVisible);
+		Result.Append(HistoryMatches);
+		Result.Append(SourceMatches);
 		if (Result.Num() > MaxVisible)
 			Result.SetNum(MaxVisible);
+		LastHistoryCount = FMath::Min(LastHistoryCount, Result.Num());
 		return Result;
+	}
+
+	void RemoveFromHistory(const FString& Str)
+	{
+		History.Remove(Str);
 	}
 };
 
-bool SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestions, TFunction<void(const FString&, TArray<FString>&)> SuggestionCallback, const ImVec2& InSize)
+bool SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestions, TFunction<void(const FString&, TArray<FString>&)> SuggestionCallback, const ImVec2& InSize, bool bShowKeyboardButton)
 {
 	auto ItemPtr = Item<SImSearchBox>(Label, [&](FItemSlotPod& InItem) {
 		InItem.bFillWidth = true;
@@ -413,7 +483,7 @@ bool SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestion
 		InItem.HAlignment = HAlign_Fill;
 		InItem.VAlignment = VAlign_Fill;
 
-		TSharedRef<SImSearchBox> WidgetRef = ImFactoryCreate<UImSearchBox>();
+		TSharedRef<SImSearchBox> WidgetRef = SNew(SImSearchBox).bShowKeyboardButton(bShowKeyboardButton);
 		WidgetRef->SetText(FText::FromString(InOutStr));
 		SetDesiredSize(WidgetRef, InSize);
 
@@ -428,28 +498,76 @@ bool SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestion
 		auto SearchBox = static_cast<SImSearchBox*>(ItemPtr);
 		auto Meta = GetMetaData<FSearchBoxMeta>(ItemPtr);
 
-		// Detect text change and update suggestions
+		// Set suggestion provider for virtual keyboard
+		if (Meta)
+		{
+			TWeakPtr<FSearchBoxMeta> WeakM = Meta;
+			SearchBox->SetKeyboardSuggestionProvider(
+				[WeakM, Suggestions, SuggestionCallback](const FString& Input, TArray<FString>& Out) {
+					if (auto M = WeakM.Pin())
+						Out = M->Filter(Input, Suggestions, SuggestionCallback);
+				});
+		}
+
+		// Detect text change, focus-trigger, or first-focus and update suggestions
 		FString CurrentText = SearchBox->GetText().ToString();
-		if (Meta && CurrentText != Meta->PrevInput)
+		bool bForceRefresh = SearchBox->ConsumeNeedsSuggestionRefresh();
+		bool bHasFocus = ItemPtr->HasAnyUserFocus().IsSet() || ItemPtr->HasFocusedDescendants();
+		if (!bForceRefresh && bHasFocus && !SearchBox->IsMenuOpen() && Meta)
+			bForceRefresh = true;
+		if (Meta && (bForceRefresh || CurrentText != Meta->PrevInput))
 		{
 			Meta->PrevInput = CurrentText;
 			auto Filtered = Meta->Filter(CurrentText, Suggestions, SuggestionCallback);
-			SearchBox->SetSuggestions(Filtered);
+			TWeakPtr<FSearchBoxMeta> WeakMeta = Meta;
+			SearchBox->SetSuggestions(Filtered, Meta->LastHistoryCount,
+				[WeakMeta, Suggestions, SuggestionCallback, SearchBox](const FString& Item) {
+					if (auto M = WeakMeta.Pin())
+					{
+						M->RemoveFromHistory(Item);
+						TArray<FString> Refreshed = M->Filter(M->PrevInput, Suggestions, SuggestionCallback);
+						SearchBox->SetSuggestions(Refreshed, M->LastHistoryCount, nullptr);
+					}
+				});
 		}
 
 		// Check for commit (Enter or suggestion click)
 		if (SearchBox->HasPendingCommit())
 		{
 			InOutStr = SearchBox->ConsumeCommit();
-			if (Meta) Meta->AddToHistory(InOutStr);
+			if (Meta && !InOutStr.IsEmpty())
+			{
+				bool bIsValidEntry = !Suggestions || Suggestions->Contains(InOutStr);
+				if (!bIsValidEntry && SuggestionCallback)
+				{
+					TArray<FString> Check;
+					SuggestionCallback(InOutStr, Check);
+					bIsValidEntry = Check.Contains(InOutStr);
+				}
+				if (bIsValidEntry)
+					Meta->AddToHistory(InOutStr);
+			}
 			bRetVal = true;
 		}
-		else if (!ItemPtr->HasAnyUserFocus().IsSet() && InOutStr != CurrentText)
+		else if (!ItemPtr->HasAnyUserFocus().IsSet() && !ItemPtr->HasFocusedDescendants() && !SearchBox->IsMenuOpen() && InOutStr != CurrentText)
 		{
 			SearchBox->SetText(FText::FromString(InOutStr));
 		}
 	}
 	return bRetVal;
+}
+
+// ==================== KeyboardButton ====================
+
+bool KeyboardButton(ImStr Label, const FVirtualKeyboardShowParams& Params, const ImVec2& InSize)
+{
+	if (TextButton(Label, FText::FromString(TEXT("\x2328")), InSize))
+	{
+		if (auto Kb = SImSlateVirtualKeyboard::Get())
+			Kb->Show(Params);
+		return true;
+	}
+	return false;
 }
 
 // ==================== Float/Numeric ====================

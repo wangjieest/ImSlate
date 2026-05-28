@@ -1,5 +1,6 @@
 // Copyright ImSlate, Inc. All Rights Reserved.
 #include "ImSlateTemplate/ImEditableText.h"
+#include "ImSlateTemplate/ImVirtualKeyboard.h"
 #include "SImSlateViewport.h"
 
 // SImEditableText
@@ -23,6 +24,36 @@ int32 SImEditableText::OnPaint(const FPaintArgs& Args, const FGeometry& Allotted
 void SImEditableText::SetBorderImage(const TAttribute<const FSlateBrush*>& InBrushAttribute)
 {
 	BorderImage.SetImage(*this, InBrushAttribute);
+}
+
+FReply SImEditableText::OnFocusReceived(const FGeometry& MyGeometry, const FFocusEvent& InFocusEvent)
+{
+	if (ImSlate::SImSlateVirtualKeyboard::ShouldUseVirtualKeyboard())
+	{
+		if (auto Keyboard = ImSlate::SImSlateVirtualKeyboard::Get())
+		{
+			auto WeakSelf = TWeakPtr<SImEditableText>(StaticCastSharedRef<SImEditableText>(AsShared()));
+			ImSlate::FVirtualKeyboardShowParams Params;
+			Params.InitialText = GetText().ToString();
+			Params.OnTextChanged = [WeakSelf](const FString& Text) {
+				if (auto This = WeakSelf.Pin())
+					This->SetText(FText::FromString(Text));
+			};
+			Params.CommitCallback = [WeakSelf](const FString& Text, ETextCommit::Type Type) {
+				if (auto This = WeakSelf.Pin())
+				{
+					if (Type != ETextCommit::OnCleared)
+						This->SetText(FText::FromString(Text));
+					if (This->VKCommitCallback)
+						This->VKCommitCallback(Text, Type);
+				}
+			};
+			Params.SuggestionProvider = VKSuggestionProvider;
+			Keyboard->Show(Params);
+			return FReply::Handled();
+		}
+	}
+	return SEditableText::OnFocusReceived(MyGeometry, InFocusEvent);
 }
 
 namespace ImSlate

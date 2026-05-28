@@ -1,6 +1,7 @@
 // Copyright ImSlate, Inc. All Rights Reserved.
 #include "SImSlateViewport.h"
 
+#include "ImSlatePrivate.h"
 #include "Application/SlateApplicationBase.h"
 #include "Engine/GameViewportClient.h"
 #include "Framework/Application/SlateApplication.h"
@@ -193,6 +194,31 @@ int32 SImSlateViewport::OnPaint(const FPaintArgs& Args,  //
 		else
 		{
 		}
+	}
+
+	if (GImSlate && GImSlate->LongPressTooltip.bVisible)
+	{
+		const auto& Tip = GImSlate->LongPressTooltip;
+		FSlateFontInfo Font = GetImSlateDefaultFont();
+		TSharedRef<FSlateFontMeasure> FontMeasure = FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
+		FVector2D TextSize = (FVector2D)FontMeasure->Measure(Tip.Text, Font);
+
+		FVector2D Padding(8.f, 4.f);
+		FVector2D BgSize = TextSize + Padding * 2.f;
+		FVector2D LocalPos = AllottedGeometry.AbsoluteToLocal(Tip.AbsolutePosition) + FVector2D(0, 2.f);
+
+		static FSlateBrush TipBrush;
+		TipBrush.DrawAs = ESlateBrushDrawType::RoundedBox;
+		TipBrush.TintColor = FLinearColor(0.1f, 0.1f, 0.1f, 0.95f);
+		TipBrush.OutlineSettings.RoundingType = ESlateBrushRoundingType::FixedRadius;
+		TipBrush.OutlineSettings.CornerRadii = FVector4(4, 4, 4, 4);
+		TipBrush.OutlineSettings.Color = FLinearColor(0.4f, 0.4f, 0.4f, 1.f);
+		TipBrush.OutlineSettings.Width = 1.f;
+
+		FSlateDrawElement::MakeBox(OutDrawElements, MaxLayerId + 1, AllottedGeometry.ToPaintGeometry(BgSize, FSlateLayoutTransform(1.f, UE::Slate::CastToVector2f(LocalPos))), &TipBrush);
+		FSlateDrawElement::MakeText(OutDrawElements, MaxLayerId + 2, AllottedGeometry.ToPaintGeometry(TextSize, FSlateLayoutTransform(1.f, UE::Slate::CastToVector2f(LocalPos + Padding))), Tip.Text, Font, ESlateDrawEffect::None, FLinearColor::White);
+
+		MaxLayerId += 2;
 	}
 
 	return MaxLayerId;

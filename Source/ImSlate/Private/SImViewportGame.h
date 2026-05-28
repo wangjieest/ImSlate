@@ -23,8 +23,13 @@ public:
 	virtual FVector2D GetWindowPos(const SImSlateWindow* InWindow) const override;
 	virtual FVector2D GetWindowSize(const SImSlateWindow* InWindow) const override;
 
+	TSharedPtr<class SImSlateVirtualKeyboard> GetOrCreateVirtualKeyboard();
+	void EnsureKeyboardInViewport();
+
 protected:
 	virtual void OnArrangeChildren(const FGeometry& AllottedGeometry, FArrangedChildren& ArrangedChildren) const override;
+	TSharedPtr<class SImSlateVirtualKeyboard> VirtualKeyboard;
+
 #if WITH_EDITOR
 	TWeakPtr<ILevelEditor> WeakLevelEditor;
 	static TWeakPtr<ILevelEditor> CurrentWeakLevelEditor;

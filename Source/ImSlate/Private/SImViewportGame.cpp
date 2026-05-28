@@ -9,6 +9,7 @@
 #include "Kismet/KismetMathLibrary.h"
 #include "ProtectFieldAccessor.h"
 #include "SImSlateWindow.h"
+#include "ImSlateTemplate/ImVirtualKeyboard.h"
 #include "Widgets/Layout/SConstraintCanvas.h"
 
 #if WITH_EDITOR
@@ -187,6 +188,38 @@ void SImViewportGame::OnArrangeChildren(const FGeometry& AllottedGeometry, FArra
 		for (auto& ArrangedWidget : ArrangedWidgets)
 			ArrangedChildren.AddWidget(ArrangedWidget);
 	}
+}
+
+TSharedPtr<SImSlateVirtualKeyboard> SImViewportGame::GetOrCreateVirtualKeyboard()
+{
+	if (!VirtualKeyboard.IsValid())
+		VirtualKeyboard = SNew(SImSlateVirtualKeyboard);
+	return VirtualKeyboard;
+}
+
+void SImViewportGame::EnsureKeyboardInViewport()
+{
+	if (!VirtualKeyboard.IsValid()) return;
+	if (VirtualKeyboard->GetParentWidget().IsValid()) return;
+
+	if (auto Client = GetGameViewportClient())
+	{
+		Client->AddViewportWidgetContent(VirtualKeyboard.ToSharedRef(), 2000);
+	}
+#if WITH_EDITOR
+	else if (TSharedPtr<ILevelEditor> LevelEditor = WeakLevelEditor.Pin())
+	{
+		auto LevelViewport = LevelEditor->GetActiveViewportInterface();
+		TSharedPtr<SOverlay>& ViewportOverlay = GS_ACCESS_PROTECT(LevelViewport.Get(), SLevelViewport, ViewportOverlay)->ViewportOverlay;
+		ViewportOverlay
+		->AddSlot(2000)
+		.HAlign(HAlign_Fill)
+		.VAlign(VAlign_Bottom)
+		[
+			VirtualKeyboard.ToSharedRef()
+		];
+	}
+#endif
 }
 
 }  // namespace ImSlate

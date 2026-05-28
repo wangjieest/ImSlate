@@ -1,4 +1,4 @@
-// Copyright ImSlate, Inc. All Rights Reserved.
+﻿// Copyright ImSlate, Inc. All Rights Reserved.
 #include "ImSlate.h"
 #include "ImSlatePrivate.h"
 
@@ -13,6 +13,7 @@
 #include "ImSlateInternal.h"
 #include "ImSlateStyleSetting.h"
 #include "ImSlateTemplates.h"
+#include "ImSlateTemplate/ImVirtualKeyboard.h"
 #include "Internationalization/Text.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "PrivateFieldAccessor.h"
@@ -152,6 +153,13 @@ void SetWindowBgAlpha(ImSlateWindow* MyWindow, float Alpha, ImSlateCond Cond)
 
 	// Set
 	MyWindow->SetBgAlpha(Alpha);
+}
+
+void SetWindowBgColor(ImSlateWindow* MyWindow, const FLinearColor& InColor, ImSlateCond Cond)
+{
+	if (Cond && (MyWindow->SetWindowByAlphaAllowFlags & Cond) == 0)
+		return;
+	MyWindow->SetBgColor(InColor);
 }
 
 void SetWindowTitle(ImSlateWindow* MyWindow, const FText& InTitle, ImSlateCond Cond)
@@ -674,6 +682,8 @@ bool Begin(ImStr Name, bool* bIsOpen, ImWindowFlags Flags, int32 Id)
 		CurWindow->SetScrollTarget(g.NextWindowData.ScrollVal);
 	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasBgAlpha)
 		SetWindowBgAlpha(CurWindow, g.NextWindowData.BgAlphaVal, g.NextWindowData.BgAlphaCond);
+	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasBgColor)
+		SetWindowBgColor(CurWindow, g.NextWindowData.BgColorVal, g.NextWindowData.BgColorCond);
 	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasCollapsed)
 		SetWindowCollapsed(CurWindow, g.NextWindowData.CollapsedVal, g.NextWindowData.CollapsedCond);
 	if (g.NextWindowData.Flags & ImSlateNextWindowDataFlags_HasTopmost)
@@ -829,6 +839,14 @@ void SetNextWindowBgAlpha(float Alpha, ImSlateCond Cond)
 	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasBgAlpha;
 	g.NextWindowData.BgAlphaVal = Alpha;
 	g.NextWindowData.BgAlphaCond = Cond ? Cond : ImSlateCond_Always;
+}
+
+void SetNextWindowBgColor(const FLinearColor& InColor, ImSlateCond Cond)
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextWindowData.Flags |= ImSlateNextWindowDataFlags_HasBgColor;
+	g.NextWindowData.BgColorVal = InColor;
+	g.NextWindowData.BgColorCond = Cond ? Cond : ImSlateCond_Always;
 }
 
 void SetCurrentWindowColorAndOpacity(const FLinearColor& InColor)
@@ -1041,6 +1059,7 @@ namespace Internal
 			g.NextItemData.ClearFlags();
 			g.NextItemData.Flags |= ImSlateNextItemDataFlags_NewRow;
 			g.NextItemData.bNewRow = true;
+			g.NextItemTooltip = FText::GetEmpty();
 		}
 		return WidgetPtr;
 	}
@@ -1393,6 +1412,11 @@ void SetNextItemAspectRatio(float InRatio)
 	g.NextItemData.SetAspectRatio(InRatio);
 }
 
+void SetNextItemTooltip(const FText& InText)
+{
+	GImSlate->NextItemTooltip = InText;
+}
+
 void SetNextItemFillWidth(float InFactor)
 {
 	ImSlateContext& g = *GImSlate;
@@ -1400,6 +1424,21 @@ void SetNextItemFillWidth(float InFactor)
 	g.NextItemData.bFillWidth = true;
 	g.NextItemData.StretchValue = InFactor;
 }
+
+extern bool GForceVirtualKeyboard;
+
+void SetVirtualKeyboardEnabled(bool bEnabled)
+{
+	GForceVirtualKeyboard = bEnabled;
+}
+
+bool IsVirtualKeyboardVisible()
+{
+	if (auto Kb = SImSlateVirtualKeyboard::Get())
+		return Kb->IsShowing();
+	return false;
+}
+
 }  // namespace ImSlate
 
 #include "ImSlateControls.inl"

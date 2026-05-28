@@ -64,6 +64,7 @@ IMSLATE_API void				SetNextWindowCollapsed(bool bCollapsed, ImSlateCond Cond = 0
 IMSLATE_API void				SetNextWindowTopmost(bool Topmost, ImSlateCond Cond = 0);
 IMSLATE_API void				SetNextWindowFocus();
 IMSLATE_API void				SetNextWindowBgAlpha(float Alpha, ImSlateCond Cond = 0);
+IMSLATE_API void				SetNextWindowBgColor(const FLinearColor& InColor, ImSlateCond Cond = 0);
 IMSLATE_API void				SetNextWindowTitle(const FText& InTitle, ImSlateCond Cond = 0);
 
 // Set current window properties (call after Begin())
@@ -131,7 +132,12 @@ IMSLATE_API void				SetNextItemMaxHeight(float InVal);
 IMSLATE_API void				SetNextItemMinSize(float InWidth, float InHeight);
 IMSLATE_API void				SetNextItemMaxSize(float InWidth, float InHeight);
 IMSLATE_API void				SetNextItemFixSize(float InWidth, float InHeight);
+IMSLATE_API void				SetNextItemTooltip(const FText& InText);
 
+// Virtual Keyboard
+IMSLATE_API void				SetVirtualKeyboardEnabled(bool bEnabled);
+IMSLATE_API bool				IsVirtualKeyboardVisible();
+IMSLATE_API bool				KeyboardButton(ImStr Label, const struct FVirtualKeyboardShowParams& Params, const ImVec2& InSize = ImVec2(0, 0));
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Measure
@@ -146,7 +152,7 @@ IMSLATE_API bool			Image(ImStr Label, UObject* InTexture, const ImVec2& InSize =
 IMSLATE_API bool			InputText(ImStr Label, FString& InStr, const ImVec2& InSize = ImVec2(0, 0), ImSlateInputTextFlags_ Flags = ImSlateInputTextFlags_None);
 
 // SearchBox: InputText with history and suggestion dropdown
-IMSLATE_API bool			SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestions = nullptr, TFunction<void(const FString&, TArray<FString>&)> SuggestionCallback = nullptr, const ImVec2& InSize = ImVec2(0, 0));
+IMSLATE_API bool			SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestions = nullptr, TFunction<void(const FString&, TArray<FString>&)> SuggestionCallback = nullptr, const ImVec2& InSize = ImVec2(0, 0), bool bShowKeyboardButton = false);
 
 IMSLATE_API bool			Button(ImStr Label, const ImVec2& InSize = ImVec2(0, 0));
 IMSLATE_API bool			TextButton(ImStr Label, const FText& InText, const ImVec2& InSize = ImVec2(0, 0));

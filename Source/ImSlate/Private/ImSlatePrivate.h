@@ -77,6 +77,7 @@ enum ImSlateNextWindowDataFlags_
 	ImSlateNextWindowDataFlags_HasCloseFunc			= 1 << 10,
 	ImSlateNextWindowDataFlags_HasTitle				= 1 << 11,
 	ImSlateNextWindowDataFlags_HasTopmost			= 1 << 12,
+	ImSlateNextWindowDataFlags_HasBgColor			= 1 << 13,
 };
 
 struct ImSlateNextWindowData
@@ -105,6 +106,8 @@ struct ImSlateNextWindowData
 	bool							CollapsedVal	= false;
 	bool							TopmostVal		= false;
 	float							BgAlphaVal		= 0.f;
+	FLinearColor					BgColorVal		= FLinearColor::Black;
+	ImSlateCond						BgColorCond		= 0;
 
 	
 	ImVec2							MenuBarOffsetMinVal;
@@ -299,6 +302,16 @@ struct ImSlateContext
 	ImSlateNextItemData											NextItemData;								// Storage for SetNextItem** functions
 	ImSlateLastItemData											LastItemData;								// Storage for last submitted item (setup by ItemAdd)
 	ImSlateItemFlags											CurrentItemFlags = 0;						// == g.ItemFlagsStack.back()
+
+	FText														NextItemTooltip;
+
+	struct FLongPressTooltip
+	{
+		FText Text;
+		FVector2D AbsolutePosition = FVector2D::ZeroVector;
+		FVector2D Size = FVector2D::ZeroVector;
+		bool bVisible = false;
+	}															LongPressTooltip;
 
 	float														CurrentIndent = 0.f;
 	TArray<float, TInlineAllocator<4>>							IndentStack;

@@ -14,12 +14,17 @@ class IMSLATE_API SImEditableText : public SEditableText
 protected:
 	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled)
 		const override;
+	virtual FReply OnFocusReceived(const FGeometry& MyGeometry, const FFocusEvent& InFocusEvent) override;
 
 public:
 	void SetBorderImage(const TAttribute<const FSlateBrush*>& InBrushAttribute);
+	void SetVirtualKeyboardCommitCallback(TFunction<void(const FString&, ETextCommit::Type)> InCallback) { VKCommitCallback = MoveTemp(InCallback); }
+	void SetVirtualKeyboardSuggestionProvider(TFunction<void(const FString&, TArray<FString>&)> InProvider) { VKSuggestionProvider = MoveTemp(InProvider); }
 
 private:
 	FInvalidatableBrushAttribute BorderImage;
+	TFunction<void(const FString&, ETextCommit::Type)> VKCommitCallback;
+	TFunction<void(const FString&, TArray<FString>&)> VKSuggestionProvider;
 };
 
 UCLASS(BlueprintType)

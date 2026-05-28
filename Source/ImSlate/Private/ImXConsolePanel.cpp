@@ -489,8 +489,14 @@ void UImXConsolePanel::DrawParamWidget(const FName& TypeName, FString& Value, bo
 bool UImXConsolePanel::MatchesSearch(const FString& Name, const FString& Help) const
 {
 	if (SearchFilter.IsEmpty()) return true;
-	return Name.Contains(SearchFilter, ESearchCase::IgnoreCase) ||
-		   Help.Contains(SearchFilter, ESearchCase::IgnoreCase);
+	TArray<FString> Terms;
+	SearchFilter.ParseIntoArray(Terms, TEXT(" "), true);
+	for (const FString& Term : Terms)
+	{
+		if (!Term.IsEmpty() && !Name.Contains(Term, ESearchCase::IgnoreCase))
+			return false;
+	}
+	return true;
 }
 
 static constexpr float XConsoleRowHeight = 48.f;
@@ -514,15 +520,15 @@ void UImXConsolePanel::DrawSearchBar()
 		for (auto& [Cat, SubCats] : CommandTree)
 			for (auto& [Sub, Cmds] : SubCats)
 				for (auto& Cmd : Cmds)
-					SearchNames.Add(Cmd.LeafName);
+					SearchNames.Add(Cmd.Name);
 		for (auto& [Cat, SubCats] : VariableTree)
 			for (auto& [Sub, Vars] : SubCats)
 				for (auto& Var : Vars)
-					SearchNames.Add(Var.LeafName);
+					SearchNames.Add(Var.Name);
 	}
 
 	ImSlate::SetNextItemFillWidth(0.7f);
-	ImSlate::SearchBox("##XConsoleSearch", SearchFilter, &SearchNames, nullptr, ImVec2(0, XConsoleRowHeight));
+	ImSlate::SearchBox("##XConsoleSearch", SearchFilter, &SearchNames, nullptr, ImVec2(0, XConsoleRowHeight), true);
 
 	ImSlate::SameLine();
 	if (ImSlate::Button("Refresh", ImVec2(80.f, XConsoleRowHeight)))
@@ -543,6 +549,9 @@ void UImXConsolePanel::DrawCommandEntry(FImXConsoleCommandInfo& Info)
 	FString LeafDisplay = (Meta && Meta->SelfMeta.HasMeta(TEXT("DisplayName")))
 		? Meta->SelfMeta.GetMeta(TEXT("DisplayName"))
 		: Info.LeafName;
+	FString Tip = Info.Name;
+	if (!Info.Help.IsEmpty()) Tip += TEXT("\n") + Info.Help;
+	ImSlate::SetNextItemTooltip(FText::FromString(Tip));
 	if (ImSlate::TextButton("CmdName", FText::FromString(LeafDisplay), ImVec2(0, XConsoleRowHeight)))
 		ExecuteCommand(Info);
 
@@ -560,7 +569,8 @@ void UImXConsolePanel::DrawCommandEntry(FImXConsoleCommandInfo& Info)
 
 void UImXConsolePanel::DrawCommandCategory(const FString& Category, TMap<FString, TArray<FImXConsoleCommandInfo>>& SubCats)
 {
-	if (!SearchFilter.IsEmpty())
+	const bool bSearching = !SearchFilter.IsEmpty();
+	if (bSearching)
 	{
 		bool bAnyVisible = false;
 		for (auto& SubPair : SubCats)
@@ -587,11 +597,13 @@ void UImXConsolePanel::DrawCommandCategory(const FString& Category, TMap<FString
 			}
 			else
 			{
-				bool bSubVisible = SearchFilter.IsEmpty();
-				if (!bSubVisible)
+				if (bSearching)
+				{
+					bool bSubVisible = false;
 					for (const auto& Cmd : Commands)
 						if (MatchesSearch(Cmd.Name, Cmd.Help)) { bSubVisible = true; break; }
-				if (!bSubVisible) continue;
+					if (!bSubVisible) continue;
+				}
 
 				FString SubId = Category + TEXT(".") + SubCat;
 				if (ImSlate::BeginFold(FStringView(SubId), FText::FromString(SubCat)))
@@ -613,11 +625,21 @@ void UImXConsolePanel::DrawCommandsTab()
 	CommandTree.GetKeys(Categories);
 	Categories.Sort();
 
-	for (int32 i = 0; i < Categories.Num(); ++i)
+	bool bNeedSpacing = false;
+	for (const FString& Cat : Categories)
 	{
-		DrawCommandCategory(Categories[i], CommandTree[Categories[i]]);
-		if (i < Categories.Num() - 1)
-			ImSlate::Spacing(2.f);
+		auto& SubCats = CommandTree[Cat];
+		if (!SearchFilter.IsEmpty())
+		{
+			bool bAny = false;
+			for (auto& Sub : SubCats)
+				for (const auto& Cmd : Sub.Value)
+					if (MatchesSearch(Cmd.Name, Cmd.Help)) { bAny = true; break; }
+			if (!bAny) continue;
+		}
+		if (bNeedSpacing) ImSlate::Spacing(2.f);
+		DrawCommandCategory(Cat, SubCats);
+		bNeedSpacing = true;
 	}
 }
 
@@ -637,6 +659,9 @@ void UImXConsolePanel::DrawVariableEntry(FImXConsoleVariableInfo& Info)
 	FString DisplayLabel = (SelfMeta && SelfMeta->HasMeta(TEXT("DisplayName")))
 		? SelfMeta->GetMeta(TEXT("DisplayName"))
 		: Info.LeafName;
+	FString VarTip = Info.Name;
+	if (!Info.Help.IsEmpty()) VarTip += TEXT("\n") + Info.Help;
+	ImSlate::SetNextItemTooltip(FText::FromString(VarTip));
 	ImSlate::TextButton("VarName", FText::FromString(DisplayLabel), ImVec2(0, XConsoleRowHeight));
 	ImSlate::SameLine();
 
@@ -714,7 +739,8 @@ void UImXConsolePanel::DrawVariableEntry(FImXConsoleVariableInfo& Info)
 
 void UImXConsolePanel::DrawVariableCategory(const FString& Category, TMap<FString, TArray<FImXConsoleVariableInfo>>& SubCats)
 {
-	if (!SearchFilter.IsEmpty())
+	const bool bSearching = !SearchFilter.IsEmpty();
+	if (bSearching)
 	{
 		bool bAnyVisible = false;
 		for (auto& SubPair : SubCats)
@@ -741,11 +767,13 @@ void UImXConsolePanel::DrawVariableCategory(const FString& Category, TMap<FStrin
 			}
 			else
 			{
-				bool bSubVisible = SearchFilter.IsEmpty();
-				if (!bSubVisible)
+				if (bSearching)
+				{
+					bool bSubVisible = false;
 					for (const auto& Var : Vars)
 						if (MatchesSearch(Var.Name, Var.Help)) { bSubVisible = true; break; }
-				if (!bSubVisible) continue;
+					if (!bSubVisible) continue;
+				}
 
 				FString SubId = Category + TEXT(".") + SubCat;
 				if (ImSlate::BeginFold(FStringView(SubId), FText::FromString(SubCat)))
@@ -767,11 +795,21 @@ void UImXConsolePanel::DrawVariablesTab()
 	VariableTree.GetKeys(Categories);
 	Categories.Sort();
 
-	for (int32 i = 0; i < Categories.Num(); ++i)
+	bool bNeedSpacing = false;
+	for (const FString& Cat : Categories)
 	{
-		DrawVariableCategory(Categories[i], VariableTree[Categories[i]]);
-		if (i < Categories.Num() - 1)
-			ImSlate::Spacing(2.f);
+		auto& SubCats = VariableTree[Cat];
+		if (!SearchFilter.IsEmpty())
+		{
+			bool bAny = false;
+			for (auto& Sub : SubCats)
+				for (const auto& Var : Sub.Value)
+					if (MatchesSearch(Var.Name, Var.Help)) { bAny = true; break; }
+			if (!bAny) continue;
+		}
+		if (bNeedSpacing) ImSlate::Spacing(2.f);
+		DrawVariableCategory(Cat, SubCats);
+		bNeedSpacing = true;
 	}
 }
 
@@ -791,6 +829,7 @@ void UImXConsolePanel::Tick(float Delta)
 	ImSlate::SetNextWindowPos(FVector2D(400, 300), ImSlateCond_Once, FVector2D(0.5f, 0.5f));
 	ImSlate::SetNextWindowSize(WindowSize, ImSlateCond_Once);
 	ImSlate::SetNextWindowBgAlpha(0.92f);
+	ImSlate::SetNextWindowBgColor(FLinearColor(0.06f, 0.06f, 0.06f, 1.f), ImSlateCond_Once);
 
 	ImSlate::Begin("XConsole Commands", &bOpen);
 

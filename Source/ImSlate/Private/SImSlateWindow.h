@@ -135,6 +135,8 @@ public:
 
 	void SetBgAlpha(float InAlpha);
 	float GetBgAlpha() const { return BackgroudAlpha; }
+	void SetBgColor(const FLinearColor& InColor);
+	FLinearColor GetBgColor() const { return ContentBackgroundBrush.TintColor.GetSpecifiedColor(); }
 	const TArray<TSharedRef<SImSlateWindow>>& GetChildWindows() const { return ChildWindows; }
 	TArray<TSharedRef<SImSlateWindow>>& GetChildWindows() { return ChildWindows; }
 
