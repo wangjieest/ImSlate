@@ -5,6 +5,9 @@
 #include "ImSlatePrivate.h"
 #include "SImViewportGame.h"
 #include "ImSlateTemplate/ImEditableText.h"
+#include "Engine/Engine.h"
+#include "Engine/GameViewportClient.h"
+#include "UnrealClient.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Text/TextLayout.h"
 #include "Widgets/Input/SEditableText.h"
@@ -324,22 +327,22 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 			.Visibility(EVisibility::Visible)
 		]
 
+		// Suggestions: SEPARATE overlay layer (not in the keyboard's vertical stack, so candidate
+		// count never changes the keyboard height / origin). VAlign_Bottom + bottom Offset = the
+		// preview+keys height pins the band DIRECTLY ABOVE the preview row. The band is only as
+		// tall as its content (AutoHeight via VAlign_Bottom), capped at 120; few candidates sit
+		// right above the preview, more candidates extend UPWARD from there. This keeps the
+		// candidates near the keys (visible) instead of starting from the top of the screen.
 		+ SOverlay::Slot()
+		.HAlign(HAlign_Fill)
+		.VAlign(VAlign_Bottom)
+		.Padding(TAttribute<FMargin>::CreateLambda([this]() -> FMargin {
+			const float UnitH = PreviewKeysRoot.IsValid() ? PreviewKeysRoot->GetCachedGeometry().GetLocalSize().Y : 0.f;
+			return FMargin(0.f, 0.f, 0.f, UnitH);
+		}))
 		[
-			SNew(SVerticalBox)
-
-			// Top spacer: absorbs remaining space
-			+ SVerticalBox::Slot()
-			.FillHeight(1.f)
-
-			// Suggestions: variable height but grows UPWARD. The whole vertical stack fills a
-			// fixed region (see ChildSlot VAlign_Fill below) with the top spacer (FillHeight)
-			// absorbing slack, so when this slot grows it eats the spacer above instead of
-			// pushing the preview row + keys (which stay pinned to the bottom). Stable key Y
-			// → popups anchored to keys keep a stable height. Capped + scrollable past the cap.
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			.MaxHeight(120.f)
+			SNew(SBox)
+			.MaxDesiredHeight(120.f)  // cap; beyond this the scroll box scrolls
 			[
 				SNew(SScrollBox)
 				.Orientation(Orient_Vertical)
@@ -349,70 +352,86 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 					.UseAllottedSize(true)
 				]
 			]
+		]
 
-			// Preview row: [ToggleType] [preview text] [Done] (fixed above keyboard)
+		// Preview row + keys: the keyboard proper. Bottom-anchored via a top spacer. Its height
+		// depends ONLY on preview + keys (suggestions are no longer here), so it is constant
+		// regardless of candidate count → stable origin.
+		+ SOverlay::Slot()
+		[
+			SNew(SVerticalBox)
+
+			// Top spacer: pushes preview+keys to the bottom of the (full-screen) overlay.
+			+ SVerticalBox::Slot()
+			.FillHeight(1.f)
+
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			[
-				SAssignNew(PreviewBorder, SBorder)
-				.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
-				.BorderBackgroundColor(FLinearColor(0.06f, 0.06f, 0.06f, 0.95f))
-				.Padding(FMargin(2.f, 2.f))
-				.Visibility(EVisibility::Visible)
+				SAssignNew(PreviewKeysRoot, SVerticalBox)
+
+				// Preview row: [ToggleType] [preview text] [Done]
+				+ SVerticalBox::Slot()
+				.AutoHeight()
 				[
-					SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.VAlign(VAlign_Center)
+					SAssignNew(PreviewBorder, SBorder)
+					.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
+					.BorderBackgroundColor(FLinearColor(0.06f, 0.06f, 0.06f, 0.95f))
+					.Padding(FMargin(2.f, 2.f))
+					.Visibility(EVisibility::Visible)
 					[
-						SNew(SBox)
-						.WidthOverride(54.f)
-						.HeightOverride(30.f)
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
 						[
-							ToggleTypeKey.ToSharedRef()
+							SNew(SBox)
+							.WidthOverride(54.f)
+							.HeightOverride(30.f)
+							[
+								ToggleTypeKey.ToSharedRef()
+							]
 						]
-					]
-					+ SHorizontalBox::Slot()
-					.FillWidth(1.f)
-					.VAlign(VAlign_Center)
-					.Padding(FMargin(6.f, 0.f))
-					[
-						SAssignNew(PreviewEdit, SImEditableText)
-						.Font(GetImSlateDefaultFont(11))
-						.ColorAndOpacity(FLinearColor::White)
-						.Justification(ETextJustify::Center)
-						.IsReadOnly(true)  // caret is self-drawn; native caret/edit disabled
-					]
-					+ SHorizontalBox::Slot()
-					.AutoWidth()
-					.VAlign(VAlign_Center)
-					[
-						SNew(SBox)
-						.WidthOverride(64.f)
-						.HeightOverride(30.f)
+						+ SHorizontalBox::Slot()
+						.FillWidth(1.f)
+						.VAlign(VAlign_Center)
+						.Padding(FMargin(6.f, 0.f))
 						[
-							DoneKey.ToSharedRef()
+							SAssignNew(PreviewEdit, SImEditableText)
+							.Font(GetImSlateDefaultFont(11))
+							.ColorAndOpacity(FLinearColor::White)
+							.Justification(ETextJustify::Center)
+							.IsReadOnly(true)  // caret is self-drawn; native caret/edit disabled
+						]
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SBox)
+							.WidthOverride(64.f)
+							.HeightOverride(30.f)
+							[
+								DoneKey.ToSharedRef()
+							]
 						]
 					]
 				]
-			]
 
-			// Keyboard: auto height, max 300 logical px (scaled by DPI), always at bottom.
-			// The cap is multiplied by the effective scale so it doesn't squash the keyboard
-			// on high-DPI screens (where a fixed 300px cap made it tiny vs the panels).
-			+ SVerticalBox::Slot()
-			.AutoHeight()
-			[
-				SNew(SBox)
-				.MaxDesiredHeight(GMaxKeyboardHeight * GetImSlateEffectiveScale())
+				// Keyboard: auto height, max 300 logical px (scaled by DPI).
+				+ SVerticalBox::Slot()
+				.AutoHeight()
 				[
-					SNew(SBorder)
-					.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
-					.BorderBackgroundColor(FLinearColor(0.08f, 0.08f, 0.08f, 0.95f))
-					.Padding(2.f)
-					.Visibility(EVisibility::Visible)
+					SNew(SBox)
+					.MaxDesiredHeight(GMaxKeyboardHeight * GetImSlateEffectiveScale())
 					[
-						SAssignNew(KeyboardGrid, SVerticalBox)
+						SNew(SBorder)
+						.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
+						.BorderBackgroundColor(FLinearColor(0.08f, 0.08f, 0.08f, 0.95f))
+						.Padding(2.f)
+						.Visibility(EVisibility::Visible)
+						[
+							SAssignNew(KeyboardGrid, SVerticalBox)
+						]
 					]
 				]
 			]
@@ -428,6 +447,21 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 	}
 
 	BuildKeyboard();
+}
+
+FVector2D SImSlateVirtualKeyboard::ComputeDesiredSize(float LayoutScaleMultiplier) const
+{
+	// Fill the whole viewport so this widget's origin is fixed (independent of content height).
+	// This keeps popups (anchored in this widget's local space) from drifting when the
+	// suggestion row count changes the content height during a Del step-drag.
+	if (GEngine && GEngine->GameViewport && GEngine->GameViewport->Viewport)
+	{
+		const FIntPoint VP = GEngine->GameViewport->Viewport->GetSizeXY();
+		if (VP.X > 0 && VP.Y > 0)
+			return FVector2D(VP.X, VP.Y);
+	}
+	// Fallback before the viewport is known: defer to content size.
+	return SCompoundWidget::ComputeDesiredSize(LayoutScaleMultiplier);
 }
 
 SImSlateVirtualKeyboard::EKeyboardLayoutMode SImSlateVirtualKeyboard::ComputeLayoutMode(float Width) const
@@ -1135,9 +1169,14 @@ void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, con
 		FString LeftLabel = bIsSpace ? TEXT("\x25C0 Cursor") : TEXT("\x25C0 Del");
 		FString RightLabel = bIsSpace ? TEXT("Cursor \x25B6") : TEXT("Undo \x25B6");
 
-		FVector2D KeyLocalPos = GetCachedGeometry().AbsoluteToLocal(KeyGeometry.GetAbsolutePosition());
+		// Position the popup in RootOverlay's OWN coordinate space (it is the popup's parent).
+		// Using this widget's geometry instead caused drift: RootOverlay's origin moves as the
+		// suggestion row count changes the layout, so converting via the popup's actual parent
+		// keeps the popup pinned to the key's absolute position regardless of that drift.
+		const FGeometry& OverlayGeo = RootOverlay->GetCachedGeometry();
+		FVector2D KeyLocalPos = OverlayGeo.AbsoluteToLocal(KeyGeometry.GetAbsolutePosition());
 		FVector2D KeyLocalSize = KeyGeometry.GetLocalSize();
-		FVector2D MySize = GetCachedGeometry().GetLocalSize();
+		FVector2D MySize = OverlayGeo.GetLocalSize();
 		// Width must fit the actual text (left + separator + right + paddings), not just scale
 		// off the key width — a narrow key (e.g. Del) was clipping "◀ Del | Undo ▶".
 		TSharedRef<FSlateFontMeasure> FM = FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
@@ -1148,10 +1187,6 @@ void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, con
 		PopupX = FMath::Clamp(PopupX, 0.f, FMath::Max(0.f, MySize.X - PopupWidth));
 		float PopupY = KeyLocalPos.Y - 32.f;
 		PopupY = FMath::Max(0.f, PopupY);
-
-		UE_LOG(LogTemp, Warning, TEXT("[PopupDbg] StepDrag KeyLocalPos.Y=%.1f PopupY=%.1f keyAbsY=%.1f kbSize=(%.0f,%.0f) sugBarH=%.1f"),
-			KeyLocalPos.Y, PopupY, KeyGeometry.GetAbsolutePosition().Y, MySize.X, MySize.Y,
-			SuggestionBar.IsValid() ? SuggestionBar->GetCachedGeometry().GetLocalSize().Y : -1.f);
 
 		StepDragVisual = SNew(SBox)
 			.WidthOverride(PopupWidth)

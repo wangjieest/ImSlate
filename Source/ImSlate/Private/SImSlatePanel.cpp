@@ -7,6 +7,8 @@
 #include "SImSlateWindow.h"
 #include "Types/SlateEnums.h"
 #include "XConsoleManager.h"
+#include "GenericPlatform/GenericPlatformApplicationMisc.h"
+#include "HAL/PlatformApplicationMisc.h"
 
 float GImSlateLayoutScale = (PLATFORM_ANDROID || PLATFORM_IOS) ? 2.f : 1.f;
 static FAutoConsoleVariableRef CVar_ImSlateLayoutScale(
@@ -15,13 +17,46 @@ static FAutoConsoleVariableRef CVar_ImSlateLayoutScale(
 	TEXT("Content layout scale for ImSlate panels. 1.0 = default. >1.0 = larger widgets/text."));
 XMetaVar(TEXT("imslate.LayoutScale"), DisplayName, TEXT("UI Scale"))(ClampMin, 0.5)(ClampMax, 4.0)(UIMin, 0.5)(UIMax, 4.0);
 
+// Reference physical density (PPI). On desktop, scale=1 looks right and desktops sit around
+// ~96 PPI (UE's logical-inch baseline), so we treat ~96 PPI as "scale 1.0 physical size".
+// On mobile we scale by realPPI/ReferencePPI so a UI element keeps the SAME physical size
+// across devices (reverse-derived from the desktop baseline, per design decision).
+static float GImSlateReferencePPI = 96.f;
+static FAutoConsoleVariableRef CVar_ImSlateReferencePPI(
+	TEXT("imslate.ReferencePPI"),
+	GImSlateReferencePPI,
+	TEXT("Reference PPI that maps to scale 1.0 for physical-size-consistent mobile UI."));
+
+// Extra multiplier on top of the physical scale, for fine-tuning hand feel on mobile.
+float GImSlateMobileScaleTweak = 1.f;
+static FAutoConsoleVariableRef CVar_ImSlateMobileScaleTweak(
+	TEXT("imslate.MobileScaleTweak"),
+	GImSlateMobileScaleTweak,
+	TEXT("Extra multiplier on the physical-based mobile UI scale (1.0 = pure physical match)."));
+
 namespace ImSlate
 {
 
 float GetImSlateEffectiveScale()
 {
+#if PLATFORM_IOS || PLATFORM_ANDROID
+	// Physical-size based: use the engine's real screen density (iOS uses nativeScale / a device
+	// table; Android uses xdpi → density bucket internally) so UI keeps a consistent physical
+	// size across devices. Fall back to the old SystemDPI*LayoutScale when density is Unknown.
+	int32 ScreenDensity = 0;
+	const EScreenPhysicalAccuracy Accuracy = FPlatformApplicationMisc::GetPhysicalScreenDensity(ScreenDensity);
+	if (Accuracy != EScreenPhysicalAccuracy::Unknown && ScreenDensity > 0 && GImSlateReferencePPI > 0.f)
+	{
+		const float PhysicalScale = ((float)ScreenDensity / GImSlateReferencePPI) * GImSlateMobileScaleTweak;
+		return FMath::Max(PhysicalScale, 1.f);
+	}
+	// Fallback (density unknown): the previous heuristic, which is "good enough" per design.
 	float SystemDPI = SImSlateViewport::StaticGetDPIScaleFactorAtPoint(FVector2D::ZeroVector);
 	return FMath::Max(SystemDPI * GImSlateLayoutScale, 1.f);
+#else
+	float SystemDPI = SImSlateViewport::StaticGetDPIScaleFactorAtPoint(FVector2D::ZeroVector);
+	return FMath::Max(SystemDPI * GImSlateLayoutScale, 1.f);
+#endif
 }
 extern void PrepassInternal(const TSharedRef<SWidget>& InWidget, float LayoutScaleMultiplier);
 

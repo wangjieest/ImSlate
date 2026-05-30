@@ -5,6 +5,10 @@
 
 #include "ImVirtualKeyboard.generated.h"
 
+// Global forward declaration so `class SConstraintCanvas` inside the ImSlate namespace below
+// refers to the engine's ::SConstraintCanvas, not a new (incomplete) ImSlate::SConstraintCanvas.
+class SConstraintCanvas;
+
 namespace ImSlate
 {
 
@@ -86,6 +90,11 @@ public:
 
 	void Construct(const FArguments& InArgs);
 	virtual void Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime) override;
+	// Force the keyboard widget to fill the whole viewport so its top-left origin is fixed.
+	// Confirmed by logs: without this the widget sized to its content (keys+suggestions), so
+	// its kbAbsPos.Y drifted as the suggestion row count changed (338->412->450 high, top
+	// moving 728->582->504), which dragged the popups (anchored in this widget's space) along.
+	virtual FVector2D ComputeDesiredSize(float LayoutScaleMultiplier) const override;
 	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override;
 
 	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
@@ -148,7 +157,9 @@ private:
 	float PreviewDragAccum = 0.f;
 	TSharedPtr<class SWrapBox> SuggestionBar;
 	TSharedPtr<class SVerticalBox> KeyboardGrid;
-	TSharedPtr<class SOverlay> RootOverlay;
+	TSharedPtr<class SVerticalBox> PreviewKeysRoot;  // preview + keys unit (suggestions float above it)
+	TSharedPtr<SConstraintCanvas> KeyboardCanvas;  // main anchor-based layout (engine global type)
+	TSharedPtr<class SOverlay> RootOverlay;  // top-most layer for transient popups
 	TSharedPtr<class SImSlateKeyPopup> ActivePopup;
 	TSharedPtr<class SWidget> SwipeVisual;
 	TSharedPtr<class SWidget> StepDragVisual;

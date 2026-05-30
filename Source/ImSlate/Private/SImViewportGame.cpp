@@ -211,10 +211,15 @@ void SImViewportGame::EnsureKeyboardInViewport()
 	{
 		auto LevelViewport = LevelEditor->GetActiveViewportInterface();
 		TSharedPtr<SOverlay>& ViewportOverlay = GS_ACCESS_PROTECT(LevelViewport.Get(), SLevelViewport, ViewportOverlay)->ViewportOverlay;
+		// VAlign_Fill (not Bottom) so the keyboard widget fills the whole viewport and its
+		// origin is fixed. VAlign_Bottom made the widget only as tall as its content, so its
+		// top drifted when the suggestion row count changed — dragging the popups along. The
+		// keyboard pins its visible content to the bottom internally via a top FillHeight spacer.
+		// This matches the game path (AddViewportWidgetContent → default VAlign_Fill).
 		ViewportOverlay
 		->AddSlot(2000)
 		.HAlign(HAlign_Fill)
-		.VAlign(VAlign_Bottom)
+		.VAlign(VAlign_Fill)
 		[
 			VirtualKeyboard.ToSharedRef()
 		];
