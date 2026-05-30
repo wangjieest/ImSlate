@@ -309,6 +309,15 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 	DoneKeyDef = MakeShared<FVirtualKeyDef>();
 	DoneKeyDef->Action = EVirtualKeyAction::Enter;
 	DoneKeyDef->Label = TEXT("Done");
+	// Up swipe = clear all text (keyboard stays open).
+	DoneKeyDef->Swipe.Up.Label = TEXT("Clr");
+	DoneKeyDef->Swipe.Up.Callback.BindLambda([this]() {
+		CurrentText.Reset();
+		CursorPosition = 0;
+		UpdatePreview();
+		UpdateSuggestions();
+	});
+	// Down swipe = Esc: cancel, restoring the text to what it was when the keyboard opened.
 	DoneKeyDef->Swipe.Down.Label = TEXT("Esc");
 	DoneKeyDef->Swipe.Down.Callback.BindLambda([this]() { Hide(false); });
 	DoneKey = MakeBoundKey(DoneKeyDef.Get());
@@ -657,7 +666,7 @@ TSharedRef<SImSlateKey> SImSlateVirtualKeyboard::MakeBoundKey(const FVirtualKeyD
 		.OnLongPress_Lambda([this](const FVirtualKeyDef& Def, const FGeometry& Geo) { OnKeyLongPress(Def, Geo); })
 		.OnLongPressMove_Lambda([this](int32 Idx) { OnKeyLongPressMove(Idx); })
 		.OnLongPressEnd_Lambda([this](int32 Idx) { OnKeyLongPressEnd(Idx); })
-		.OnPressVisual_Lambda([this](const FVirtualKeyDef& Def, const FGeometry& Geo) { OnKeyPressVisual(Def, Geo); })
+		.OnPressVisual_Lambda([this](const FVirtualKeyDef& Def, const FGeometry& Geo, bool bForceStepDrag) { OnKeyPressVisual(Def, Geo, bForceStepDrag); })
 		.OnMoveVisual_Lambda([this](const FVector2D& Delta, bool bSwipeReady) { OnKeyMoveVisual(Delta, bSwipeReady); })
 		.OnReleaseVisual_Lambda([this]() { OnKeyReleaseVisual(); })
 		.OnSpaceCursorZone_Lambda([this](int32 Dir) { OnSpaceCursorZone(Dir); });
@@ -715,6 +724,7 @@ void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
 	OnTextChanged = Params.OnTextChanged;
 	SuggestionProvider = Params.SuggestionProvider;
 	BoundOwner = Params.Owner;  // rebind to the new editable widget's lifecycle
+	bSuggestionCommitsAndCloses = Params.bSuggestionCommitsAndCloses;
 
 	// Modal background: block taps from reaching the game when requested.
 	if (BackgroundBlocker.IsValid())
@@ -1152,12 +1162,16 @@ void SImSlateVirtualKeyboard::OnKeyLongPressEnd(int32 SelectedIndex)
 	DismissPopup();
 }
 
-void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, const FGeometry& KeyGeometry)
+void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, const FGeometry& KeyGeometry, bool bForceStepDrag)
 {
 	if (!RootOverlay.IsValid()) return;
 	OnKeyReleaseVisual();
 
-	bool bIsStepDrag = (KeyDef.Action == EVirtualKeyAction::Space || KeyDef.Action == EVirtualKeyAction::Backspace);
+	// Step-drag hint when: Space/Del (always), OR the caller forced it (Done's horizontal drag).
+	// Done's VERTICAL swipe passes bForceStepDrag=false → falls through to the four-way popup.
+	bool bIsStepDrag = bForceStepDrag
+		|| KeyDef.Action == EVirtualKeyAction::Space
+		|| KeyDef.Action == EVirtualKeyAction::Backspace;
 
 	if (bIsStepDrag)
 	{
@@ -1445,7 +1459,16 @@ void SImSlateVirtualKeyboard::OnSuggestionClicked(const FString& Value)
 {
 	CurrentText = Value;
 	CursorPosition = CurrentText.Len();
-	Hide(true);
+	if (bSuggestionCommitsAndCloses)
+	{
+		Hide(true);  // replace + commit + close
+	}
+	else
+	{
+		// Replace only; keep the keyboard open for further editing.
+		UpdatePreview();
+		UpdateSuggestions();
+	}
 }
 
 }  // namespace ImSlate

@@ -168,8 +168,10 @@ FReply SImEditableText::OnFocusReceived(const FGeometry& MyGeometry, const FFocu
 			Params.CommitCallback = [WeakSelf](const FString& Text, ETextCommit::Type Type) {
 				if (auto This = WeakSelf.Pin())
 				{
-					if (Type != ETextCommit::OnCleared)
-						This->SetText(FText::FromString(Text));
+					// Always apply Text: on OnEnter it's the edited text; on OnCleared (Esc) it's
+					// the original text captured at open time, so this RESTORES the field (the live
+					// OnTextChanged sync had been updating it during editing).
+					This->SetText(FText::FromString(Text));
 					if (This->VKCommitCallback)
 						This->VKCommitCallback(Text, Type);
 				}

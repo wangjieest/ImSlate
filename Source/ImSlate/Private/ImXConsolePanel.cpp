@@ -528,7 +528,8 @@ void UImXConsolePanel::DrawSearchBar()
 	}
 
 	ImSlate::SetNextItemFillWidth(0.7f);
-	ImSlate::SearchBox("##XConsoleSearch", SearchFilter, &SearchNames, nullptr, ImVec2(0, XConsoleRowHeight), true);
+	// No manual keyboard button: focusing the edit auto-shows the virtual keyboard now.
+	ImSlate::SearchBox("##XConsoleSearch", SearchFilter, &SearchNames, nullptr, ImVec2(0, XConsoleRowHeight), false);
 
 	ImSlate::SameLine();
 	if (ImSlate::Button("Refresh", ImVec2(80.f, XConsoleRowHeight)))

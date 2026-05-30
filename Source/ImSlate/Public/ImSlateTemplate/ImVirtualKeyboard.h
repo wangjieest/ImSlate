@@ -80,6 +80,9 @@ struct FVirtualKeyboardShowParams
 	FImSlateSuggestionProvider SuggestionProvider;
 	TWeakPtr<class SWidget> Owner;  // bound editable widget; keyboard follows its lifecycle
 	bool bBlockBackground = true;   // true: full-screen modal, taps don't pass through to game
+	// true: clicking a suggestion replaces the text AND commits+closes the keyboard (Done).
+	// false: clicking a suggestion only replaces the text; the keyboard stays open for more edits.
+	bool bSuggestionCommitsAndCloses = true;
 };
 
 class IMSLATE_API SImSlateVirtualKeyboard : public SCompoundWidget
@@ -124,6 +127,7 @@ private:
 	enum class EShiftState : uint8 { Default, SingleShot, Locked };
 
 	bool bVisible = false;
+	bool bSuggestionCommitsAndCloses = true;  // see FVirtualKeyboardShowParams
 	TWeakPtr<class SWidget> BoundOwner;
 	EShiftState ShiftState = EShiftState::Default;
 	int32 CurrentLayer = 0;
@@ -195,7 +199,7 @@ private:
 	void OnKeyLongPress(const FVirtualKeyDef& KeyDef, const FGeometry& KeyGeometry);
 	void OnKeyLongPressMove(int32 HighlightIndex);
 	void OnKeyLongPressEnd(int32 SelectedIndex);
-	void OnKeyPressVisual(const FVirtualKeyDef& KeyDef, const FGeometry& KeyGeometry);
+	void OnKeyPressVisual(const FVirtualKeyDef& KeyDef, const FGeometry& KeyGeometry, bool bForceStepDrag);
 	void OnKeyMoveVisual(const FVector2D& Delta, bool bSwipeReady);
 	void OnKeyReleaseVisual();
 	void OnSpaceCursorZone(int32 Direction);

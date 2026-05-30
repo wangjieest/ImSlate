@@ -14,7 +14,7 @@ DECLARE_DELEGATE_OneParam(FOnVirtualKeyAction, EVirtualKeyAction /*Action*/);
 DECLARE_DELEGATE_TwoParams(FOnVirtualKeyLongPress, const FVirtualKeyDef& /*KeyDef*/, const FGeometry& /*KeyGeometry*/);
 DECLARE_DELEGATE_OneParam(FOnVirtualKeyLongPressMove, int32 /*HighlightIndex*/);
 DECLARE_DELEGATE_OneParam(FOnVirtualKeyLongPressEnd, int32 /*SelectedIndex*/);
-DECLARE_DELEGATE_TwoParams(FOnVirtualKeyPressVisual, const FVirtualKeyDef& /*KeyDef*/, const FGeometry& /*KeyGeometry*/);
+DECLARE_DELEGATE_ThreeParams(FOnVirtualKeyPressVisual, const FVirtualKeyDef& /*KeyDef*/, const FGeometry& /*KeyGeometry*/, bool /*bForceStepDrag*/);
 DECLARE_DELEGATE_TwoParams(FOnVirtualKeyMoveVisual, const FVector2D& /*Delta from press*/, bool /*bSwipeReady*/);
 DECLARE_DELEGATE(FOnVirtualKeyReleaseVisual);
 

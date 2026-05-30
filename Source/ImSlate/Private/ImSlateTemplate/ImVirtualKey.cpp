@@ -385,13 +385,20 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 	FVector2D Delta = ScreenPos - PressStartPos;
 	float SwipeThreshold = 8.f * GetImSlateEffectiveScale();
 	bool bIsSpaceOrDel = (KeyDef->Action == EVirtualKeyAction::Space || KeyDef->Action == EVirtualKeyAction::Backspace);
+	// Done (Enter): horizontal drag = delete/undo step-drag (like Del); vertical = four-way swipe
+	// (up=clear / down=Esc). Decide by which axis dominates. Done's horizontal step-drag shows
+	// NO floating hint (only the function runs); the four-way popup still shows for vertical.
+	const bool bIsDone = (KeyDef->Action == EVirtualKeyAction::Enter);
+	const bool bHorizontal = FMath::Abs(Delta.X) > FMath::Abs(Delta.Y);
+	const bool bDoneHorizStepDrag = bIsDone && bHorizontal;
 
-	// Space/Del: immediate step-drag when finger crosses threshold
-	if (!bLongPressHandled && bIsSpaceOrDel && Delta.Size() >= SwipeThreshold)
+	// Space/Del (any direction) or Done dragged horizontally: step-drag past threshold.
+	if (!bLongPressHandled && !bSwipeVisualShown && (bIsSpaceOrDel || bDoneHorizStepDrag) && Delta.Size() >= SwipeThreshold)
 	{
 		bLongPressHandled = true;
 		LongPressAnchorPos = PressStartPos;
-		OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry);
+		if (!bIsDone)  // Done's horizontal step-drag shows no floating hint; Del/Space do.
+			OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry, /*bForceStepDrag*/ true);
 	}
 
 	// Long-press check (finger near start, for keys with LongPressChars).
@@ -412,7 +419,7 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 		if (Delta.Size() >= SwipeThreshold)
 		{
 			bSwipeVisualShown = true;
-			OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry);
+			OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry, /*bForceStepDrag*/ false);  // four-way popup
 		}
 	}
 
@@ -431,6 +438,12 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 		else if (KeyDef->Action == EVirtualKeyAction::Backspace)
 		{
 			OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);
+			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Backspace);     LongPressAnchorPos.X -= StepW; XOffset += StepW; }
+			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::UndoBackspace); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
+		}
+		else if (KeyDef->Action == EVirtualKeyAction::Enter)  // Done horizontal drag: same as Del
+		{
+			OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);  // highlight ◀ Del / Undo ▶
 			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Backspace);     LongPressAnchorPos.X -= StepW; XOffset += StepW; }
 			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::UndoBackspace); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
 		}
