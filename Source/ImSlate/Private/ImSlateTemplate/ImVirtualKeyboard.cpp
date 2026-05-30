@@ -4,7 +4,9 @@
 
 #include "ImSlatePrivate.h"
 #include "SImViewportGame.h"
+#include "ImSlateTemplate/ImEditableText.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Framework/Text/TextLayout.h"
 #include "Widgets/Input/SEditableText.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SWrapBox.h"
@@ -86,35 +88,21 @@ static FVirtualKeyDef MakeActionKey(EVirtualKeyAction Action, const FString& Lab
 	return Def;
 }
 
-TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetNumberRow()
-{
-	const TCHAR* Syms[] = {TEXT("!"),TEXT("@"),TEXT("#"),TEXT("$"),TEXT("%"),TEXT("^"),TEXT("&"),TEXT("*"),TEXT("("),TEXT(")")};
-	TArray<TArray<FVirtualKeyDef>> Rows;
-	TArray<FVirtualKeyDef> Row;
-	for (int32 i = 0; i < 9; ++i)
-		Row.Add(MakeCharKey(FString::FromInt(i + 1), FString::FromInt(i + 1), Syms[i]));
-	Row.Add(MakeCharKey(TEXT("0"), TEXT("0"), Syms[9]));
-	Rows.Add(MoveTemp(Row));
-	return Rows;
-}
-
 TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetQWERTYLayout()
 {
-	const TCHAR* SwipeDigits[] = {TEXT("1"),TEXT("2"),TEXT("3"),TEXT("4"),TEXT("5"),TEXT("6"),TEXT("7"),TEXT("8"),TEXT("9"),TEXT("0")};
 	const TCHAR* Row1Chars[] = {TEXT("q"),TEXT("w"),TEXT("e"),TEXT("r"),TEXT("t"),TEXT("y"),TEXT("u"),TEXT("i"),TEXT("o"),TEXT("p")};
+	const TCHAR* SwipeDigits[] = {TEXT("1"),TEXT("2"),TEXT("3"),TEXT("4"),TEXT("5"),TEXT("6"),TEXT("7"),TEXT("8"),TEXT("9"),TEXT("0")};
 
 	TArray<TArray<FVirtualKeyDef>> Rows;
 
-	// Row 1: qwertyuiop with swipe-up digits
+	// Row 1: qwertyuiop with swipe-up digits (no separate number row).
 	{
 		TArray<FVirtualKeyDef> Row;
 		for (int32 i = 0; i < 10; ++i)
 		{
 			FString Lower = Row1Chars[i];
-			FString Upper = Lower.ToUpper();
-			Row.Add(MakeCharKey(Lower, Upper, SwipeDigits[i]));
+			Row.Add(MakeCharKey(Lower, Lower.ToUpper(), SwipeDigits[i]));
 		}
-
 		Rows.Add(MoveTemp(Row));
 	}
 
@@ -152,20 +140,16 @@ TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetQWERTYLayout()
 
 TArray<FVirtualKeyDef> SImSlateVirtualKeyboard::GetBottomRow()
 {
+	// ToggleType + Done moved to the preview row.
 	TArray<FVirtualKeyDef> Row;
-	Row.Add(MakeActionKey(EVirtualKeyAction::ToggleType, TEXT("T9"), 1.2f));
 
+	// Full-screen row spans 10 columns; keep the same . : space = 1 : 2 ratio.
 	auto DotKey = MakeCharKey(TEXT("."), TEXT("."), TEXT(","));
 	DotKey.LongPressChars = {TEXT(";"),TEXT("-"),TEXT("\""),TEXT("+"),TEXT("="),TEXT("\\"),TEXT("["),TEXT("]"),TEXT("<"),TEXT(">")};
+	DotKey.WidthMultiplier = 3.34f;
 	Row.Add(MoveTemp(DotKey));
 
-	Row.Add(MakeActionKey(EVirtualKeyAction::Space, TEXT("\x25C0  space  \x25B6"), 4.5f));
-	{
-		auto DoneKey = MakeActionKey(EVirtualKeyAction::Enter, TEXT("Done"), 1.5f);
-		DoneKey.Swipe.Up.Label = TEXT("Esc");
-		DoneKey.Swipe.Up.Callback.BindLambda([this]() { Hide(false); });
-		Row.Add(MoveTemp(DoneKey));
-	}
+	Row.Add(MakeActionKey(EVirtualKeyAction::Space, TEXT("\x25C0  space  \x25B6"), 6.66f));
 	return Row;
 }
 
@@ -255,16 +239,11 @@ TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetT9Layout()
 
 TArray<FVirtualKeyDef> SImSlateVirtualKeyboard::GetT9BottomRow()
 {
+	// ToggleType + Done moved to the preview row.
 	TArray<FVirtualKeyDef> Row;
-	Row.Add(MakeActionKey(EVirtualKeyAction::ToggleType, TEXT("T26"), 2.f));
 	Row.Add(MakeCharKey(TEXT("0"), TEXT("0")));
-	Row.Add(MakeActionKey(EVirtualKeyAction::Space, TEXT("\x25C0 space \x25B6"), 3.f));
-	{
-		auto DoneKey = MakeActionKey(EVirtualKeyAction::Enter, TEXT("Done"), 2.f);
-		DoneKey.Swipe.Up.Label = TEXT("Esc");
-		DoneKey.Swipe.Up.Callback.BindLambda([this]() { Hide(false); });
-		Row.Add(MoveTemp(DoneKey));
-	}
+	Row[0].WidthMultiplier = 2.f;
+	Row.Add(MakeActionKey(EVirtualKeyAction::Space, TEXT("\x25C0 space \x25B6"), 4.f));
 	return Row;
 }
 
@@ -313,9 +292,32 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 
 	float Scale = GetImSlateEffectiveScale();
 
+	// Preview-row keys: persistent KeyDefs (not rebuilt by BuildKeyboard).
+	ToggleTypeKeyDef = MakeShared<FVirtualKeyDef>();
+	ToggleTypeKeyDef->Action = EVirtualKeyAction::ToggleType;
+	ToggleTypeKeyDef->Label = TEXT("T9");
+	ToggleTypeKey = MakeBoundKey(ToggleTypeKeyDef.Get());
+
+	DoneKeyDef = MakeShared<FVirtualKeyDef>();
+	DoneKeyDef->Action = EVirtualKeyAction::Enter;
+	DoneKeyDef->Label = TEXT("Done");
+	DoneKeyDef->Swipe.Down.Label = TEXT("Esc");
+	DoneKeyDef->Swipe.Down.Callback.BindLambda([this]() { Hide(false); });
+	DoneKey = MakeBoundKey(DoneKeyDef.Get());
+
 	ChildSlot
 	[
 		SAssignNew(RootOverlay, SOverlay)
+
+		// Full-screen modal hit-blocker (bottom layer). Visibility toggled in Show()
+		// per FVirtualKeyboardShowParams::bBlockBackground.
+		+ SOverlay::Slot()
+		[
+			SAssignNew(BackgroundBlocker, SBorder)
+			.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
+			.BorderBackgroundColor(FLinearColor(0.f, 0.f, 0.f, 0.f))  // transparent but hit-testable
+			.Visibility(EVisibility::Visible)
+		]
 
 		+ SOverlay::Slot()
 		[
@@ -339,20 +341,50 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 				]
 			]
 
-			// Preview text (fixed position above keyboard)
+			// Preview row: [ToggleType] [preview text] [Done] (fixed above keyboard)
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			[
 				SAssignNew(PreviewBorder, SBorder)
 				.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
 				.BorderBackgroundColor(FLinearColor(0.06f, 0.06f, 0.06f, 0.95f))
-				.Padding(FMargin(6.f, 3.f))
+				.Padding(FMargin(2.f, 2.f))
 				.Visibility(EVisibility::Visible)
 				[
-					SAssignNew(PreviewText, STextBlock)
-					.Font(GetImSlateDefaultFont(11))
-					.ColorAndOpacity(FLinearColor::White)
-					.Justification(ETextJustify::Center)
+					SNew(SHorizontalBox)
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					[
+						SNew(SBox)
+						.WidthOverride(54.f)
+						.HeightOverride(30.f)
+						[
+							ToggleTypeKey.ToSharedRef()
+						]
+					]
+					+ SHorizontalBox::Slot()
+					.FillWidth(1.f)
+					.VAlign(VAlign_Center)
+					.Padding(FMargin(6.f, 0.f))
+					[
+						SAssignNew(PreviewEdit, SImEditableText)
+						.Font(GetImSlateDefaultFont(11))
+						.ColorAndOpacity(FLinearColor::White)
+						.Justification(ETextJustify::Center)
+						.IsReadOnly(true)  // caret is self-drawn; native caret/edit disabled
+					]
+					+ SHorizontalBox::Slot()
+					.AutoWidth()
+					.VAlign(VAlign_Center)
+					[
+						SNew(SBox)
+						.WidthOverride(64.f)
+						.HeightOverride(30.f)
+						[
+							DoneKey.ToSharedRef()
+						]
+					]
 				]
 			]
 
@@ -376,6 +408,9 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 		]
 	];
 
+	if (PreviewEdit.IsValid())
+		PreviewEdit->SetPreviewDisplayMode(true);
+
 	BuildKeyboard();
 }
 
@@ -383,20 +418,40 @@ static constexpr float GMaxKeyboardHeight = 300.f;
 static constexpr float GMaxKeyHeight = 48.f;
 static constexpr float GMinKeyWidth = 32.f;
 
-SImSlateVirtualKeyboard::EKeyboardLayoutMode SImSlateVirtualKeyboard::GetLayoutMode() const
+SImSlateVirtualKeyboard::EKeyboardLayoutMode SImSlateVirtualKeyboard::ComputeLayoutMode(float Width) const
 {
-	if (bLayoutModeInitialized)
-		return CachedLayoutMode;
+	// Pure function of width: same screen → same mode, independent of toggle history.
+	if (Width <= 0.f)
+		return EKeyboardLayoutMode::FullScreen;  // unknown yet — start collapsed
 
-	FVector2D Size = GetCachedGeometry().GetLocalSize();
-	if (Size.X <= 0.f) return EKeyboardLayoutMode::FullScreen;
+	float Scale = GetImSlateEffectiveScale();
+	float KeyH = FMath::Min(32.f * Scale, GMaxKeyHeight);
+	float ComfortKeyW = KeyH * 1.3f;
+	float SideWidth = 5.f * ComfortKeyW + 5.f * 4.f * Scale;
+	float MinGap = 60.f * Scale;
+	bool bCanSplit = (SideWidth * 2.f + MinGap) <= Width;
 
-	float SideWidth = Size.X * 0.33f;
-	float MinKeysPerSide = 5.f;
-	auto& MutableThis = const_cast<SImSlateVirtualKeyboard&>(*this);
-	MutableThis.CachedLayoutMode = (SideWidth >= MinKeysPerSide * GMinKeyWidth) ? EKeyboardLayoutMode::Split : EKeyboardLayoutMode::FullScreen;
-	MutableThis.bLayoutModeInitialized = true;
-	return CachedLayoutMode;
+	return bCanSplit ? EKeyboardLayoutMode::Split : EKeyboardLayoutMode::FullScreen;
+}
+
+void SImSlateVirtualKeyboard::Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime)
+{
+	SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
+
+	if (!bVisible) return;
+
+	// AllottedGeometry here is authoritative (unlike GetCachedGeometry timing during
+	// Construct/Show). Rebuild only when the resulting layout mode actually changes.
+	float Width = AllottedGeometry.GetLocalSize().X;
+	if (Width <= 0.f) return;
+
+	EKeyboardLayoutMode DesiredMode = ComputeLayoutMode(Width);
+	if (DesiredMode != BuiltLayoutMode || BuiltWidth < 0.f)
+	{
+		BuiltLayoutMode = DesiredMode;
+		BuiltWidth = Width;
+		BuildKeyboard();
+	}
 }
 
 void SImSlateVirtualKeyboard::BuildKeyboard()
@@ -436,9 +491,6 @@ void SImSlateVirtualKeyboard::BuildFullScreenLayout()
 	}
 	else
 	{
-		for (const auto& Row : GetNumberRow())
-			AddRow(Row);
-
 		if (CurrentLayer == 0)
 		{
 			for (const auto& Row : GetQWERTYLayout())
@@ -470,7 +522,6 @@ void SImSlateVirtualKeyboard::BuildSplitLayout()
 
 	auto BuildQWERTYHalf = [&](TSharedRef<SVerticalBox> Half, bool bRight) {
 		auto AllRows = (CurrentLayer == 0) ? GetQWERTYLayout() : GetSymbolLayout();
-		auto NumberRows = GetNumberRow();
 
 		auto SplitRows = [&](const TArray<TArray<FVirtualKeyDef>>& Src) {
 			TArray<TArray<FVirtualKeyDef>> Result;
@@ -486,15 +537,15 @@ void SImSlateVirtualKeyboard::BuildSplitLayout()
 			return Result;
 		};
 
-		AddRowsToBox(Half, SplitRows(NumberRows));
 		AddRowsToBox(Half, SplitRows(AllRows));
 
-		auto BottomRow = GetBottomRow();
-		int32 BottomMid = BottomRow.Num() / 2;
+		// Each half gets its own [. | space] so both sides have matching proportions.
 		TArray<FVirtualKeyDef> HalfBottom;
-		int32 Start = bRight ? BottomMid : 0;
-		int32 End = bRight ? BottomRow.Num() : BottomMid;
-		for (int32 i = Start; i < End; ++i) HalfBottom.Add(BottomRow[i]);
+		auto DotKey = MakeCharKey(TEXT("."), TEXT("."), TEXT(","));
+		DotKey.LongPressChars = {TEXT(";"),TEXT("-"),TEXT("\""),TEXT("+"),TEXT("="),TEXT("\\"),TEXT("["),TEXT("]"),TEXT("<"),TEXT(">")};
+		DotKey.WidthMultiplier = 2.f;
+		HalfBottom.Add(MoveTemp(DotKey));
+		HalfBottom.Add(MakeActionKey(EVirtualKeyAction::Space, TEXT("\x25C0 space \x25B6"), 4.f));
 		TArray<TArray<FVirtualKeyDef>> BottomRows = {MoveTemp(HalfBottom)};
 		AddRowsToBox(Half, BottomRows);
 	};
@@ -517,28 +568,54 @@ void SImSlateVirtualKeyboard::BuildSplitLayout()
 		BuildQWERTYHalf(RightHalf, true);
 	}
 
+	// Both T9 and T26 use the SAME side width — a thumb's reach is a physical span,
+	// not a column count. Each half fills this fixed width regardless of key count.
+	float SplitScale = GetImSlateEffectiveScale();
+	float SplitKeyH = FMath::Min(32.f * SplitScale, GMaxKeyHeight);
+	float ComfortKeyW = SplitKeyH * 1.3f;
+	float SideWidth = 5.f * ComfortKeyW + 5.f * 4.f * SplitScale;
+
 	KeyboardGrid->AddSlot()
 	.FillHeight(1.f)
 	[
 		SNew(SHorizontalBox)
 		+ SHorizontalBox::Slot()
-		.FillWidth(0.33f)
-		.HAlign(HAlign_Left)
+		.AutoWidth()
 		.VAlign(VAlign_Bottom)
 		[
-			LeftHalf
+			SNew(SBox)
+			.WidthOverride(SideWidth)
+			[ LeftHalf ]
 		]
 		+ SHorizontalBox::Slot()
-		.FillWidth(0.34f)
-		// Middle: transparent, game visible
+		.FillWidth(1.f)
 		+ SHorizontalBox::Slot()
-		.FillWidth(0.33f)
-		.HAlign(HAlign_Right)
+		.AutoWidth()
 		.VAlign(VAlign_Bottom)
 		[
-			RightHalf
+			SNew(SBox)
+			.WidthOverride(SideWidth)
+			[ RightHalf ]
 		]
 	];
+}
+
+TSharedRef<SImSlateKey> SImSlateVirtualKeyboard::MakeBoundKey(const FVirtualKeyDef* DefPtr)
+{
+	TSharedRef<SImSlateKey> KeyWidget = SNew(SImSlateKey)
+		.KeyDef(DefPtr)
+		.bShiftActive_Lambda([this]() { return IsUpperCase(); })
+		.bShiftSingleShot_Lambda([this]() { return ShiftState == EShiftState::SingleShot; })
+		.OnKeyInput_Lambda([this](const FVirtualKeyDef& Def, const FString& Val) { DismissPopup(); OnKeyInput(Def, Val); })
+		.OnKeyAction_Lambda([this](EVirtualKeyAction Action) { DismissPopup(); OnKeyAction(Action); })
+		.OnLongPress_Lambda([this](const FVirtualKeyDef& Def, const FGeometry& Geo) { OnKeyLongPress(Def, Geo); })
+		.OnLongPressMove_Lambda([this](int32 Idx) { OnKeyLongPressMove(Idx); })
+		.OnLongPressEnd_Lambda([this](int32 Idx) { OnKeyLongPressEnd(Idx); })
+		.OnPressVisual_Lambda([this](const FVirtualKeyDef& Def, const FGeometry& Geo) { OnKeyPressVisual(Def, Geo); })
+		.OnMoveVisual_Lambda([this](const FVector2D& Delta, bool bSwipeReady) { OnKeyMoveVisual(Delta, bSwipeReady); })
+		.OnReleaseVisual_Lambda([this]() { OnKeyReleaseVisual(); })
+		.OnSpaceCursorZone_Lambda([this](int32 Dir) { OnSpaceCursorZone(Dir); });
+	return KeyWidget;
 }
 
 void SImSlateVirtualKeyboard::BuildKeyRow(TSharedRef<SHorizontalBox> RowBox, const TArray<FVirtualKeyDef>& Keys)
@@ -552,24 +629,12 @@ void SImSlateVirtualKeyboard::BuildKeyRow(TSharedRef<SHorizontalBox> RowBox, con
 	{
 		const FVirtualKeyDef* DefPtr = &PersistentKeyDefs[BaseIndex + i];
 
-		TSharedPtr<SImSlateKey> KeyWidget;
+		TSharedRef<SImSlateKey> KeyWidget = MakeBoundKey(DefPtr);
 		RowBox->AddSlot()
 		.FillWidth(DefPtr->WidthMultiplier)
 		.Padding(FMargin(2.f * Scale, 0.f))
 		[
-			SAssignNew(KeyWidget, SImSlateKey)
-			.KeyDef(DefPtr)
-			.bShiftActive_Lambda([this]() { return IsUpperCase(); })
-			.bShiftSingleShot_Lambda([this]() { return ShiftState == EShiftState::SingleShot; })
-			.OnKeyInput_Lambda([this](const FVirtualKeyDef& Def, const FString& Val) { DismissPopup(); OnKeyInput(Def, Val); })
-			.OnKeyAction_Lambda([this](EVirtualKeyAction Action) { DismissPopup(); OnKeyAction(Action); })
-			.OnLongPress_Lambda([this](const FVirtualKeyDef& Def, const FGeometry& Geo) { OnKeyLongPress(Def, Geo); })
-			.OnLongPressMove_Lambda([this](int32 Idx) { OnKeyLongPressMove(Idx); })
-			.OnLongPressEnd_Lambda([this](int32 Idx) { OnKeyLongPressEnd(Idx); })
-			.OnPressVisual_Lambda([this](const FVirtualKeyDef& Def, const FGeometry& Geo) { OnKeyPressVisual(Def, Geo); })
-			.OnMoveVisual_Lambda([this](const FVector2D& Delta, bool bSwipeReady) { OnKeyMoveVisual(Delta, bSwipeReady); })
-			.OnReleaseVisual_Lambda([this]() { OnKeyReleaseVisual(); })
-			.OnSpaceCursorZone_Lambda([this](int32 Dir) { OnSpaceCursorZone(Dir); })
+			KeyWidget
 		];
 
 		if (DefPtr->Action == EVirtualKeyAction::Space)
@@ -587,6 +652,12 @@ void SImSlateVirtualKeyboard::BuildKeyRow(TSharedRef<SHorizontalBox> RowBox, con
 	}
 }
 
+void SImSlateVirtualKeyboard::UpdateToggleTypeLabel()
+{
+	if (ToggleTypeKeyDef.IsValid())
+		ToggleTypeKeyDef->Label = (KeyboardType == EKeyboardType::QWERTY) ? TEXT("T9") : TEXT("T26");
+}
+
 // ==================== Show / Hide ====================
 
 void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
@@ -597,14 +668,24 @@ void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
 	CommitCallback = Params.CommitCallback;
 	OnTextChanged = Params.OnTextChanged;
 	SuggestionProvider = Params.SuggestionProvider;
+	BoundOwner = Params.Owner;  // rebind to the new editable widget's lifecycle
+
+	// Modal background: block taps from reaching the game when requested.
+	if (BackgroundBlocker.IsValid())
+		BackgroundBlocker->SetVisibility(Params.bBlockBackground ? EVisibility::Visible : EVisibility::Collapsed);
 
 	ShiftState = EShiftState::Default;
 	CurrentLayer = 0;
 	BackspaceUndoBuffer.Reset();
+	UpdateToggleTypeLabel();
 
 	bVisible = true;
-	bLayoutModeInitialized = false;
 	SetVisibility(EVisibility::Visible);
+
+	// Build once now (may be collapsed if geometry isn't ready). Tick() will rebuild
+	// with the correct split/full mode as soon as it has authoritative geometry.
+	BuiltWidth = -1.f;
+	BuildKeyboard();
 
 	// Start cursor blink
 	if (!CursorBlinkTimer.IsValid())
@@ -613,6 +694,9 @@ void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
 			[this](double, float) -> EActiveTimerReturnType {
 				if (!bVisible) { CursorBlinkTimer.Reset(); return EActiveTimerReturnType::Stop; }
 				bCursorVisible = !bCursorVisible;
+				if (PreviewEdit.IsValid())
+					PreviewEdit->SetPreviewCaretVisible(bCursorVisible);  // caret is drawn by PreviewEdit
+				Invalidate(EInvalidateWidgetReason::Paint);  // repaint subtree (incl. PreviewEdit)
 				return EActiveTimerReturnType::Continue;
 			}));
 	}
@@ -642,6 +726,20 @@ void SImSlateVirtualKeyboard::Hide(bool bCommit)
 	CommitCallback = nullptr;
 	OnTextChanged = nullptr;
 	SuggestionProvider = nullptr;
+	BoundOwner.Reset();
+}
+
+bool SImSlateVirtualKeyboard::IsOwnedBy(const SWidget* Widget) const
+{
+	return Widget != nullptr && BoundOwner.Pin().Get() == Widget;
+}
+
+void SImSlateVirtualKeyboard::NotifyOwnerDestroyed(const SWidget* Widget)
+{
+	// Auto-hide only when the editable we're bound to is the one being destroyed.
+	// If the keyboard was rebound to another editable, this is a no-op.
+	if (IsOwnedBy(Widget))
+		Hide(false);
 }
 
 // ==================== Text Editing ====================
@@ -693,8 +791,12 @@ void SImSlateVirtualKeyboard::ToggleShift()
 void SImSlateVirtualKeyboard::UpdatePreview()
 {
 	bCursorVisible = true;
-	if (PreviewText.IsValid())
-		PreviewText->SetText(FText::FromString(CurrentText));
+	if (PreviewEdit.IsValid())
+	{
+		PreviewEdit->SetText(FText::FromString(CurrentText));
+		PreviewEdit->SetPreviewCaretVisible(true);
+		PreviewEdit->GoTo(FTextLocation(0, CursorPosition));  // after SetText: caret to current index
+	}
 	if (OnTextChanged)
 		OnTextChanged(CurrentText);
 }
@@ -702,42 +804,9 @@ void SImSlateVirtualKeyboard::UpdatePreview()
 int32 SImSlateVirtualKeyboard::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect,
 	FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
 {
-	int32 MaxLayerId = SCompoundWidget::OnPaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
-
-	if (bCursorVisible && PreviewText.IsValid() && bVisible)
-	{
-		FGeometry TextGeo = PreviewText->GetCachedGeometry();
-		FSlateFontInfo Font = GetImSlateDefaultFont(11);
-		TSharedRef<FSlateFontMeasure> FM = FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
-
-		float FullTextW = (float)FM->Measure(CurrentText, Font).X;
-		float BeforeW = (float)FM->Measure(CurrentText.Left(CursorPosition), Font).X;
-		float CursorH = (float)FM->GetMaxCharacterHeight(Font);
-		FVector2D WidgetSize = TextGeo.GetLocalSize();
-
-		float CenterOffsetX = (WidgetSize.X - FullTextW) * 0.5f;
-		float CenterOffsetY = (WidgetSize.Y - CursorH) * 0.5f;
-
-		FVector2D CursorTopLeft_TextLocal(CenterOffsetX + BeforeW, CenterOffsetY);
-		FVector2D CursorTopLeft_Abs = TextGeo.LocalToAbsolute(CursorTopLeft_TextLocal);
-		FVector2D CursorPos = AllottedGeometry.AbsoluteToLocal(CursorTopLeft_Abs);
-
-		float ScaleRatio = TextGeo.GetAccumulatedLayoutTransform().GetScale()
-			/ FMath::Max(AllottedGeometry.GetAccumulatedLayoutTransform().GetScale(), 0.001f);
-		float CursorW = 1.5f * ScaleRatio;
-		float CursorHScaled = CursorH * ScaleRatio;
-
-		static FSlateBrush CursorBrush;
-		CursorBrush.DrawAs = ESlateBrushDrawType::Image;
-		CursorBrush.TintColor = FLinearColor::White;
-
-		FSlateDrawElement::MakeBox(OutDrawElements, MaxLayerId + 1,
-			AllottedGeometry.ToPaintGeometry(FVector2D(CursorW, CursorHScaled),
-				FSlateLayoutTransform(1.f, UE::Slate::CastToVector2f(CursorPos))),
-			&CursorBrush, ESlateDrawEffect::None, FLinearColor::White);
-	}
-
-	return MaxLayerId + 1;
+	// Caret is now self-drawn by PreviewEdit (SImEditableText preview mode) using the
+	// engine's text layout, so the keyboard no longer paints it here.
+	return SCompoundWidget::OnPaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
 }
 
 // ==================== Editor Sync ====================
@@ -748,8 +817,13 @@ void SImSlateVirtualKeyboard::SyncFromEditor(const FString& Text)
 	CurrentText = Text;
 	CursorPosition = FMath::Clamp(CursorPosition, 0, CurrentText.Len());
 	bCursorVisible = true;
-	if (PreviewText.IsValid())
-		PreviewText->SetText(FText::FromString(CurrentText));
+	if (PreviewEdit.IsValid())
+	{
+		PreviewEdit->SetText(FText::FromString(CurrentText));
+		PreviewEdit->SetPreviewCaretVisible(true);
+		PreviewEdit->GoTo(FTextLocation(0, CursorPosition));
+	}
+	UpdateSuggestions();
 }
 
 // ==================== Preview Drag + Cursor Blink ====================
@@ -841,6 +915,11 @@ void SImSlateVirtualKeyboard::UpdateSuggestions()
 void SImSlateVirtualKeyboard::UpdateSuggestionsAsync(TArray<FString> InResults)
 {
 	AsyncSuggestionQueue.Enqueue(MoveTemp(InResults));
+	RegisterActiveTimer(0.f, FWidgetActiveTimerDelegate::CreateLambda(
+		[this](double, float) -> EActiveTimerReturnType {
+			if (bVisible) UpdateSuggestions();
+			return EActiveTimerReturnType::Stop;
+		}));
 }
 
 void SImSlateVirtualKeyboard::PopulateSuggestionBar(const TArray<FString>& Suggestions)
@@ -865,6 +944,8 @@ void SImSlateVirtualKeyboard::PopulateSuggestionBar(const TArray<FString>& Sugge
 			]
 		];
 	}
+
+	Invalidate(EInvalidateWidgetReason::Layout);
 }
 
 // ==================== Input Handling ====================
@@ -938,6 +1019,7 @@ void SImSlateVirtualKeyboard::OnKeyAction(EVirtualKeyAction Action)
 	case EVirtualKeyAction::ToggleType:
 		KeyboardType = (KeyboardType == EKeyboardType::QWERTY) ? EKeyboardType::T9 : EKeyboardType::QWERTY;
 		CurrentLayer = 0;
+		UpdateToggleTypeLabel();
 		BuildKeyboard();
 		break;
 	default:
@@ -1015,18 +1097,68 @@ void SImSlateVirtualKeyboard::OnKeyLongPressEnd(int32 SelectedIndex)
 
 void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, const FGeometry& KeyGeometry)
 {
-	if (!KeyDef.Swipe.HasAny() || !RootOverlay.IsValid()) return;
+	if (!RootOverlay.IsValid()) return;
 	OnKeyReleaseVisual();
+
+	bool bIsStepDrag = (KeyDef.Action == EVirtualKeyAction::Space || KeyDef.Action == EVirtualKeyAction::Backspace);
+
+	if (bIsStepDrag)
+	{
+		float Scale = GetImSlateEffectiveScale();
+		FSlateFontInfo Font = GetImSlateDefaultFont(7);
+		FLinearColor Dim(0.5f, 0.5f, 0.5f, 1.f);
+
+		bool bIsSpace = (KeyDef.Action == EVirtualKeyAction::Space);
+		FString LeftLabel = bIsSpace ? TEXT("\x25C0 Cursor") : TEXT("\x25C0 Del");
+		FString RightLabel = bIsSpace ? TEXT("Cursor \x25B6") : TEXT("Undo \x25B6");
+
+		FVector2D KeyLocalPos = GetCachedGeometry().AbsoluteToLocal(KeyGeometry.GetAbsolutePosition());
+		FVector2D KeyLocalSize = KeyGeometry.GetLocalSize();
+		FVector2D MySize = GetCachedGeometry().GetLocalSize();
+		float PopupWidth = FMath::Min(KeyLocalSize.X * 1.2f, 200.f);
+		float PopupX = KeyLocalPos.X + KeyLocalSize.X * 0.5f - PopupWidth * 0.5f;
+		PopupX = FMath::Clamp(PopupX, 0.f, FMath::Max(0.f, MySize.X - PopupWidth));
+		float PopupY = KeyLocalPos.Y - 32.f;
+		PopupY = FMath::Max(0.f, PopupY);
+
+		StepDragVisual = SNew(SBox)
+			.WidthOverride(PopupWidth)
+			[
+				SNew(SBox)
+				.HeightOverride(28.f)
+				[
+					SNew(SBorder)
+					.BorderImage(&GetPopupBgBrush())
+					.Padding(FMargin(10.f, 4.f))
+					[
+						SNew(SHorizontalBox)
+						+ SHorizontalBox::Slot().FillWidth(1.f).HAlign(HAlign_Left).VAlign(VAlign_Center)
+						[ SAssignNew(StepDragLeftText, STextBlock).Text(FText::FromString(LeftLabel)).Font(Font).ColorAndOpacity(Dim) ]
+						+ SHorizontalBox::Slot().AutoWidth().HAlign(HAlign_Center).VAlign(VAlign_Center).Padding(FMargin(8.f, 0.f))
+						[ SNew(STextBlock).Text(FText::FromString(TEXT("\x2502"))).Font(Font).ColorAndOpacity(FLinearColor(0.4f, 0.4f, 0.4f)) ]
+						+ SHorizontalBox::Slot().FillWidth(1.f).HAlign(HAlign_Right).VAlign(VAlign_Center)
+						[ SAssignNew(StepDragRightText, STextBlock).Text(FText::FromString(RightLabel)).Font(Font).ColorAndOpacity(Dim) ]
+					]
+				]
+			];
+
+		RootOverlay->AddSlot()
+		.HAlign(HAlign_Left)
+		.VAlign(VAlign_Top)
+		.Padding(FMargin(PopupX, PopupY, 0.f, 0.f))
+		[ StepDragVisual.ToSharedRef() ];
+		return;
+	}
+
+	if (!KeyDef.Swipe.HasAny()) return;
 	ActiveKeyDef = &KeyDef;
 
 	float Scale = GetImSlateEffectiveScale();
 	float CellSize = FMath::Min(KeyGeometry.GetLocalSize().X, KeyGeometry.GetLocalSize().Y);
-	FSlateFontInfo Font = GetImSlateDefaultFont(8);
+	FSlateFontInfo Font = GetImSlateDefaultFont(14);
 	FLinearColor HintColor(0.9f, 0.9f, 0.9f, 1.f);
 
-	// Build a 3x3 grid: center=key label, top/bottom/left/right=swipe chars
 	TSharedRef<SOverlay> Grid = SNew(SOverlay);
-
 	SwipeDirectionTexts.Reset();
 
 	auto AddCell = [&](const FString& Text, EHorizontalAlignment HAlign, EVerticalAlignment VAlign, const FString& DirKey = FString()) {
@@ -1065,9 +1197,7 @@ void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, con
 			SNew(SBorder)
 			.BorderImage(&GetPopupBgBrush())
 			.Padding(2.f * Scale)
-			[
-				Grid
-			]
+			[ Grid ]
 		];
 
 	FVector2D KeyLocalPos = GetCachedGeometry().AbsoluteToLocal(KeyGeometry.GetAbsolutePosition());
@@ -1082,13 +1212,22 @@ void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, con
 	.HAlign(HAlign_Left)
 	.VAlign(VAlign_Top)
 	.Padding(FMargin(PopupX, PopupY, 0.f, 0.f))
-	[
-		SwipeVisual.ToSharedRef()
-	];
+	[ SwipeVisual.ToSharedRef() ];
 }
 
 void SImSlateVirtualKeyboard::OnKeyMoveVisual(const FVector2D& Delta, bool bSwipeReady)
 {
+	if (StepDragVisual.IsValid())
+	{
+		FLinearColor Dim(0.5f, 0.5f, 0.5f, 1.f);
+		FLinearColor Active(0.3f, 0.8f, 1.f, 1.f);
+		bool bLeft = Delta.X < -4.f;
+		bool bRight = Delta.X > 4.f;
+		if (StepDragLeftText.IsValid())  StepDragLeftText->SetColorAndOpacity(bLeft ? Active : Dim);
+		if (StepDragRightText.IsValid()) StepDragRightText->SetColorAndOpacity(bRight ? Active : Dim);
+		return;
+	}
+
 	if (SwipeVisual.IsValid())
 	{
 		float DPIScale = GetCachedGeometry().GetAccumulatedLayoutTransform().GetScale();
@@ -1097,7 +1236,6 @@ void SImSlateVirtualKeyboard::OnKeyMoveVisual(const FVector2D& Delta, bool bSwip
 		SwipeVisual->SetRenderTransform(FSlateRenderTransform(FVector2f(0.f, ClampedY)));
 	}
 
-	// Highlight: center when near origin or direction has no entry, else direction
 	FString ActiveDir = TEXT("C");
 	if (bSwipeReady && ActiveKeyDef)
 	{
@@ -1127,6 +1265,13 @@ void SImSlateVirtualKeyboard::OnKeyMoveVisual(const FVector2D& Delta, bool bSwip
 
 void SImSlateVirtualKeyboard::OnKeyReleaseVisual()
 {
+	if (StepDragVisual.IsValid() && RootOverlay.IsValid())
+	{
+		RootOverlay->RemoveSlot(StepDragVisual.ToSharedRef());
+		StepDragVisual.Reset();
+		StepDragLeftText.Reset();
+		StepDragRightText.Reset();
+	}
 	if (SwipeVisual.IsValid() && RootOverlay.IsValid())
 	{
 		RootOverlay->RemoveSlot(SwipeVisual.ToSharedRef());

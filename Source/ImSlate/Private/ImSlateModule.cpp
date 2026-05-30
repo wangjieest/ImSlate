@@ -209,7 +209,6 @@ public:
 
 	void OnGameInstanceStart(UWorld* World)
 	{
-#if 0
 #if WITH_EDITOR
 		if (!ensure(World) || !World->IsGameWorld())
 			return;
@@ -217,20 +216,19 @@ public:
 		if (!World)
 			return;
 #endif
-		OnViewportCreated(World, [World] { OnWorldViewport(World));
+		auto OnViewportCreatedCb = [World] { ImSlate::FWorldContextRoot::OnWorldViewport(World); };
 		if (auto Viewport = World->GetGameViewport())
 		{
 #if WITH_EDITOR
-			CallOnWorldNextTick(World, [World] { OnWorldViewport(World); });
+			CallOnWorldNextTick(World, MoveTemp(OnViewportCreatedCb));
 #else
-			OnWorldViewport(World);
+			OnViewportCreatedCb();
 #endif
 		}
 		else
 		{
-			UGameViewportClient::OnViewportCreated().AddWeakLambda(World, [World] { OnWorldViewport(World); });
+			UGameViewportClient::OnViewportCreated().AddWeakLambda(World, MoveTemp(OnViewportCreatedCb));
 		}
-#endif
 	}
 };
 

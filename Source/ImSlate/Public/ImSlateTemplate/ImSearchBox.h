@@ -39,7 +39,7 @@ public:
 
 	TSharedPtr<SEditableText> GetEditableText() const { return EditText; }
 	void SetUseInlineSuggestions(bool bInline) { bUseInlineSuggestions = bInline; }
-	void SetKeyboardSuggestionProvider(FImSearchBoxSuggestionProvider InProvider) { KeyboardSuggestionProvider = MoveTemp(InProvider); }
+	void SetKeyboardSuggestionProvider(FImSearchBoxSuggestionProvider InProvider);
 
 protected:
 	virtual FReply OnPreviewKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;

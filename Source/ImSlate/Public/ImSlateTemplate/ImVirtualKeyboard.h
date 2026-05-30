@@ -74,6 +74,8 @@ struct FVirtualKeyboardShowParams
 	TFunction<void(const FString&, ETextCommit::Type)> CommitCallback;
 	TFunction<void(const FString&)> OnTextChanged;  // real-time sync on every keystroke
 	FImSlateSuggestionProvider SuggestionProvider;
+	TWeakPtr<class SWidget> Owner;  // bound editable widget; keyboard follows its lifecycle
+	bool bBlockBackground = true;   // true: full-screen modal, taps don't pass through to game
 };
 
 class IMSLATE_API SImSlateVirtualKeyboard : public SCompoundWidget
@@ -83,6 +85,7 @@ public:
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
+	virtual void Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime) override;
 	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override;
 
 	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
@@ -98,6 +101,11 @@ public:
 	void UpdateSuggestionsAsync(TArray<FString> InResults);
 	void SyncFromEditor(const FString& Text);
 
+	// Lifecycle binding: keyboard belongs to the widget that called Show().
+	// When that widget is destroyed, the keyboard auto-hides.
+	bool IsOwnedBy(const class SWidget* Widget) const;
+	void NotifyOwnerDestroyed(const class SWidget* Widget);
+
 	static TSharedPtr<SImSlateVirtualKeyboard> Get();
 	static bool ShouldUseVirtualKeyboard();
 
@@ -107,11 +115,15 @@ private:
 	enum class EShiftState : uint8 { Default, SingleShot, Locked };
 
 	bool bVisible = false;
+	TWeakPtr<class SWidget> BoundOwner;
 	EShiftState ShiftState = EShiftState::Default;
 	int32 CurrentLayer = 0;
 	EKeyboardType KeyboardType = EKeyboardType::QWERTY;
-	EKeyboardLayoutMode CachedLayoutMode = EKeyboardLayoutMode::FullScreen;
-	bool bLayoutModeInitialized = false;
+	// Layout mode is derived purely from the Tick-provided geometry width (not from
+	// toggle history), so the same screen always yields the same mode. We track the
+	// width the keyboard was last *built* against to know when a rebuild is needed.
+	float BuiltWidth = -1.f;
+	EKeyboardLayoutMode BuiltLayoutMode = EKeyboardLayoutMode::FullScreen;
 	FString CurrentText;
 	int32 CursorPosition = 0;
 	FString OriginalText;
@@ -121,8 +133,14 @@ private:
 	TFunction<void(const FString&)> OnTextChanged;
 	FImSlateSuggestionProvider SuggestionProvider;
 
-	TSharedPtr<class STextBlock> PreviewText;
+	TSharedPtr<class SImEditableText> PreviewEdit;  // preview text + self-drawn caret (engine layout)
 	TSharedPtr<class SBorder> PreviewBorder;
+	TSharedPtr<class SWidget> BackgroundBlocker;  // full-screen modal hit-blocker
+	// Toggle-type + Done keys flanking the preview row (persist across BuildKeyboard).
+	TSharedPtr<class SImSlateKey> ToggleTypeKey;
+	TSharedPtr<class SImSlateKey> DoneKey;
+	TSharedPtr<FVirtualKeyDef> ToggleTypeKeyDef;
+	TSharedPtr<FVirtualKeyDef> DoneKeyDef;
 	TSharedPtr<FActiveTimerHandle> CursorBlinkTimer;
 	bool bCursorVisible = true;
 	bool bPreviewDragging = false;
@@ -133,6 +151,9 @@ private:
 	TSharedPtr<class SOverlay> RootOverlay;
 	TSharedPtr<class SImSlateKeyPopup> ActivePopup;
 	TSharedPtr<class SWidget> SwipeVisual;
+	TSharedPtr<class SWidget> StepDragVisual;
+	TSharedPtr<class STextBlock> StepDragLeftText;
+	TSharedPtr<class STextBlock> StepDragRightText;
 	const FVirtualKeyDef* ActiveKeyDef = nullptr;
 	TMap<FString, TSharedPtr<class STextBlock>> SwipeDirectionTexts;
 	TWeakPtr<class SImSlateKey> ActiveLongPressKey;
@@ -145,12 +166,15 @@ private:
 	TArray<FKeyWidgetEntry> KeyWidgets;
 	TArray<FVirtualKeyDef> PersistentKeyDefs;
 
-	EKeyboardLayoutMode GetLayoutMode() const;
+	EKeyboardLayoutMode ComputeLayoutMode(float Width) const;  // pure: mode from width
+	EKeyboardLayoutMode GetLayoutMode() const { return BuiltLayoutMode; }  // last built mode
 
 	void BuildKeyboard();
 	void BuildFullScreenLayout();
 	void BuildSplitLayout();
 	void BuildKeyRow(TSharedRef<class SHorizontalBox> Row, const TArray<FVirtualKeyDef>& Keys);
+	TSharedRef<class SImSlateKey> MakeBoundKey(const FVirtualKeyDef* DefPtr);
+	void UpdateToggleTypeLabel();
 	void UpdatePreview();
 	void UpdateSuggestions();
 	void PopulateSuggestionBar(const TArray<FString>& Suggestions);
@@ -182,7 +206,6 @@ private:
 	FVirtualKeyDef MakeBackspaceKey(float Width);
 	TArray<TArray<FVirtualKeyDef>> GetQWERTYLayout();
 	TArray<TArray<FVirtualKeyDef>> GetSymbolLayout();
-	TArray<TArray<FVirtualKeyDef>> GetNumberRow();
 	TArray<FVirtualKeyDef> GetBottomRow();
 	TArray<TArray<FVirtualKeyDef>> GetT9Layout();
 	TArray<FVirtualKeyDef> GetT9BottomRow();

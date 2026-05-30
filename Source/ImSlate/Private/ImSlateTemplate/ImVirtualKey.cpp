@@ -92,9 +92,8 @@ int32 SImSlateKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeom
 	bool bDrawnIcon = false;
 	if (KeyDef->Action == EVirtualKeyAction::Backspace)
 	{
-		// ← with X shape
 		TArray<FVector2D> Points;
-		float W = IconSize * 1.2f, H = IconSize * 0.8f;
+		float W = IconSize * 0.8f, H = IconSize * 0.55f;
 		Points.Add(Center + FVector2D(-W, 0));
 		Points.Add(Center + FVector2D(-W * 0.3f, -H));
 		Points.Add(Center + FVector2D(W, -H));
@@ -349,34 +348,39 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 	float SwipeThreshold = 8.f * GetImSlateEffectiveScale();
 	bool bIsSpaceOrDel = (KeyDef->Action == EVirtualKeyAction::Space || KeyDef->Action == EVirtualKeyAction::Backspace);
 
-	// Space/Del: immediate step-drag when finger crosses threshold (no long-press wait)
-	if (!bLongPressHandled && !bSwipeActive && bIsSpaceOrDel && Delta.Size() >= SwipeThreshold)
+	// Space/Del: immediate step-drag when finger crosses threshold
+	if (!bLongPressHandled && bIsSpaceOrDel && Delta.Size() >= SwipeThreshold)
 	{
 		bLongPressHandled = true;
 		LongPressAnchorPos = PressStartPos;
+		OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry);
 	}
 
-	// Other keys: long-press check while finger stays near start
-	bool bCanLongPress = KeyDef->LongPressChars.Num() > 0;
-	if (!bLongPressHandled && !bSwipeActive && Delta.Size() < SwipeThreshold)
+	// Long-press check (finger near start, for keys with LongPressChars)
+	if (!bLongPressHandled && KeyDef->LongPressChars.Num() > 0 && Delta.Size() < SwipeThreshold
+		&& FPlatformTime::Seconds() - PressStartTime >= LongPressThreshold)
 	{
-		if (bCanLongPress && FPlatformTime::Seconds() - PressStartTime >= LongPressThreshold)
-		{
-			bLongPressHandled = true;
-			LongPressAnchorPos = ScreenPos;
-			OnLongPress.ExecuteIfBound(*KeyDef, MyGeometry);
-		}
-		if (!bSwipeVisualShown && Delta.Size() >= SwipeThreshold * 0.5f && KeyDef->Swipe.HasAny() && !bIsSpaceOrDel)
+		bLongPressHandled = true;
+		LongPressAnchorPos = ScreenPos;
+		if (bSwipeVisualShown) { OnReleaseVisual.ExecuteIfBound(); bSwipeVisualShown = false; }
+		OnLongPress.ExecuteIfBound(*KeyDef, MyGeometry);
+	}
+
+	// Swipe popup trigger: finger moved past the key bounds → show four-way visual
+	if (!bLongPressHandled && !bSwipeVisualShown && KeyDef->Swipe.HasAny())
+	{
+		FVector2D LocalPos = MyGeometry.AbsoluteToLocal(ScreenPos);
+		FVector2D KeySize = MyGeometry.GetLocalSize();
+		bool bOutsideKey = LocalPos.X < 0.f || LocalPos.X > KeySize.X ||
+		                   LocalPos.Y < 0.f || LocalPos.Y > KeySize.Y;
+		if (bOutsideKey)
 		{
 			bSwipeVisualShown = true;
 			OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry);
 		}
-		if (bSwipeVisualShown)
-			OnMoveVisual.ExecuteIfBound(Delta, Delta.Size() >= SwipeThreshold);
-		return;
 	}
 
-	// Drag active: Space = cursor step, Del = delete/undo step, LongPress = popup drag
+	// Step-drag active: Space = cursor, Del = delete/undo, LongPress = popup
 	if (bLongPressHandled)
 	{
 		float XOffset = ScreenPos.X - LongPressAnchorPos.X;
@@ -384,11 +388,13 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 
 		if (KeyDef->Action == EVirtualKeyAction::Space)
 		{
+			OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);
 			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Right); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
 			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Left);  LongPressAnchorPos.X -= StepW; XOffset += StepW; }
 		}
 		else if (KeyDef->Action == EVirtualKeyAction::Backspace)
 		{
+			OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);
 			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Backspace);     LongPressAnchorPos.X -= StepW; XOffset += StepW; }
 			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::UndoBackspace); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
 		}
@@ -402,23 +408,26 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 		return;
 	}
 
-	// Swipe visual for regular keys
-	if (!bSwipeVisualShown && KeyDef->Swipe.HasAny() && !bIsSpaceOrDel)
-	{
-		bSwipeVisualShown = true;
-		OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry);
-	}
+	// Swipe visual: direction based on key bounds (popup shown on press)
 	if (bSwipeVisualShown)
-		OnMoveVisual.ExecuteIfBound(Delta, Delta.Size() >= SwipeThreshold);
+	{
+		FVector2D LocalPos = MyGeometry.AbsoluteToLocal(ScreenPos);
+		FVector2D KeySize = MyGeometry.GetLocalSize();
+		bool bOutsideKey = LocalPos.X < 0.f || LocalPos.X > KeySize.X ||
+		                   LocalPos.Y < 0.f || LocalPos.Y > KeySize.Y;
+		OnMoveVisual.ExecuteIfBound(Delta, bOutsideKey);
 
-	if (Delta.Size() < SwipeThreshold)
-		return;
-
-	ESwipeDirection Dir = DetectSwipe(Delta);
-	if (Dir == ESwipeDirection::None) return;
-
-	ActiveSwipeDir = Dir;
-	bSwipeActive = true;
+		if (bOutsideKey)
+		{
+			ActiveSwipeDir = DetectSwipe(Delta);
+			bSwipeActive = true;
+		}
+		else
+		{
+			bSwipeActive = false;
+			ActiveSwipeDir = ESwipeDirection::None;
+		}
+	}
 }
 
 SImSlateKey::ESwipeDirection SImSlateKey::DetectSwipe(const FVector2D& Delta) const

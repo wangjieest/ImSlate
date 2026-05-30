@@ -91,7 +91,7 @@ private:
 	FVector2D PressStartPos = FVector2D::ZeroVector;
 	double PressStartTime = 0.0;
 
-	static constexpr float LongPressThreshold = 0.5f;
+	static constexpr float LongPressThreshold = 0.7f;
 
 	void HandlePress(const FGeometry& MyGeometry, const FVector2D& ScreenPos);
 	void HandleRelease(const FGeometry& MyGeometry, const FVector2D& ScreenPos);

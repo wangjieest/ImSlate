@@ -58,6 +58,15 @@ static const FButtonStyle& GetSuggestionHighlightStyle()
 	return Style;
 }
 
+void SImSearchBox::SetKeyboardSuggestionProvider(FImSearchBoxSuggestionProvider InProvider)
+{
+	KeyboardSuggestionProvider = InProvider;
+	// Forward to the inner editable so its focus-triggered keyboard Show() also
+	// carries the provider (not just the keyboard-button path).
+	if (EditText.IsValid())
+		StaticCastSharedPtr<SImEditableText>(EditText)->SetVirtualKeyboardSuggestionProvider(InProvider);
+}
+
 void SImSearchBox::Construct(const FArguments& InArgs)
 {
 	bUseInlineSuggestions = InArgs._bUseInlineSuggestions;
@@ -88,6 +97,9 @@ void SImSearchBox::Construct(const FArguments& InArgs)
 	MyEditText->SetBorderImage(&EditBgBrush);
 
 	EditText = MyEditText;
+	// If a provider was already set before Construct, forward it to the inner editable.
+	if (KeyboardSuggestionProvider)
+		MyEditText->SetVirtualKeyboardSuggestionProvider(KeyboardSuggestionProvider);
 
 	TSharedRef<SHorizontalBox> EditRow = SNew(SHorizontalBox)
 		+ SHorizontalBox::Slot()
