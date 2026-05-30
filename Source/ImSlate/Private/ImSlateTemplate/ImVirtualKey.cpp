@@ -2,6 +2,7 @@
 #include "ImSlateTemplate/ImVirtualKey.h"
 #include "Fonts/FontMeasure.h"
 #include "Framework/Application/SlateApplication.h"
+#include "Widgets/SWindow.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Text/STextBlock.h"
@@ -65,7 +66,9 @@ void SImSlateKey::SetLongPressPopupInfo(float PopupCenterAbsX, float InCellWidth
 FVector2D SImSlateKey::ComputeDesiredSize(float LayoutScaleMultiplier) const
 {
 	float Scale = GetImSlateEffectiveScale();
-	float H = FMath::Min(32.f * Scale, 48.f); // capped at GMaxKeyHeight
+	// The cap must scale with DPI too. A fixed 48px cap was in *physical* pixels, so on a
+	// high-DPI screen (e.g. iOS retina) it clamped keys to a tiny size. Cap in logical px (*Scale).
+	float H = FMath::Min(32.f * Scale, 48.f * Scale); // = 32*Scale; logical cap of 48
 	float W = H * 0.85f;
 	if (KeyDef)
 		W *= KeyDef->WidthMultiplier;
@@ -401,14 +404,12 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 		TryTriggerLongPress(MyGeometry, ScreenPos);
 	}
 
-	// Swipe popup trigger: finger moved past the key bounds → show four-way visual
+	// Swipe popup trigger: finger moved past the swipe threshold → show four-way visual.
+	// Use distance from the press point (not "left the key bounds"), so edge keys — which
+	// can't be dragged outside toward the screen edge — still pop their four-way popup.
 	if (!bLongPressHandled && !bSwipeVisualShown && KeyDef->Swipe.HasAny())
 	{
-		FVector2D LocalPos = MyGeometry.AbsoluteToLocal(ScreenPos);
-		FVector2D KeySize = MyGeometry.GetLocalSize();
-		bool bOutsideKey = LocalPos.X < 0.f || LocalPos.X > KeySize.X ||
-		                   LocalPos.Y < 0.f || LocalPos.Y > KeySize.Y;
-		if (bOutsideKey)
+		if (Delta.Size() >= SwipeThreshold)
 		{
 			bSwipeVisualShown = true;
 			OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry);
@@ -447,16 +448,53 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 		return;
 	}
 
-	// Swipe visual: direction based on key bounds (popup shown on press)
+	// Swipe visual: a direction activates when the finger crosses, in that direction, the
+	// smaller of (a) the standard "leave the key bounds" distance and (b) the space actually
+	// available before the finger hits the screen edge. So a normal key keeps the standard
+	// bounds behavior, while an EDGE key — which can't be dragged past its border toward the
+	// screen edge — gets a reduced threshold on its squeezed side so that direction is still
+	// reachable. Only the squeezed side is relaxed; the others stay standard.
 	if (bSwipeVisualShown)
 	{
-		FVector2D LocalPos = MyGeometry.AbsoluteToLocal(ScreenPos);
-		FVector2D KeySize = MyGeometry.GetLocalSize();
-		bool bOutsideKey = LocalPos.X < 0.f || LocalPos.X > KeySize.X ||
-		                   LocalPos.Y < 0.f || LocalPos.Y > KeySize.Y;
-		OnMoveVisual.ExecuteIfBound(Delta, bOutsideKey);
+		const FVector2D KeySize = MyGeometry.GetLocalSize();
+		const float GeoScale = MyGeometry.GetAccumulatedLayoutTransform().GetScale();
+		// Standard distance to "leave" the key from its center, in absolute screen px.
+		const float StdX = (KeySize.X * 0.5f) * GeoScale;
+		const float StdY = (KeySize.Y * 0.5f) * GeoScale;
+		const float Margin = 6.f * GeoScale;  // keep a little room from the very edge
 
-		if (bOutsideKey)
+		// Absolute key rect and the window (screen) rect the finger can move within.
+		const FVector2D AbsTL = MyGeometry.LocalToAbsolute(FVector2D::ZeroVector);
+		const FVector2D AbsBR = MyGeometry.LocalToAbsolute(KeySize);
+		FVector2D ScreenMin(0.f, 0.f), ScreenMax(FLT_MAX, FLT_MAX);
+		if (TSharedPtr<SWindow> Win = FSlateApplication::Get().FindWidgetWindow(SharedThis(this)))
+		{
+			const FGeometry& WG = Win->GetTickSpaceGeometry();
+			ScreenMin = WG.LocalToAbsolute(FVector2D::ZeroVector);
+			ScreenMax = WG.LocalToAbsolute(WG.GetLocalSize());
+		}
+		// Reachable travel before hitting the screen edge, per direction (absolute px).
+		const float ReachL = FMath::Max(0.f, (AbsTL.X - ScreenMin.X) - Margin);
+		const float ReachR = FMath::Max(0.f, (ScreenMax.X - AbsBR.X) - Margin);
+		const float ReachU = FMath::Max(0.f, (AbsTL.Y - ScreenMin.Y) - Margin);
+		const float ReachD = FMath::Max(0.f, (ScreenMax.Y - AbsBR.Y) - Margin);
+
+		// Per-direction threshold: standard, but capped to what's reachable on a squeezed side.
+		const float MinThresh = 8.f * GetImSlateEffectiveScale();
+		const float ThreshL = FMath::Max(MinThresh, FMath::Min(StdX, ReachL));
+		const float ThreshR = FMath::Max(MinThresh, FMath::Min(StdX, ReachR));
+		const float ThreshU = FMath::Max(MinThresh, FMath::Min(StdY, ReachU));
+		const float ThreshD = FMath::Max(MinThresh, FMath::Min(StdY, ReachD));
+
+		bool bDirActive = false;
+		if (FMath::Abs(Delta.X) > FMath::Abs(Delta.Y))
+			bDirActive = (Delta.X > 0) ? (Delta.X >= ThreshR) : (-Delta.X >= ThreshL);
+		else
+			bDirActive = (Delta.Y < 0) ? (-Delta.Y >= ThreshU) : (Delta.Y >= ThreshD);
+
+		OnMoveVisual.ExecuteIfBound(Delta, bDirActive);
+
+		if (bDirActive)
 		{
 			ActiveSwipeDir = DetectSwipe(Delta);
 			bSwipeActive = true;

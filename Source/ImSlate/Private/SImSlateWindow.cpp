@@ -40,8 +40,12 @@ namespace ImSlate
 {
 extern SImViewportGame* GetGameViewportImpl();
 
-bool bSupportImViewportHost = true;
-#if WITH_EDITOR
+// Multi-window (ImViewportHost = separate native SWindow) is DESKTOP-ONLY. iOS allows only
+// one UI window — dragging an ImSlate window out of the game viewport used to switch to the
+// Host path and create a second SWindow, crashing with "Only one UI window may be created on
+// iOS". On mobile, windows must always stay inline in the game viewport.
+bool bSupportImViewportHost = PLATFORM_DESKTOP;
+#if PLATFORM_DESKTOP
 FXConsoleVariableRef CVar_SupportImViewportHost(TEXT("imslate.multiview"), bSupportImViewportHost, TEXT(""));
 #endif
 

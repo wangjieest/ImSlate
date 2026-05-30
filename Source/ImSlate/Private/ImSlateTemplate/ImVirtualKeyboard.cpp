@@ -284,6 +284,11 @@ TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetSymbolLayout()
 	return Rows;
 }
 
+// Keyboard sizing caps in LOGICAL pixels (multiplied by the effective DPI scale at use sites).
+static constexpr float GMaxKeyboardHeight = 300.f;
+static constexpr float GMaxKeyHeight = 48.f;
+static constexpr float GMinKeyWidth = 32.f;
+
 // ==================== Construct ====================
 
 void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
@@ -327,10 +332,14 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 			+ SVerticalBox::Slot()
 			.FillHeight(1.f)
 
-			// Suggestions: scrollable, max 100px
+			// Suggestions: variable height but grows UPWARD. The whole vertical stack fills a
+			// fixed region (see ChildSlot VAlign_Fill below) with the top spacer (FillHeight)
+			// absorbing slack, so when this slot grows it eats the spacer above instead of
+			// pushing the preview row + keys (which stay pinned to the bottom). Stable key Y
+			// → popups anchored to keys keep a stable height. Capped + scrollable past the cap.
 			+ SVerticalBox::Slot()
 			.AutoHeight()
-			.MaxHeight(100.f)
+			.MaxHeight(120.f)
 			[
 				SNew(SScrollBox)
 				.Orientation(Orient_Vertical)
@@ -388,12 +397,14 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 				]
 			]
 
-			// Keyboard: auto height, max 300px, always at bottom
+			// Keyboard: auto height, max 300 logical px (scaled by DPI), always at bottom.
+			// The cap is multiplied by the effective scale so it doesn't squash the keyboard
+			// on high-DPI screens (where a fixed 300px cap made it tiny vs the panels).
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			[
 				SNew(SBox)
-				.MaxDesiredHeight(300.f)
+				.MaxDesiredHeight(GMaxKeyboardHeight * GetImSlateEffectiveScale())
 				[
 					SNew(SBorder)
 					.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
@@ -409,14 +420,15 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 	];
 
 	if (PreviewEdit.IsValid())
+	{
 		PreviewEdit->SetPreviewDisplayMode(true);
+		// Display-only: don't let the editable widget eat mouse events, so preview-area
+		// drag (move cursor) still reaches the keyboard. It only shows text + self-drawn caret.
+		PreviewEdit->SetVisibility(EVisibility::HitTestInvisible);
+	}
 
 	BuildKeyboard();
 }
-
-static constexpr float GMaxKeyboardHeight = 300.f;
-static constexpr float GMaxKeyHeight = 48.f;
-static constexpr float GMinKeyWidth = 32.f;
 
 SImSlateVirtualKeyboard::EKeyboardLayoutMode SImSlateVirtualKeyboard::ComputeLayoutMode(float Width) const
 {
@@ -425,7 +437,7 @@ SImSlateVirtualKeyboard::EKeyboardLayoutMode SImSlateVirtualKeyboard::ComputeLay
 		return EKeyboardLayoutMode::FullScreen;  // unknown yet — start collapsed
 
 	float Scale = GetImSlateEffectiveScale();
-	float KeyH = FMath::Min(32.f * Scale, GMaxKeyHeight);
+	float KeyH = FMath::Min(32.f * Scale, GMaxKeyHeight * Scale);
 	float ComfortKeyW = KeyH * 1.3f;
 	float SideWidth = 5.f * ComfortKeyW + 5.f * 4.f * Scale;
 	float MinGap = 60.f * Scale;
@@ -571,7 +583,7 @@ void SImSlateVirtualKeyboard::BuildSplitLayout()
 	// Both T9 and T26 use the SAME side width — a thumb's reach is a physical span,
 	// not a column count. Each half fills this fixed width regardless of key count.
 	float SplitScale = GetImSlateEffectiveScale();
-	float SplitKeyH = FMath::Min(32.f * SplitScale, GMaxKeyHeight);
+	float SplitKeyH = FMath::Min(32.f * SplitScale, GMaxKeyHeight * SplitScale);
 	float ComfortKeyW = SplitKeyH * 1.3f;
 	float SideWidth = 5.f * ComfortKeyW + 5.f * 4.f * SplitScale;
 
@@ -1136,6 +1148,10 @@ void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, con
 		PopupX = FMath::Clamp(PopupX, 0.f, FMath::Max(0.f, MySize.X - PopupWidth));
 		float PopupY = KeyLocalPos.Y - 32.f;
 		PopupY = FMath::Max(0.f, PopupY);
+
+		UE_LOG(LogTemp, Warning, TEXT("[PopupDbg] StepDrag KeyLocalPos.Y=%.1f PopupY=%.1f keyAbsY=%.1f kbSize=(%.0f,%.0f) sugBarH=%.1f"),
+			KeyLocalPos.Y, PopupY, KeyGeometry.GetAbsolutePosition().Y, MySize.X, MySize.Y,
+			SuggestionBar.IsValid() ? SuggestionBar->GetCachedGeometry().GetLocalSize().Y : -1.f);
 
 		StepDragVisual = SNew(SBox)
 			.WidthOverride(PopupWidth)
