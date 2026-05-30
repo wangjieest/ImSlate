@@ -52,6 +52,7 @@ public:
 	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override;
 
 	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnMouseButtonDoubleClick(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	virtual FReply OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 
@@ -79,6 +80,7 @@ private:
 	FVector2D LongPressAnchorPos = FVector2D::ZeroVector;
 	float LongPressCellWidth = 0.f;
 	int32 LongPressCharCount = 0;
+	int32 LongPressSelIndex = 0;  // current selection, advanced by step-drag (not absolute mapping)
 
 	enum class ESwipeDirection { None, Up, Down, Left, Right };
 
@@ -90,12 +92,16 @@ private:
 	ESwipeDirection ActiveSwipeDir = ESwipeDirection::None;
 	FVector2D PressStartPos = FVector2D::ZeroVector;
 	double PressStartTime = 0.0;
+	TSharedPtr<FActiveTimerHandle> LongPressTimer;
 
-	static constexpr float LongPressThreshold = 0.7f;
+	static constexpr float LongPressThreshold = 0.5f;
 
 	void HandlePress(const FGeometry& MyGeometry, const FVector2D& ScreenPos);
 	void HandleRelease(const FGeometry& MyGeometry, const FVector2D& ScreenPos);
 	void HandleMove(const FGeometry& MyGeometry, const FVector2D& ScreenPos);
+	// Fire the long-press popup (finger near start, key has LongPressChars). Called by both
+	// the auto timer (finger held still) and HandleMove. Returns true if it triggered.
+	bool TryTriggerLongPress(const FGeometry& Geometry, const FVector2D& ScreenPos);
 
 	void FireInput(const FString& InputValue);
 	void FireAction(EVirtualKeyAction Action);

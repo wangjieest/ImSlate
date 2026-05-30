@@ -54,7 +54,10 @@ void SImSlateKey::UpdateKeyDef(const FVirtualKeyDef* InKeyDef)
 
 void SImSlateKey::SetLongPressPopupInfo(float PopupCenterAbsX, float InCellWidth, int32 InCharCount)
 {
-	LongPressAnchorPos.X = PopupCenterAbsX;
+	// NOTE: do NOT override LongPressAnchorPos here. Step-drag selection uses the finger's
+	// own trigger position (set in TryTriggerLongPress) as the anchor, like Space/Del. Using
+	// the popup center instead broke right-side keys: the popup gets clamped left of the
+	// finger, so XOffset started positive and left-drag jumped rightward.
 	LongPressCellWidth = InCellWidth;
 	LongPressCharCount = InCharCount;
 }
@@ -201,6 +204,15 @@ FReply SImSlateKey::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointe
 	return FReply::Unhandled();
 }
 
+// On rapid repeated taps Slate routes the 2nd press as a double-click instead of a
+// regular down. Without this override that press would fall through to the keyboard
+// (which swallows double-clicks) and its paired up would arrive with bIsPressed=false
+// and be dropped — losing every other tap. Treat a double-click as a normal press.
+FReply SImSlateKey::OnMouseButtonDoubleClick(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	return OnMouseButtonDown(MyGeometry, MouseEvent);
+}
+
 FReply SImSlateKey::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton && HasMouseCapture())
@@ -254,10 +266,36 @@ void SImSlateKey::HandlePress(const FGeometry& MyGeometry, const FVector2D& Scre
 	LastCursorZone = 0;
 	PressStartPos = ScreenPos;
 	PressStartTime = FPlatformTime::Seconds();
+
+	// Auto long-press: fire the popup after LongPressThreshold even if the finger never moves
+	// (HandleMove only runs on movement, so a still hold would otherwise never trigger).
+	if (KeyDef && KeyDef->LongPressChars.Num() > 0)
+	{
+		LongPressTimer = RegisterActiveTimer(LongPressThreshold,
+			FWidgetActiveTimerDelegate::CreateLambda([this](double, float) -> EActiveTimerReturnType {
+				LongPressTimer.Reset();
+				if (bIsPressed)
+					TryTriggerLongPress(GetCachedGeometry(), PressStartPos);  // finger still at start
+				return EActiveTimerReturnType::Stop;
+			}));
+	}
+}
+
+bool SImSlateKey::TryTriggerLongPress(const FGeometry& Geometry, const FVector2D& ScreenPos)
+{
+	if (bLongPressHandled || bSwipeVisualShown || !KeyDef || KeyDef->LongPressChars.Num() == 0)
+		return false;
+	bLongPressHandled = true;
+	LongPressAnchorPos = ScreenPos;
+	LongPressSelIndex = KeyDef->LongPressChars.Num() / 2;  // start at the middle entry
+	OnLongPress.ExecuteIfBound(*KeyDef, Geometry);
+	return true;
 }
 
 void SImSlateKey::HandleRelease(const FGeometry& MyGeometry, const FVector2D& ScreenPos)
 {
+	if (LongPressTimer.IsValid()) { UnRegisterActiveTimer(LongPressTimer.ToSharedRef()); LongPressTimer.Reset(); }
+
 	if (!bIsPressed || !KeyDef)
 	{
 		bIsPressed = false;
@@ -321,11 +359,8 @@ void SImSlateKey::HandleRelease(const FGeometry& MyGeometry, const FVector2D& Sc
 	{
 		if (LongPressCharCount > 0)
 		{
-			float XOffset = ScreenPos.X - LongPressAnchorPos.X;
-			float CellW = LongPressCellWidth > 0.f ? LongPressCellWidth : 44.f * GetImSlateEffectiveScale();
-			int32 HalfCount = LongPressCharCount / 2;
-			int32 Index = FMath::Clamp(FMath::RoundToInt(XOffset / CellW) + HalfCount, 0, LongPressCharCount - 1);
-			OnLongPressEnd.ExecuteIfBound(Index);
+			// Use the step-drag accumulated selection (matches the highlight shown during move).
+			OnLongPressEnd.ExecuteIfBound(LongPressSelIndex);
 		}
 		return;
 	}
@@ -356,14 +391,14 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 		OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry);
 	}
 
-	// Long-press check (finger near start, for keys with LongPressChars)
-	if (!bLongPressHandled && KeyDef->LongPressChars.Num() > 0 && Delta.Size() < SwipeThreshold
+	// Long-press check (finger near start, for keys with LongPressChars).
+	// The auto timer started in HandlePress is the primary trigger; this is the fallback when
+	// the finger is moving slightly. Skip if a swipe popup is already active (sliding back must
+	// not flip swipe → long-press).
+	if (!bLongPressHandled && !bSwipeVisualShown && KeyDef->LongPressChars.Num() > 0 && Delta.Size() < SwipeThreshold
 		&& FPlatformTime::Seconds() - PressStartTime >= LongPressThreshold)
 	{
-		bLongPressHandled = true;
-		LongPressAnchorPos = ScreenPos;
-		if (bSwipeVisualShown) { OnReleaseVisual.ExecuteIfBound(); bSwipeVisualShown = false; }
-		OnLongPress.ExecuteIfBound(*KeyDef, MyGeometry);
+		TryTriggerLongPress(MyGeometry, ScreenPos);
 	}
 
 	// Swipe popup trigger: finger moved past the key bounds → show four-way visual
@@ -400,10 +435,14 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 		}
 		else if (LongPressCharCount > 0)
 		{
-			float CellW = LongPressCellWidth > 0.f ? LongPressCellWidth : 44.f * GetImSlateEffectiveScale();
-			int32 HalfCount = LongPressCharCount / 2;
-			int32 Index = FMath::Clamp(FMath::RoundToInt(XOffset / CellW) + HalfCount, 0, LongPressCharCount - 1);
-			OnLongPressMove.ExecuteIfBound(Index);
+			// Step-drag selection (like Space/Del): every StepW of movement advances the
+			// selection by one, accumulating — so a small finger motion scans many entries.
+			// NOT an absolute finger-position mapping.
+			int32 OldIndex = LongPressSelIndex;
+			while (XOffset > StepW)  { LongPressSelIndex = FMath::Min(LongPressSelIndex + 1, LongPressCharCount - 1); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
+			while (XOffset < -StepW) { LongPressSelIndex = FMath::Max(LongPressSelIndex - 1, 0);                      LongPressAnchorPos.X -= StepW; XOffset += StepW; }
+			if (LongPressSelIndex != OldIndex)
+				OnLongPressMove.ExecuteIfBound(LongPressSelIndex);
 		}
 		return;
 	}
@@ -479,20 +518,28 @@ void SImSlateKeyPopup::Construct(const FArguments& InArgs)
 	for (int32 i = 0; i < Chars.Num(); ++i)
 	{
 		TSharedPtr<SBorder> CellBorder;
+		// Each cell is forced to a fixed width (CellWidth) so the on-screen layout matches
+		// the index-mapping math in SImSlateKey::HandleMove (which steps by CellWidth).
+		// Previously cells were AutoWidth → actual width ≠ CellWidth → highlight drifted
+		// from the finger position.
 		Row->AddSlot()
 		.AutoWidth()
 		.Padding(1.f)
 		[
-			SAssignNew(CellBorder, SBorder)
-			.BorderImage(&GetKeyBrush(false))
-			.HAlign(HAlign_Center)
-			.VAlign(VAlign_Center)
-			.Padding(FMargin(4.f * Scale, 2.f * Scale))
+			SNew(SBox)
+			.WidthOverride(CellWidth)
 			[
-				SNew(STextBlock)
-				.Text(FText::FromString(Chars[i]))
-				.Font(GetImSlateDefaultFont(16))
-				.ColorAndOpacity(FLinearColor::White)
+				SAssignNew(CellBorder, SBorder)
+				.BorderImage(&GetKeyBrush(false))
+				.HAlign(HAlign_Center)
+				.VAlign(VAlign_Center)
+				.Padding(FMargin(0.f, 2.f * Scale))
+				[
+					SNew(STextBlock)
+					.Text(FText::FromString(Chars[i]))
+					.Font(GetImSlateDefaultFont(16))
+					.ColorAndOpacity(FLinearColor::White)
+				]
 			]
 		];
 		CellBorders.Add(CellBorder);

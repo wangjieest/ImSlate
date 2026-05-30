@@ -1045,7 +1045,12 @@ void SImSlateVirtualKeyboard::OnKeyLongPress(const FVirtualKeyDef& KeyDef, const
 	float KeyCenterX = KeyLocalPos.X + KeyLocalSize.X * 0.5f;
 	float PopupX = KeyCenterX - PopupWidth * 0.5f;
 	PopupX = FMath::Clamp(PopupX, 0.f, FMath::Max(0.f, MySize.X - PopupWidth));
-	float PopupY = KeyLocalPos.Y - 50.f;
+	// Place the popup fully ABOVE the key: offset by the popup's own height + a gap,
+	// not a fixed 50 (which left the popup overlapping the key row).
+	float PopupHeight = ActivePopup->GetDesiredSize().Y;
+	if (PopupHeight <= 0.f)
+		PopupHeight = 48.f * GetImSlateEffectiveScale();  // fallback before first layout
+	float PopupY = KeyLocalPos.Y - PopupHeight - 6.f;
 	PopupY = FMath::Max(0.f, PopupY);
 
 	RootOverlay->AddSlot()
@@ -1056,18 +1061,24 @@ void SImSlateVirtualKeyboard::OnKeyLongPress(const FVirtualKeyDef& KeyDef, const
 		ActivePopup.ToSharedRef()
 	];
 
-	int32 DefaultIdx = KeyDef.LongPressChars.Find(KeyDef.Value);
-	ActivePopup->SetHighlightIndex(DefaultIdx >= 0 ? DefaultIdx : KeyDef.LongPressChars.Num() / 2);
+	// Default selection is the MIDDLE entry — matches the finger-at-center index that
+	// HandleRelease computes (round(0/CellW)+HalfCount = Count/2) when released without moving.
+	ActivePopup->SetHighlightIndex(KeyDef.LongPressChars.Num() / 2);
 
-	// Tell the key where the popup center is so it can compute correct indices
+	// Tell the key where the popup center is so it can compute correct indices.
+	// IMPORTANT: the key compares against ScreenPos (ABSOLUTE screen space), so BOTH the
+	// anchor X and the cell width must be in absolute space. PopupX/CellW are local (unscaled),
+	// so multiply by DPIScale. Previously CellW was passed unscaled → XOffset(abs)/CellW(local)
+	// mismatched by the DPI factor → the selection jumped multiple cells per cell of movement.
 	FVector2D MyAbsPos = GetCachedGeometry().GetAbsolutePosition();
 	float DPIScale = GetCachedGeometry().GetAccumulatedLayoutTransform().GetScale();
 	float PopupCenterAbsX = MyAbsPos.X + (PopupX + PopupWidth * 0.5f) * DPIScale;
+	float CellWAbs = CellW * DPIScale;
 	for (auto& Entry : KeyWidgets)
 	{
 		if (Entry.Def == &KeyDef && Entry.Widget.IsValid())
 		{
-			Entry.Widget->SetLongPressPopupInfo(PopupCenterAbsX, CellW, KeyDef.LongPressChars.Num());
+			Entry.Widget->SetLongPressPopupInfo(PopupCenterAbsX, CellWAbs, KeyDef.LongPressChars.Num());
 			ActiveLongPressKey = Entry.Widget;
 			break;
 		}
@@ -1115,7 +1126,12 @@ void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, con
 		FVector2D KeyLocalPos = GetCachedGeometry().AbsoluteToLocal(KeyGeometry.GetAbsolutePosition());
 		FVector2D KeyLocalSize = KeyGeometry.GetLocalSize();
 		FVector2D MySize = GetCachedGeometry().GetLocalSize();
-		float PopupWidth = FMath::Min(KeyLocalSize.X * 1.2f, 200.f);
+		// Width must fit the actual text (left + separator + right + paddings), not just scale
+		// off the key width — a narrow key (e.g. Del) was clipping "◀ Del | Undo ▶".
+		TSharedRef<FSlateFontMeasure> FM = FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
+		float TextW = (float)FM->Measure(LeftLabel, Font).X + (float)FM->Measure(RightLabel, Font).X;
+		float SepAndPad = (float)FM->Measure(TEXT("\x2502"), Font).X + 16.f * Scale /*sep slot padding*/ + 20.f * Scale /*border padding*/;
+		float PopupWidth = FMath::Max(KeyLocalSize.X * 1.2f, TextW + SepAndPad);
 		float PopupX = KeyLocalPos.X + KeyLocalSize.X * 0.5f - PopupWidth * 0.5f;
 		PopupX = FMath::Clamp(PopupX, 0.f, FMath::Max(0.f, MySize.X - PopupWidth));
 		float PopupY = KeyLocalPos.Y - 32.f;
@@ -1154,58 +1170,116 @@ void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, con
 	ActiveKeyDef = &KeyDef;
 
 	float Scale = GetImSlateEffectiveScale();
-	float CellSize = FMath::Min(KeyGeometry.GetLocalSize().X, KeyGeometry.GetLocalSize().Y);
-	FSlateFontInfo Font = GetImSlateDefaultFont(14);
+	FSlateFontInfo Font = GetImSlateDefaultFont(12);  // slightly smaller than before (was 14) to fit cells snugly
 	FLinearColor HintColor(0.9f, 0.9f, 0.9f, 1.f);
-
-	TSharedRef<SOverlay> Grid = SNew(SOverlay);
-	SwipeDirectionTexts.Reset();
-
-	auto AddCell = [&](const FString& Text, EHorizontalAlignment HAlign, EVerticalAlignment VAlign, const FString& DirKey = FString()) {
-		if (Text.IsEmpty()) return;
-		TSharedPtr<STextBlock> Tb;
-		Grid->AddSlot()
-		.HAlign(HAlign)
-		.VAlign(VAlign)
-		.Padding(FMargin(4.f * Scale))
-		[
-			SAssignNew(Tb, STextBlock)
-			.Text(FText::FromString(Text))
-			.Font(Font)
-			.ColorAndOpacity(HintColor)
-		];
-		if (!DirKey.IsEmpty())
-			SwipeDirectionTexts.Add(DirKey, Tb);
-	};
 
 	auto ApplyCase = [this](const FString& S) -> FString {
 		if (S.Len() == 1 && FChar::IsAlpha(S[0]))
 			return IsUpperCase() ? S.ToUpper() : S.ToLower();
 		return S;
 	};
-	AddCell(ApplyCase(KeyDef.Swipe.Up.Label), HAlign_Center, VAlign_Top, TEXT("U"));
-	AddCell(ApplyCase(KeyDef.Swipe.Down.Label), HAlign_Center, VAlign_Bottom, TEXT("D"));
-	AddCell(ApplyCase(KeyDef.Swipe.Left.Label), HAlign_Left, VAlign_Center, TEXT("L"));
-	AddCell(ApplyCase(KeyDef.Swipe.Right.Label), HAlign_Right, VAlign_Center, TEXT("R"));
-	AddCell(KeyDef.Value.IsEmpty() ? KeyDef.GetDisplayLabel(IsUpperCase()) : KeyDef.Value, HAlign_Center, VAlign_Center, TEXT("C"));
 
-	float GridSize = CellSize * 3.f;
-	SwipeVisual = SNew(SBox)
-		.WidthOverride(GridSize)
-		.HeightOverride(GridSize)
-		[
-			SNew(SBorder)
-			.BorderImage(&GetPopupBgBrush())
-			.Padding(2.f * Scale)
-			[ Grid ]
-		];
+	const FString UpText    = ApplyCase(KeyDef.Swipe.Up.Label);
+	const FString DownText  = ApplyCase(KeyDef.Swipe.Down.Label);
+	const FString LeftText  = ApplyCase(KeyDef.Swipe.Left.Label);
+	const FString RightText = ApplyCase(KeyDef.Swipe.Right.Label);
+	const FString CenterText = KeyDef.Value.IsEmpty() ? KeyDef.GetDisplayLabel(IsUpperCase()) : KeyDef.Value;
+
+	// UNIFIED RULE: build the popup as rows × columns, omitting any empty row/column so the
+	// popup hugs exactly the cells that exist. CellSize is a font-based square constant
+	// (independent of key geometry). Each cell has a uniform minimum size, widened only if
+	// its own text is longer (so e.g. "Done"/"Esc" are never clipped). No empty thirds, no
+	// empty rows: up-only-and-center → 2 rows; full four-way → 3 rows × 3 cols.
+	TSharedRef<FSlateFontMeasure> FM = FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
+	const float GlyphH = (float)FM->GetMaxCharacterHeight(Font);
+	const float CellSize = GlyphH + 10.f * Scale;     // uniform square minimum
+	const float CellPadX = 12.f * Scale;              // horizontal breathing room for wide labels
+
+	const bool bHasUp    = !UpText.IsEmpty();
+	const bool bHasDown  = !DownText.IsEmpty();
+	const bool bHasLeft  = !LeftText.IsEmpty();
+	const bool bHasRight = !RightText.IsEmpty();
+
+	SwipeDirectionTexts.Reset();
+
+	// A single cell: fixed height, width = max(CellSize, text + padding) so it never clips.
+	auto MakeCell = [&](const FString& Text, const FString& DirKey) -> TSharedRef<SWidget> {
+		float W = FMath::Max(CellSize, (float)FM->Measure(Text, Font).X + CellPadX);
+		TSharedPtr<STextBlock> Tb;
+		TSharedRef<SBox> Box = SNew(SBox)
+			.WidthOverride(W)
+			.HeightOverride(CellSize)
+			.HAlign(HAlign_Center)
+			.VAlign(VAlign_Center)
+			[
+				SAssignNew(Tb, STextBlock)
+				.Text(FText::FromString(Text))
+				.Font(Font)
+				.ColorAndOpacity(HintColor)
+				.Justification(ETextJustify::Center)
+			];
+		if (!DirKey.IsEmpty())
+			SwipeDirectionTexts.Add(DirKey, Tb);
+		return Box;
+	};
+	// An empty placeholder cell (keeps a column aligned when only one side exists).
+	auto MakeSpacer = [&]() -> TSharedRef<SWidget> {
+		return SNew(SBox).WidthOverride(CellSize).HeightOverride(CellSize);
+	};
+
+	TSharedRef<SVerticalBox> Rows = SNew(SVerticalBox);
+
+	// Up row (only if Up exists) — centered over the middle column.
+	if (bHasUp)
+	{
+		Rows->AddSlot().AutoHeight().HAlign(HAlign_Center)
+		[ MakeCell(UpText, TEXT("U")) ];
+	}
+
+	// Middle row: [Left] Center [Right]. Spacers keep Center centered when one side is empty.
+	{
+		TSharedRef<SHorizontalBox> Mid = SNew(SHorizontalBox);
+		if (bHasLeft || bHasRight)
+			Mid->AddSlot().AutoWidth()[ bHasLeft ? MakeCell(LeftText, TEXT("L")) : MakeSpacer() ];
+		Mid->AddSlot().AutoWidth()[ MakeCell(CenterText, TEXT("C")) ];
+		if (bHasLeft || bHasRight)
+			Mid->AddSlot().AutoWidth()[ bHasRight ? MakeCell(RightText, TEXT("R")) : MakeSpacer() ];
+		Rows->AddSlot().AutoHeight().HAlign(HAlign_Center)[ Mid ];
+	}
+
+	// Down row (only if Down exists).
+	if (bHasDown)
+	{
+		Rows->AddSlot().AutoHeight().HAlign(HAlign_Center)
+		[ MakeCell(DownText, TEXT("D")) ];
+	}
+
+	TSharedRef<SWidget> Grid = Rows;
+	// Popup auto-sizes to its content (SBorder wraps the rows); compute extents for placement.
+	const int32 NumRows = 1 + (bHasUp ? 1 : 0) + (bHasDown ? 1 : 0);
+	const int32 NumCols = (bHasLeft || bHasRight) ? 3 : 1;
+	const float GridH = CellSize * NumRows;
+	// Popup auto-sizes to its rows (no forced override), so a wide Center label (e.g. "Done")
+	// is fully contained. Border padding adds to the size.
+	const float BorderPad = 2.f * Scale;
+	SwipeVisual = SNew(SBorder)
+		.BorderImage(&GetPopupBgBrush())
+		.Padding(BorderPad)
+		[ Grid ];
+
+	// Estimate popup extents for placement (rows/cols * cell + border). Center column may be
+	// wider than CellSize for long labels, so use the measured center width as a floor.
+	float CenterW = FMath::Max(CellSize, (float)FM->Measure(CenterText, Font).X + CellPadX);
+	float ContentW = (NumCols == 3) ? (CellSize * 2.f + CenterW) : CenterW;
+	float PopupW = ContentW + BorderPad * 2.f;
+	float PopupH = GridH + BorderPad * 2.f;
 
 	FVector2D KeyLocalPos = GetCachedGeometry().AbsoluteToLocal(KeyGeometry.GetAbsolutePosition());
 	FVector2D KeyLocalSize = KeyGeometry.GetLocalSize();
 	FVector2D MySize = GetCachedGeometry().GetLocalSize();
-	float PopupX = KeyLocalPos.X + KeyLocalSize.X * 0.5f - GridSize * 0.5f;
-	PopupX = FMath::Clamp(PopupX, 0.f, FMath::Max(0.f, MySize.X - GridSize));
-	float PopupY = KeyLocalPos.Y - GridSize - 4.f;
+	float PopupX = KeyLocalPos.X + KeyLocalSize.X * 0.5f - PopupW * 0.5f;
+	PopupX = FMath::Clamp(PopupX, 0.f, FMath::Max(0.f, MySize.X - PopupW));
+	float PopupY = KeyLocalPos.Y - PopupH - 4.f;
 	PopupY = FMath::Max(0.f, PopupY);
 
 	RootOverlay->AddSlot()
