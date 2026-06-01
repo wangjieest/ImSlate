@@ -8,16 +8,101 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "HAL/IConsoleManager.h"
+#include "Framework/Application/IInputProcessor.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Misc/CoreDelegates.h"
 
 #if GMP_EXTEND_CONSOLE
+
+// Resolve the current game world (PIE or standalone). Used by both the console command path and the
+// hotkey path so they toggle the SAME panel instance.
+static UWorld* GetXConsoleGameWorld()
+{
+	if (!GEngine)
+		return nullptr;
+	// Prefer the active play world (PIE/standalone); GWorld is correct under the InputProcessor too.
+	if (UWorld* Play = GEngine->GetCurrentPlayWorld())
+		return Play;
+	if (GWorld && GWorld->IsGameWorld())
+		return GWorld;
+	return nullptr;
+}
+
+static void ToggleXConsolePanel(TOptional<bool> bOpen, UWorld* InWorld)
+{
+	if (InWorld)
+		UGenericSingletons::GetSingleton<UImXConsolePanel>(InWorld)->EnableTick(bOpen);
+}
 
 static FXConsoleCommandLambdaFull XVar_ImSlateXConsole(
 	TEXT("imslate.XConsole"),
 	TEXT("Toggle ImSlate XConsole Panel"),
 	[](TOptional<bool> bOpen, UWorld* InWorld, FOutputDevice& Ar) {
-		if (InWorld)
-			UGenericSingletons::GetSingleton<UImXConsolePanel>(InWorld)->EnableTick(bOpen);
+		ToggleXConsolePanel(bOpen, InWorld);
 	});
+
+//////////////////////////////////////////////////////////////////////////
+// Desktop hotkey: Right Ctrl toggles the panel (game/PIE runtime only)
+//////////////////////////////////////////////////////////////////////////
+#if PLATFORM_DESKTOP
+
+static bool GImSlateXConsoleHotkey = true;
+static FAutoConsoleVariableRef CVar_ImSlateXConsoleHotkey(
+	TEXT("imslate.XConsoleHotkey"),
+	GImSlateXConsoleHotkey,
+	TEXT("Enable Right-Ctrl hotkey to toggle the ImSlate XConsole panel on desktop (game/PIE only)."));
+
+// A Slate-global input pre-processor so the hotkey works regardless of which widget/PlayerController
+// has focus. Toggles only when a game world is active (so it never fires in the editor at rest), and
+// returns Unhandled so Right-Ctrl still passes through to the game and other listeners.
+class FImXConsoleHotkeyProcessor : public IInputProcessor
+{
+public:
+	virtual void Tick(const float, FSlateApplication&, TSharedRef<ICursor>) override {}
+
+	virtual bool HandleKeyDownEvent(FSlateApplication&, const FKeyEvent& InKeyEvent) override
+	{
+		if (GImSlateXConsoleHotkey
+			&& InKeyEvent.GetKey() == EKeys::RightControl
+			&& !InKeyEvent.IsRepeat())
+		{
+			if (UWorld* World = GetXConsoleGameWorld())
+				ToggleXConsolePanel(TOptional<bool>(), World);  // no arg = flip current state
+		}
+		return false;  // don't swallow — let Right-Ctrl pass through
+	}
+};
+
+static TSharedPtr<FImXConsoleHotkeyProcessor> GImXConsoleHotkeyProcessor;
+
+// Register/unregister the processor with Slate. Registered lazily the first time the module/world
+// is up (see the static initializer below) and torn down on Slate shutdown.
+struct FImXConsoleHotkeyRegistrar
+{
+	static void RegisterNow()
+	{
+		if (FSlateApplication::IsInitialized() && !GImXConsoleHotkeyProcessor.IsValid())
+		{
+			GImXConsoleHotkeyProcessor = MakeShared<FImXConsoleHotkeyProcessor>();
+			FSlateApplication::Get().RegisterInputPreProcessor(GImXConsoleHotkeyProcessor);
+		}
+	}
+
+	FImXConsoleHotkeyRegistrar()
+	{
+		// Slate already up (module loaded late) → register now; otherwise wait for PostEngineInit.
+		RegisterNow();
+		FCoreDelegates::OnPostEngineInit.AddLambda([] { RegisterNow(); });
+		FCoreDelegates::OnEnginePreExit.AddLambda([] {
+			if (FSlateApplication::IsInitialized() && GImXConsoleHotkeyProcessor.IsValid())
+				FSlateApplication::Get().UnregisterInputPreProcessor(GImXConsoleHotkeyProcessor);
+			GImXConsoleHotkeyProcessor.Reset();
+		});
+	}
+};
+static FImXConsoleHotkeyRegistrar GImXConsoleHotkeyRegistrar;
+
+#endif  // PLATFORM_DESKTOP
 
 //////////////////////////////////////////////////////////////////////////
 // Lifecycle

@@ -34,11 +34,34 @@ static FAutoConsoleVariableRef CVar_ForceVirtualKeyboard(
 // divides the physical density by ContentScaleFactor (r.MobileContentScaleFactor, e.g. 2.68 on
 // iPhone 17), so the effective scale lands ~1.8 and the on-screen keys feel too small. Rather
 // than inflate ALL panels globally, the keyboard gets its own extra multiplier on top.
-float GImSlateKeyboardScale = 1.5f;
+//
+// Default is MOBILE-ONLY: on desktop the keys are already plenty large (effective scale already
+// carries the monitor DPI, which on a high-PPI editor monitor can be 2.0~2.7), so the extra ×1.5
+// just makes the keyboard balloon to near full-screen. Desktop defaults to 1.0; mobile keeps the
+// 1.5 compensation. The CVar still overrides on either platform.
+float GImSlateKeyboardScale = (PLATFORM_ANDROID || PLATFORM_IOS) ? 1.5f : 1.0f;
 static FAutoConsoleVariableRef CVar_ImSlateKeyboardScale(
 	TEXT("imslate.KeyboardScale"),
 	GImSlateKeyboardScale,
-	TEXT("Extra size multiplier for the virtual keyboard only (on top of imslate.LayoutScale). 1.0 = same as panels."));
+	TEXT("Extra size multiplier for the virtual keyboard only (on top of imslate.LayoutScale). 1.0 = same as panels. Default: mobile 1.5, desktop 1.0."));
+
+// ---- Plan A: keyboard height cap ----
+// The keyboard fills the whole viewport, so its cached local height == viewport height. We cache
+// it (updated each Tick) plus the keyboard's per-unit-scale logical height (= measured content
+// height / the scale it was measured at). GetKbScale() then clamps the scale down so the keyboard
+// never exceeds GKeyboardMaxHeightFraction of the viewport. This SHRINKS the keys to fit (no
+// clipping), unlike an SBox MaxDesiredHeight which would just crop the bottom rows off.
+static float GCachedViewportHeight = 0.f;          // logical px (== keyboard's cached local Y)
+static float GCachedKeyboardUnitHeight = 0.f;      // content height at scale=1 (content / scale)
+
+// Hard cap on the WHOLE keyboard (preview + keys) as a fraction of the available viewport height.
+// On a large/high-DPI screen (e.g. editor at full size) the DPI-driven scale can balloon the
+// keyboard to nearly full-screen; this clamps it so it never eats more than this fraction.
+float GKeyboardMaxHeightFraction = 0.5f;
+static FAutoConsoleVariableRef CVar_KeyboardMaxHeightFraction(
+	TEXT("imslate.KeyboardMaxHeightFraction"),
+	GKeyboardMaxHeightFraction,
+	TEXT("Max keyboard height as a fraction of the viewport height (0.5 = half-screen). 0 disables the cap."));
 
 // Keyboard-local scale: panel effective scale × keyboard multiplier. ALL keyboard sizing
 // (keys, spacing, popups, height caps) AND the key widgets' ComputeDesiredSize / gesture
@@ -46,7 +69,18 @@ static FAutoConsoleVariableRef CVar_ImSlateKeyboardScale(
 // ImSlateFactory.h as GetImSlateKeyboardScale; GetKbScale is the file-local short alias.
 static float GetKbScale()
 {
-	return GetImSlateEffectiveScale() * FMath::Max(GImSlateKeyboardScale, 0.1f);
+	float Scale = GetImSlateEffectiveScale() * FMath::Max(GImSlateKeyboardScale, 0.1f);
+
+	// Cap the keyboard to a fraction of the viewport height by clamping the scale. We need both the
+	// viewport height and the keyboard's natural per-unit-scale height; both are measured at runtime
+	// (see Tick). Until measured, no cap is applied.
+	if (GKeyboardMaxHeightFraction > 0.f && GCachedViewportHeight > 0.f && GCachedKeyboardUnitHeight > 0.f)
+	{
+		const float MaxH = GCachedViewportHeight * GKeyboardMaxHeightFraction;
+		const float MaxScale = MaxH / GCachedKeyboardUnitHeight;
+		Scale = FMath::Min(Scale, MaxScale);
+	}
+	return FMath::Max(Scale, 0.1f);
 }
 
 // Exported alias (declared in ImSlateFactory.h) so the key widgets in ImVirtualKey.cpp can use the
@@ -638,6 +672,19 @@ void SImSlateVirtualKeyboard::Tick(const FGeometry& AllottedGeometry, const doub
 		BuiltLayoutMode = DesiredMode;
 		BuiltWidth = Width;
 		BuildKeyboard();
+	}
+
+	// Plan A height-cap inputs (see GetKbScale): the keyboard fills the viewport, so AllottedGeometry
+	// Y == viewport height. The per-unit-scale content height = current content desired height /
+	// current keyboard scale; dividing out the scale makes it scale-independent, so feeding it back
+	// into GetKbScale's clamp converges (the keys are linear in scale).
+	GCachedViewportHeight = AllottedGeometry.GetLocalSize().Y;
+	if (PreviewKeysRoot.IsValid())
+	{
+		const float ContentH = PreviewKeysRoot->GetDesiredSize().Y;
+		const float CurScale = FMath::Max(GetImSlateKeyboardScale(), 0.1f);
+		if (ContentH > 0.f)
+			GCachedKeyboardUnitHeight = ContentH / CurScale;
 	}
 }
 
