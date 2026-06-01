@@ -106,6 +106,11 @@ public:
 	void SetScrollTarget(FVector2D In);
 	void CheckCloseButton(bool* bIn);
 
+	// Maximize / restore: fill the whole viewport, then restore the saved pos/size. While
+	// maximized, moving and resizing are disabled (NoMove/NoResize forced on; restored on exit).
+	void ToggleMaximize();
+	bool IsMaximized() const { return bMaximized; }
+
 	SImViewportGame* IsAreaInGameViewport() const;
 	bool IsViewportGame() const;
 
@@ -207,6 +212,16 @@ protected:
 	const FMargin PanelMargin{2.f, 2.f, 2.f, 2.f};
 	bool bShowResizeHandle = false;
 	bool bShowDockingCross = false;
+
+	// Maximize state. While maximized the window fills the viewport; SavedPos/SavedSize hold the
+	// pre-maximize geometry to restore, and SavedFlags holds the move/resize flag bits we forced.
+	bool bMaximized = false;
+	FVector2D SavedPos = FVector2D::ZeroVector;
+	FVector2D SavedSize = FVector2D::ZeroVector;
+	bool bSavedShowResizeHandle = false;  // bShowResizeHandle before maximize, to restore exactly
+	bool bSavedNoMove = false;            // whether NoMove was already set before maximize
+	bool bSavedNoResize = false;          // whether NoResize was already set before maximize
+	bool bWasInHostBeforeMaximize = false;// popped into a host SWindow before maximize → restore there
 
 	TAttribute<FVector2D> ContentScale;
 	TAttribute<FLinearColor> ColorAndOpacity;

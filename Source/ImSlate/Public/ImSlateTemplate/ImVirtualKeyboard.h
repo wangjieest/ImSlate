@@ -107,11 +107,23 @@ public:
 	virtual FReply OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
 	virtual FReply OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
 	virtual FReply OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
+
+	// Physical keyboard support: the keyboard ROOT takes Slate user focus while shown (set in
+	// Tick on the first frame after Show, so the widget is in the tree). Physical key events
+	// are routed here and reuse the exact same OnKeyInput/OnKeyAction logic as the on-screen
+	// keys, so the preview + bound editable + suggestions stay in sync. The root is a
+	// SCompoundWidget (not SEditableText), so holding focus never pops the OS keyboard on mobile.
+	virtual bool SupportsKeyboardFocus() const override { return bVisible; }
+	virtual FReply OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
+	virtual FReply OnKeyUp(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
+	virtual FReply OnKeyChar(const FGeometry& MyGeometry, const FCharacterEvent& InCharacterEvent) override;
 	void Show(const FVirtualKeyboardShowParams& Params);
 	void Hide(bool bCommit);
 	bool IsShowing() const { return bVisible; }
 	void UpdateSuggestionsAsync(TArray<FString> InResults);
-	void SyncFromEditor(const FString& Text);
+	// Sync text AND caret from the bound editable (physical-keyboard input). CaretPos < 0 means
+	// "unknown" → keep clamped old position; otherwise move the preview caret to it.
+	void SyncFromEditor(const FString& Text, int32 CaretPos = -1);
 
 	// Lifecycle binding: keyboard belongs to the widget that called Show().
 	// When that widget is destroyed, the keyboard auto-hides.
@@ -119,7 +131,9 @@ public:
 	void NotifyOwnerDestroyed(const class SWidget* Widget);
 
 	static TSharedPtr<SImSlateVirtualKeyboard> Get();
-	static bool ShouldUseVirtualKeyboard();
+	// Returns true only when the focused edit lives inside the game viewport (overlay, no OS window/IME).
+	// Floated-out windows (host viewport = real SWindow) use the OS keyboard instead.
+	static bool ShouldUseVirtualKeyboard(const class SWidget* InWidget = nullptr);
 
 private:
 	enum class EKeyboardType { QWERTY, T9 };
@@ -127,6 +141,7 @@ private:
 	enum class EShiftState : uint8 { Default, SingleShot, Locked };
 
 	bool bVisible = false;
+	bool bPendingFocus = false;  // Show() set this; Tick() grabs user focus on the first frame in-tree
 	bool bSuggestionCommitsAndCloses = true;  // see FVirtualKeyboardShowParams
 	TWeakPtr<class SWidget> BoundOwner;
 	EShiftState ShiftState = EShiftState::Default;
@@ -160,6 +175,12 @@ private:
 	FVector2D PreviewDragLastPos = FVector2D::ZeroVector;
 	float PreviewDragAccum = 0.f;
 	TSharedPtr<class SWrapBox> SuggestionBar;
+	// Current candidate list + keyboard-navigated selection. SelectedSuggestionIndex == -1 means no
+	// selection (Up/Down haven't been used, or input changed). Up/Down move it; Enter on a selected
+	// candidate commits THAT word instead of the typed text.
+	TArray<FString> CurrentSuggestions;
+	int32 SelectedSuggestionIndex = -1;
+	void MoveSuggestionSelection(int32 Delta);  // Down=+1 / Up=-1, clamped to [-1, Num-1], no wrap
 	TSharedPtr<class SVerticalBox> KeyboardGrid;
 	TSharedPtr<class SVerticalBox> PreviewKeysRoot;  // preview + keys unit (suggestions float above it)
 	TSharedPtr<SConstraintCanvas> KeyboardCanvas;  // main anchor-based layout (engine global type)

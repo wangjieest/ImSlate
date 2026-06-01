@@ -549,7 +549,9 @@ bool SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestion
 			}
 			bRetVal = true;
 		}
-		else if (!ItemPtr->HasAnyUserFocus().IsSet() && !ItemPtr->HasFocusedDescendants() && !SearchBox->IsMenuOpen() && InOutStr != CurrentText)
+		else if (!ItemPtr->HasAnyUserFocus().IsSet() && !ItemPtr->HasFocusedDescendants() && !SearchBox->IsMenuOpen()
+			&& !SearchBox->IsVirtualKeyboardActiveForMe()  // editing via VK: edit is source of truth, don't revert
+			&& InOutStr != CurrentText)
 		{
 			SearchBox->SetText(FText::FromString(InOutStr));
 		}
@@ -1057,14 +1059,17 @@ bool CheckBox(ImStr Label, ECheckBoxState& CheckState, const ImVec2& InSize)
 
 		Ptr->CurState = CheckState;
 
-		GS_ACCESS_PROTECT(WidgetRef, SCheckBox, OnCheckStateChanged)->OnCheckStateChanged = FOnCheckStateChanged::CreateLambda([Ptr](ECheckBoxState InState) -> void {
-			Ptr->CurState = InState;
-			UE_LOG(LogImSlate, Verbose, TEXT("Enter EditHasChanged, %d"), InState);
-			if (Ptr->bHasChanged == false)
+		// Tri-state cycle on click. SCheckBox only toggles Checked↔Unchecked on its own (InState is
+		// never Undetermined), so we ignore InState and advance our OWN tracked state through all
+		// three: Unchecked → Checked → Undetermined → Unchecked.
+		GS_ACCESS_PROTECT(WidgetRef, SCheckBox, OnCheckStateChanged)->OnCheckStateChanged = FOnCheckStateChanged::CreateLambda([Ptr](ECheckBoxState /*InState*/) -> void {
+			switch (Ptr->CurState)
 			{
-				UE_LOG(LogImSlate, Verbose, TEXT("OnCheckStateChanged EditHasChanged"));
-				Ptr->bHasChanged = true;
+				case ECheckBoxState::Unchecked:     Ptr->CurState = ECheckBoxState::Checked;       break;
+				case ECheckBoxState::Checked:       Ptr->CurState = ECheckBoxState::Undetermined;  break;
+				default:                            Ptr->CurState = ECheckBoxState::Unchecked;     break;
 			}
+			Ptr->bHasChanged = true;
 			return;
 		});
 

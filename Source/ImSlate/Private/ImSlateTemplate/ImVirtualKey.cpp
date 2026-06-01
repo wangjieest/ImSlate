@@ -65,10 +65,12 @@ void SImSlateKey::SetLongPressPopupInfo(float PopupCenterAbsX, float InCellWidth
 
 FVector2D SImSlateKey::ComputeDesiredSize(float LayoutScaleMultiplier) const
 {
-	float Scale = GetImSlateEffectiveScale();
-	// The cap must scale with DPI too. A fixed 48px cap was in *physical* pixels, so on a
-	// high-DPI screen (e.g. iOS retina) it clamped keys to a tiny size. Cap in logical px (*Scale).
-	float H = FMath::Min(32.f * Scale, 48.f * Scale); // = 32*Scale; logical cap of 48
+	// Use the KEYBOARD scale (= effective × imslate.KeyboardScale), the SAME scale the keyboard
+	// layout/spacing use. Previously this used GetImSlateEffectiveScale() (without KeyboardScale),
+	// so each key's desired size was smaller than the slot the layout reserved for it — keys looked
+	// undersized / row heights inconsistent. Now keys and their slots scale together.
+	float Scale = GetImSlateKeyboardScale();
+	float H = 32.f * Scale;  // base key height in logical px (× keyboard scale)
 	float W = H * 0.85f;
 	if (KeyDef)
 		W *= KeyDef->WidthMultiplier;

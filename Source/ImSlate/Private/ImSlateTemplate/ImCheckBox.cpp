@@ -2,6 +2,93 @@
 #include "ImSlateTemplate/ImCheckBox.h"
 
 #include "Widgets/Layout/SBox.h"
+#include "Widgets/SLeafWidget.h"
+#include "Brushes/SlateColorBrush.h"
+#include "Brushes/SlateRoundedBoxBrush.h"
+#include "Styling/CoreStyle.h"
+
+// Self-painted tri-state check mark, used instead of the default themed check images (which are
+// small/grey and make Checked vs Unchecked vs Undetermined hard to tell apart). Draws:
+//   Unchecked    → empty rounded box (grey outline)
+//   Checked      → solid blue box + white tick
+//   Undetermined → grey box + horizontal dash
+// State is read from the owning SImCheckBox via a getter.
+class SImCheckMark : public SLeafWidget
+{
+public:
+	SLATE_BEGIN_ARGS(SImCheckMark) {}
+		SLATE_ARGUMENT(TFunction<ECheckBoxState()>, StateGetter)
+	SLATE_END_ARGS()
+
+	void Construct(const FArguments& InArgs)
+	{
+		StateGetter = InArgs._StateGetter;
+		SetCanTick(false);
+	}
+
+	virtual FVector2D ComputeDesiredSize(float) const override
+	{
+		const float S = 18.f * ImSlate::GetImSlateEffectiveScale();
+		return FVector2D(S, S);
+	}
+
+	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& G, const FSlateRect& Cull,
+		FSlateWindowElementList& Out, int32 LayerId, const FWidgetStyle& InStyle, bool bParentEnabled) const override
+	{
+		const ECheckBoxState State = StateGetter ? StateGetter() : ECheckBoxState::Unchecked;
+		const FVector2D Sz = G.GetLocalSize();
+		const float Side = FMath::Min(Sz.X, Sz.Y);
+		const FVector2D TL((Sz.X - Side) * 0.5f, (Sz.Y - Side) * 0.5f);  // center the square
+		const auto PG = G.ToPaintGeometry();
+
+		// One shared box brush with a FIXED small corner radius (NOT height-based, which would round
+		// a square into a circle). All three states use this SAME outer box shape — only the fill
+		// colour and the inner glyph differ, so the outline is identical across states.
+		auto MakeBoxBrush = [](const FLinearColor& Fill, const FLinearColor& Outline, float OutlineW) {
+			FSlateRoundedBoxBrush B(Fill, Outline, OutlineW);
+			B.OutlineSettings.RoundingType = ESlateBrushRoundingType::FixedRadius;
+			B.OutlineSettings.CornerRadii = FVector4(3.f, 3.f, 3.f, 3.f);
+			return B;
+		};
+		const FLinearColor Blue(0.10f, 0.45f, 0.90f, 1.f);
+		const FLinearColor BoxGrey(0.30f, 0.30f, 0.30f, 1.f);
+		const FLinearColor OutlineGrey(0.6f, 0.6f, 0.6f, 1.f);
+		const float LineW = 2.f * ImSlate::GetImSlateEffectiveScale();
+
+		FSlateRoundedBoxBrush BoxBrush = (State == ECheckBoxState::Checked)
+			? MakeBoxBrush(Blue, OutlineGrey, 1.f)
+			: (State == ECheckBoxState::Undetermined)
+				? MakeBoxBrush(BoxGrey, OutlineGrey, 1.f)
+				: MakeBoxBrush(FLinearColor::Transparent, OutlineGrey, 1.5f);  // Unchecked: empty
+
+		auto BoxGeom = G.MakeChild(FVector2f(Side, Side), FSlateLayoutTransform(FVector2f(TL))).ToPaintGeometry();
+		FSlateDrawElement::MakeBox(Out, LayerId, BoxGeom, &BoxBrush);
+
+		// Inner glyph on top of the (identical) box.
+		if (State == ECheckBoxState::Checked)
+		{
+			// White tick.
+			const float x0 = TL.X + Side * 0.24f, y0 = TL.Y + Side * 0.52f;
+			const float x1 = TL.X + Side * 0.42f, y1 = TL.Y + Side * 0.72f;
+			const float x2 = TL.X + Side * 0.76f, y2 = TL.Y + Side * 0.30f;
+			FSlateDrawElement::MakeLines(Out, LayerId + 1, PG,
+				{FVector2D(x0, y0), FVector2D(x1, y1), FVector2D(x2, y2)},
+				ESlateDrawEffect::None, FLinearColor::White, true, LineW);
+		}
+		else if (State == ECheckBoxState::Undetermined)
+		{
+			// Horizontal dash.
+			const float y = TL.Y + Side * 0.5f;
+			FSlateDrawElement::MakeLines(Out, LayerId + 1, PG,
+				{FVector2D(TL.X + Side * 0.24f, y), FVector2D(TL.X + Side * 0.76f, y)},
+				ESlateDrawEffect::None, FLinearColor(0.9f, 0.9f, 0.9f, 1.f), true, LineW);
+		}
+		return LayerId + 2;
+	}
+
+private:
+	TFunction<ECheckBoxState()> StateGetter;
+};
 
 SImCheckBox::SImCheckBox()
 {
@@ -91,16 +178,12 @@ void SImCheckBox::BuildCheckBox(TSharedRef<SWidget> InContent)
 			.HAlign(HAlign_Center)
 			[
 				SNew(SBox)
-				.WidthOverride(Style->UncheckedImage.ImageSize.X * ImSlate::GetImSlateEffectiveScale())
-				.HeightOverride(Style->UncheckedImage.ImageSize.Y * ImSlate::GetImSlateEffectiveScale())
+				.WidthOverride(18.f * ImSlate::GetImSlateEffectiveScale())
+				.HeightOverride(18.f * ImSlate::GetImSlateEffectiveScale())
 				[
-					SNew(SImage)
-					.Image(this, &SImCheckBox::OnGetCheckImage)
-#if UE_5_00_OR_LATER
-					.ColorAndOpacity(this, &SImCheckBox::GetForegroundColor)
-#else
-					.ColorAndOpacity(this, &SImCheckBox::OnGetForegroundColor)
-#endif
+					// Self-painted tri-state mark (clearer than the default themed check images).
+					SNew(SImCheckMark)
+					.StateGetter([this]() { return IsCheckboxChecked.Get(); })
 				]
 			]
 			+ SHorizontalBox::Slot()

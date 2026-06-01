@@ -267,25 +267,52 @@ void UImXConsolePanel::DrawParamWidget(const FName& TypeName, FString& Value, bo
 	const FXConsoleObjectMeta* CmdMeta = IXConsoleManager::GetXConsoleMeta(*CmdName);
 	const FXConsoleParamMeta* PMeta = (CmdMeta && CmdMeta->Params.IsValidIndex(Index)) ? &CmdMeta->Params[Index] : nullptr;
 
-	// TOptional enable checkbox
-	if (bIsOptional)
+	// Extract inner type for TOptional<T>
+	FString InnerType = TypeStr;
+	if (TypeStr.StartsWith(TEXT("TOptional<")) && TypeStr.EndsWith(TEXT(">")))
+		InnerType = TypeStr.Mid(10, TypeStr.Len() - 11);
+
+	const bool bIsOptionalBool = bIsOptional && (InnerType == TEXT("bool"));
+
+	// TOptional enable checkbox — EXCEPT for TOptional<bool>, which uses a single tri-state
+	// checkbox below (Undetermined = unset/no-arg, Checked = true, Unchecked = false) instead
+	// of a separate enable box + value box.
+	if (bIsOptional && !bIsOptionalBool)
 	{
 		FString OptId = FString::Printf(TEXT("%s_opt%d"), *CmdName, Index);
 		ImSlate::CheckBox(FStringView(OptId), bEnabled);
 		ImSlate::SameLine();
 	}
 
-	// Extract inner type for TOptional<T>
-	FString InnerType = TypeStr;
-	if (TypeStr.StartsWith(TEXT("TOptional<")) && TypeStr.EndsWith(TEXT(">")))
-		InnerType = TypeStr.Mid(10, TypeStr.Len() - 11);
-
 	// === bool ===
 	if (InnerType == TEXT("bool"))
 	{
-		bool bVal = Value.Equals(TEXT("true"), ESearchCase::IgnoreCase) || Value == TEXT("1");
-		if (ImSlate::CheckBox(FStringView(WidgetId), bVal))
-			Value = bVal ? TEXT("true") : TEXT("false");
+		if (bIsOptionalBool)
+		{
+			// Tri-state: Undetermined → not passed (bEnabled=false); Checked/Unchecked → true/false.
+			ECheckBoxState State = !bEnabled
+				? ECheckBoxState::Undetermined
+				: ((Value.Equals(TEXT("true"), ESearchCase::IgnoreCase) || Value == TEXT("1"))
+					? ECheckBoxState::Checked : ECheckBoxState::Unchecked);
+			if (ImSlate::CheckBox(FStringView(WidgetId), State))
+			{
+				if (State == ECheckBoxState::Undetermined)
+				{
+					bEnabled = false;  // unset → ExecuteCommand passes "" (no arg)
+				}
+				else
+				{
+					bEnabled = true;
+					Value = (State == ECheckBoxState::Checked) ? TEXT("true") : TEXT("false");
+				}
+			}
+		}
+		else
+		{
+			bool bVal = Value.Equals(TEXT("true"), ESearchCase::IgnoreCase) || Value == TEXT("1");
+			if (ImSlate::CheckBox(FStringView(WidgetId), bVal))
+				Value = bVal ? TEXT("true") : TEXT("false");
+		}
 	}
 	// === float / double ===
 	else if (InnerType == TEXT("float") || InnerType == TEXT("double"))

@@ -364,6 +364,150 @@ public:
 	}
 };
 
+// Header buttons drawn with FSlateDrawElement::MakeLines (no glyph/texture), so the icon scales
+// crisply with the title bar height. Both subclass SButton to reuse its click + hover handling,
+// hide the default button background, and self-draw the icon on top. Sized square (width = title
+// height) and VAlign_Fill in the header so the icon area fills the bar vertically.
+class SImIconButton : public SButton
+{
+public:
+	// Icon lines are drawn inset by this fraction of the smaller side, leaving a margin.
+	static constexpr float kInsetFrac = 0.30f;
+
+	SLATE_BEGIN_ARGS(SImIconButton) {}
+		SLATE_EVENT(FOnClicked, OnClicked)
+	SLATE_END_ARGS()
+
+	void Construct(const FArguments& InArgs)
+	{
+		SButton::Construct(SButton::FArguments()
+			.ButtonStyle(&NoBgStyle())
+			.ContentPadding(FMargin(0.f))
+			.HAlign(HAlign_Fill)
+			.VAlign(VAlign_Fill)
+			.OnClicked(InArgs._OnClicked));
+	}
+
+	// A button style with no visible background in any state (we draw the icon ourselves; hover is
+	// indicated by a faint overlay we paint, not by the style).
+	static const FButtonStyle& NoBgStyle()
+	{
+		static FButtonStyle Style = []() {
+			FButtonStyle S = FCoreStyle::Get().GetWidgetStyle<FButtonStyle>("Button");
+			FSlateColorBrush Transparent(FLinearColor::Transparent);
+			S.SetNormal(Transparent);
+			S.SetHovered(Transparent);
+			S.SetPressed(Transparent);
+			S.SetNormalPadding(FMargin(0.f));
+			S.SetPressedPadding(FMargin(0.f));
+			return S;
+		}();
+		return Style;
+	}
+
+protected:
+	// Background highlight on hover, in the given colour (subclasses pass their own: white for
+	// maximize, red for close). Returns the layer to draw the icon on (above the highlight).
+	int32 PaintHoverBg(const FGeometry& G, FSlateWindowElementList& Out, int32 LayerId, const FLinearColor& HoverColor) const
+	{
+		if (IsHovered())
+		{
+			static FSlateColorBrush HoverBrush(FLinearColor::White);
+			FSlateDrawElement::MakeBox(Out, LayerId, G.ToPaintGeometry(), &HoverBrush,
+				ESlateDrawEffect::None, HoverColor);
+		}
+		return LayerId + 1;
+	}
+
+	// Inset square (in local space) the icon is drawn within.
+	FSlateRect IconRect(const FGeometry& G) const
+	{
+		const FVector2D Sz = G.GetLocalSize();
+		const float S = FMath::Min(Sz.X, Sz.Y);
+		const float Inset = S * kInsetFrac;
+		const FVector2D C = Sz * 0.5f;
+		const float H = S * 0.5f - Inset;
+		return FSlateRect(C.X - H, C.Y - H, C.X + H, C.Y + H);
+	}
+
+	// Always clearly visible (not only on hover): light-white at rest, pure white on hover.
+	FLinearColor IconColor() const { return IsHovered() ? FLinearColor::White : FLinearColor(0.85f, 0.85f, 0.85f, 1.f); }
+};
+
+// Close button: draws an "X" (two diagonal lines).
+class SImCloseButton final : public SImIconButton
+{
+public:
+	SLATE_BEGIN_ARGS(SImCloseButton) {}
+		SLATE_EVENT(FOnClicked, OnClicked)
+	SLATE_END_ARGS()
+	void Construct(const FArguments& InArgs)
+	{
+		SImIconButton::Construct(SImIconButton::FArguments().OnClicked(InArgs._OnClicked));
+	}
+
+	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& G, const FSlateRect& Cull,
+		FSlateWindowElementList& Out, int32 LayerId, const FWidgetStyle& InStyle, bool bEnabled) const override
+	{
+		int32 Layer = SButton::OnPaint(Args, G, Cull, Out, LayerId, InStyle, bEnabled);
+		// Close: hover fills RED (a common close-button affordance).
+		Layer = PaintHoverBg(G, Out, Layer, FLinearColor(0.85f, 0.15f, 0.15f, 0.9f));
+		const FSlateRect R = IconRect(G);
+		// On the red hover fill, draw the X white for contrast.
+		const FLinearColor Col = IsHovered() ? FLinearColor::White : IconColor();
+		const auto PG = G.ToPaintGeometry();
+		FSlateDrawElement::MakeLines(Out, Layer, PG, {FVector2D(R.Left, R.Top), FVector2D(R.Right, R.Bottom)}, ESlateDrawEffect::None, Col, true, 1.5f);
+		FSlateDrawElement::MakeLines(Out, Layer, PG, {FVector2D(R.Right, R.Top), FVector2D(R.Left, R.Bottom)}, ESlateDrawEffect::None, Col, true, 1.5f);
+		return Layer + 1;
+	}
+};
+
+// Maximize / restore button: a single square when normal (→ maximize), or two overlapping
+// squares when maximized (→ restore). State is queried from the owning window each paint.
+class SImMaximizeButton final : public SImIconButton
+{
+public:
+	SLATE_BEGIN_ARGS(SImMaximizeButton) {}
+		SLATE_EVENT(FOnClicked, OnClicked)
+	SLATE_END_ARGS()
+	void Construct(const FArguments& InArgs)
+	{
+		SImIconButton::Construct(SImIconButton::FArguments().OnClicked(InArgs._OnClicked));
+	}
+
+	TFunction<bool()> IsMaximized;
+
+	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& G, const FSlateRect& Cull,
+		FSlateWindowElementList& Out, int32 LayerId, const FWidgetStyle& InStyle, bool bEnabled) const override
+	{
+		int32 Layer = SButton::OnPaint(Args, G, Cull, Out, LayerId, InStyle, bEnabled);
+		// Maximize/restore: hover fills a faint white.
+		Layer = PaintHoverBg(G, Out, Layer, FLinearColor(1.f, 1.f, 1.f, 0.25f));
+		const FSlateRect R = IconRect(G);
+		const FLinearColor Col = IconColor();
+		const auto PG = G.ToPaintGeometry();
+		auto Box = [&](const FSlateRect& B) {
+			TArray<FVector2D> Pts{
+				FVector2D(B.Left, B.Top), FVector2D(B.Right, B.Top),
+				FVector2D(B.Right, B.Bottom), FVector2D(B.Left, B.Bottom), FVector2D(B.Left, B.Top)};
+			FSlateDrawElement::MakeLines(Out, Layer, PG, Pts, ESlateDrawEffect::None, Col, true, 1.5f);
+		};
+		const bool bMax = IsMaximized && IsMaximized();
+		if (bMax)
+		{
+			// Restore icon: two overlapping squares (a back one shifted up-right, a front one).
+			const float D = (R.Right - R.Left) * 0.25f;
+			Box(FSlateRect(R.Left + D, R.Top, R.Right, R.Bottom - D));        // back
+			Box(FSlateRect(R.Left, R.Top + D, R.Right - D, R.Bottom));        // front
+		}
+		else
+		{
+			Box(R);  // maximize icon: a single square
+		}
+		return Layer + 1;
+	}
+};
+
 class SImHeaderArea final : public SCompoundWidget
 {
 public:
@@ -393,8 +537,13 @@ public:
 				.HeightOverride(ComputeDesiredSize(0.f).Y)
 				[
 					SNew(SBorder)
-					// UE 5.7: Use TAttribute::CreateSP for Slate widgets (non-UObject types)
-					//.BorderImage(TAttribute<const FSlateBrush*>::CreateSP(this, &SImHeaderArea::HeaderBrush))
+					// Give the title bar a SOLID (opaque) fill. Previously BorderImage was commented
+					// out, so the SBorder used the default themed brush which is mostly transparent —
+					// inside a viewport (no host SWindow backing it) the bar showed through to the
+					// half-transparent content background and the game scene, making the title text
+					// and the maximize/close buttons hard to read. A flat opaque box fixes that.
+					.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
+					.BorderBackgroundColor(TAttribute<FSlateColor>::CreateSP(this, &SImHeaderArea::GetHeaderFillColor))
 					.Visibility(EVisibility::SelfHitTestInvisible)
 					.Content()
 					[
@@ -426,18 +575,34 @@ public:
 						[
 							SNew(SSpacer)
 						]
+						// Maximize / restore button (square, fills the bar vertically).
 						+ SHorizontalBox::Slot()
 						.HAlign(HAlign_Right)
-						.VAlign(VAlign_Center)
+						.VAlign(VAlign_Fill)
 						.AutoWidth()
 						[
-							SNew(SButton)
-							.Text(NSLOCTEXT("ImSlate", "CloseIcon", "X"))
-							// UE 5.7: Use TAttribute::CreateLambda with this pointer capture to access member variable
+							SNew(SBox)
+							.WidthOverride(TAttribute<FOptionalSize>::CreateSP(this, &SImHeaderArea::GetTitleHeightSize))
+							[
+								SAssignNew(MaximizeButton, SImMaximizeButton)
+								.OnClicked(this, &SImHeaderArea::OnMaximizeBtnClick)
+							]
+						]
+						// Close button (square, fills the bar vertically). Drawn as an "X" in OnPaint.
+						+ SHorizontalBox::Slot()
+						.HAlign(HAlign_Right)
+						.VAlign(VAlign_Fill)
+						.AutoWidth()
+						[
+							SNew(SBox)
+							.WidthOverride(TAttribute<FOptionalSize>::CreateSP(this, &SImHeaderArea::GetTitleHeightSize))
 							.Visibility(TAttribute<EVisibility>::CreateLambda([this]() {
 								return this->Target->ShouldShowCloseButton() ? EVisibility::Visible : EVisibility::Collapsed;
 							}))
-							.OnClicked(this, &SImHeaderArea::OnCloseBtnClick)
+							[
+								SNew(SImCloseButton)
+								.OnClicked(this, &SImHeaderArea::OnCloseBtnClick)
+							]
 						]
 					]
 				]
@@ -449,6 +614,13 @@ public:
 				SNew(SSpacer)
 			]
 		];
+
+		// Maximize button draws "restore" vs "maximize" based on the window's live state.
+		if (MaximizeButton.IsValid())
+		{
+			SImSlateWindow* W = Target;
+			MaximizeButton->IsMaximized = [W]() { return W && W->IsMaximized(); };
+		}
 	}
 
 	FVector2D GetMinSize() const { return MinSizeAttr.Get(FVector2D{200.f, 40.f}); }
@@ -487,6 +659,15 @@ public:
 		TitleBrush.TintColor = DefaultColor;
 	}
 
+	// Opaque title-bar fill: the themed header color but forced to full alpha, so the bar (and its
+	// title text + maximize/close buttons) stay readable regardless of the window's content alpha.
+	FSlateColor GetHeaderFillColor() const
+	{
+		FLinearColor C = GetDefault<UXImSlateStyleSetting>()->WindowHeaderColor;
+		C.A = 1.f;
+		return FSlateColor(C);
+	}
+
 	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
 	{
 		if (!(Target->Flags & ImSlateWindowFlags_NoMove))
@@ -515,6 +696,16 @@ public:
 		}
 		return FReply::Handled();
 	}
+	FReply OnMaximizeBtnClick()
+	{
+		if (Target)
+			Target->ToggleMaximize();
+		return FReply::Handled();
+	}
+	// Square button width = title bar height, so the icon area is a square that fills the bar.
+	FOptionalSize GetTitleHeightSize() const { return FOptionalSize(GetTitleHeight()); }
+
+	TSharedPtr<SImMaximizeButton> MaximizeButton;
 	virtual void CacheDesiredSize(float LayoutScaleMultiplier) override { SWidget::CacheDesiredSize(LayoutScaleMultiplier); }
 };
 
@@ -761,6 +952,59 @@ void SImSlateWindow::SetWindowContentSize(FVector2D InSize)
 	}
 }
 
+void SImSlateWindow::ToggleMaximize()
+{
+	if (!ensure(Viewport))
+		return;
+
+	if (!bMaximized)
+	{
+		// Save current geometry + the exact move/resize state, then fill the viewport and disable
+		// move/resize. Saving the prior NoMove/NoResize bits means restore is exact even for windows
+		// that were already non-movable / non-resizable.
+		SavedPos = GetWindowPos();
+		SavedSize = GetWindowSize();
+		bSavedShowResizeHandle = bShowResizeHandle;
+		bSavedNoMove = (Flags & ImSlateWindowFlags_NoMove) != 0;
+		bSavedNoResize = (Flags & ImSlateWindowFlags_NoResize) != 0;
+
+		// If the window had been popped out into a host SWindow, maximizing means "go fullscreen
+		// in the viewport": pull it back into the game viewport first, so fullscreen always == fill
+		// the viewport (consistent), and remember to restore it to the host on un-maximize.
+		bWasInHostBeforeMaximize = !IsViewportGame();
+		if (bWasInHostBeforeMaximize)
+			MoveToViewport(GetViewportGame());
+
+		const FVector2D ViewportSize = Viewport->GetCachedGeometry().GetLocalSize();
+
+		bMaximized = true;
+		Flags |= (ImSlateWindowFlags_NoMove | ImSlateWindowFlags_NoResize);
+		bShowResizeHandle = false;
+
+		DragingWindowPos(FVector2D::ZeroVector, Viewport->GetCachedGeometry().GetAbsolutePosition());
+		if (ViewportSize.X > 0 && ViewportSize.Y > 0)
+			SetWindowSize(ViewportSize);
+	}
+	else
+	{
+		// Restore: put back exactly the flags/geometry from before maximize.
+		bMaximized = false;
+		if (!bSavedNoMove)   Flags &= ~ImSlateWindowFlags_NoMove;
+		if (!bSavedNoResize) Flags &= ~ImSlateWindowFlags_NoResize;
+		bShowResizeHandle = bSavedShowResizeHandle;
+
+		// If it was popped out into a host before maximizing, send it back to the host.
+		if (bWasInHostBeforeMaximize && bSupportImViewportHost)
+			MoveToViewport(SelectViewport());
+		bWasInHostBeforeMaximize = false;
+
+		if (!SavedSize.IsZero())
+			SetWindowSize(SavedSize);
+		DragingWindowPos(SavedPos, SavedPos);
+	}
+	Invalidate(EInvalidateWidgetReason::Layout);
+}
+
 void SImSlateWindow::SetWindowTitleHeight(float InHeight)
 {
 	if (TitleHeight != InHeight)
@@ -1005,17 +1249,38 @@ void SImSlateWindow::CacheDesiredSize(float LayoutScaleMultiplier)
 		FVector2D ViewportSize = Viewport->GetCachedGeometry().GetLocalSize();
 		if (ViewportSize.X > 0 && ViewportSize.Y > 0)
 		{
-			if (SetWindowSizeAllowFlags & ImSlateCond_FirstClearMask)
+			if (!bSupportImViewportHost)
 			{
+				// Non-multiview (mobile, or imslate.multiview off): the window can't escape to a
+				// host SWindow, so it must stay fully inside the viewport on ALL four edges — both
+				// position AND size. Without this the old clamp (below) let the window hang off the
+				// left/right by MinGrabWidth and off the bottom (clamped only by title height), so a
+				// drag past an edge wrote an out-of-bounds target every frame while the partial clamp
+				// rewrote it back — the position flickered between the two each frame.
+				// Clamp size first (a window bigger than the viewport could never satisfy a 4-edge
+				// position clamp), then clamp the top-left so the whole rect fits.
 				ActualSize.X = FMath::Min(ActualSize.X, ViewportSize.X);
 				ActualSize.Y = FMath::Min(ActualSize.Y, ViewportSize.Y);
+				ActualPos.X = FMath::Clamp(ActualPos.X, 0.f, FMath::Max(0.f, ViewportSize.X - ActualSize.X));
+				ActualPos.Y = FMath::Clamp(ActualPos.Y, 0.f, FMath::Max(0.f, ViewportSize.Y - ActualSize.Y));
 			}
-			if (!(Flags & ImSlateWindowFlags_NoTitleBar))
+			else
 			{
-				constexpr float MinGrabWidth = 50.f;
-				float TitleH = GetTitleHeight();
-				ActualPos.X = FMath::Clamp(ActualPos.X, -(ActualSize.X - MinGrabWidth), ViewportSize.X - MinGrabWidth);
-				ActualPos.Y = FMath::Clamp(ActualPos.Y, 0.f, FMath::Max(0.f, ViewportSize.Y - TitleH));
+				// Multiview (desktop): a window may be dragged partly off-viewport to then pop out
+				// into a host SWindow, so keep the looser clamp that only guarantees a grabbable
+				// strip stays on screen.
+				if (SetWindowSizeAllowFlags & ImSlateCond_FirstClearMask)
+				{
+					ActualSize.X = FMath::Min(ActualSize.X, ViewportSize.X);
+					ActualSize.Y = FMath::Min(ActualSize.Y, ViewportSize.Y);
+				}
+				if (!(Flags & ImSlateWindowFlags_NoTitleBar))
+				{
+					constexpr float MinGrabWidth = 50.f;
+					float TitleH = GetTitleHeight();
+					ActualPos.X = FMath::Clamp(ActualPos.X, -(ActualSize.X - MinGrabWidth), ViewportSize.X - MinGrabWidth);
+					ActualPos.Y = FMath::Clamp(ActualPos.Y, 0.f, FMath::Max(0.f, ViewportSize.Y - TitleH));
+				}
 			}
 		}
 	}

@@ -19,6 +19,9 @@
 
 namespace ImSlate
 {
+// Virtual keyboard must render above ImSlate panels (viewport Z=12000) and ImGui (Z=10000).
+static constexpr int32 IMSLATE_VIRTUALKEYBOARD_Z_ORDER = 14000;
+
 #if WITH_EDITOR
 TWeakPtr<ILevelEditor> SImViewportGame::CurrentWeakLevelEditor;
 #endif
@@ -204,20 +207,21 @@ void SImViewportGame::EnsureKeyboardInViewport()
 
 	if (auto Client = GetGameViewportClient())
 	{
-		Client->AddViewportWidgetContent(VirtualKeyboard.ToSharedRef(), 2000);
+		Client->AddViewportWidgetContent(VirtualKeyboard.ToSharedRef(), IMSLATE_VIRTUALKEYBOARD_Z_ORDER);
 	}
 #if WITH_EDITOR
 	else if (TSharedPtr<ILevelEditor> LevelEditor = WeakLevelEditor.Pin())
 	{
 		auto LevelViewport = LevelEditor->GetActiveViewportInterface();
 		TSharedPtr<SOverlay>& ViewportOverlay = GS_ACCESS_PROTECT(LevelViewport.Get(), SLevelViewport, ViewportOverlay)->ViewportOverlay;
+		WeakKeyboardOverlay = ViewportOverlay;  // remember for removal in the destructor
 		// VAlign_Fill (not Bottom) so the keyboard widget fills the whole viewport and its
 		// origin is fixed. VAlign_Bottom made the widget only as tall as its content, so its
 		// top drifted when the suggestion row count changed — dragging the popups along. The
 		// keyboard pins its visible content to the bottom internally via a top FillHeight spacer.
 		// This matches the game path (AddViewportWidgetContent → default VAlign_Fill).
 		ViewportOverlay
-		->AddSlot(2000)
+		->AddSlot(IMSLATE_VIRTUALKEYBOARD_Z_ORDER)
 		.HAlign(HAlign_Fill)
 		.VAlign(VAlign_Fill)
 		[
@@ -225,6 +229,28 @@ void SImViewportGame::EnsureKeyboardInViewport()
 		];
 	}
 #endif
+}
+
+void SImViewportGame::RemoveKeyboard()
+{
+	// The virtual keyboard is parented into the engine's viewport overlay (independent of this
+	// ImSlate world context). When the world is torn down (e.g. editor map switch) the overlay
+	// still holds a ref to the keyboard → it lingers on screen after ImSlate disappears. Remove
+	// it from BOTH possible parents (game-client overlay and editor ViewportOverlay), and drop
+	// our own ref, so it goes away with ImSlate. Called from ~FWorldContextRoot (guaranteed
+	// teardown point, while refs are still valid) and from the destructor as a backstop.
+	if (!VirtualKeyboard.IsValid())
+		return;
+	if (auto Client = GetGameViewportClient())
+		Client->RemoveViewportWidgetContent(VirtualKeyboard.ToSharedRef());
+	if (TSharedPtr<SOverlay> Overlay = WeakKeyboardOverlay.Pin())
+		Overlay->RemoveSlot(VirtualKeyboard.ToSharedRef());
+	VirtualKeyboard.Reset();
+}
+
+SImViewportGame::~SImViewportGame()
+{
+	RemoveKeyboard();
 }
 
 }  // namespace ImSlate

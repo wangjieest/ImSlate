@@ -29,6 +29,10 @@ ImSlate::ImSlateContext* EditorGImSlate = nullptr;
 IMSLATE_API ImSlate::ImSlateContext* GImSlate = nullptr;
 #endif
 
+// ImSlate viewport Z-order — must be above ImGui (IMGUI_WIDGET_Z_ORDER = 10000)
+// so ImSlate panels render on top of ImGui debug windows.
+static constexpr int32 IMSLATE_VIEWPORT_Z_ORDER = 12000;
+
 namespace ImSlate
 {
 struct FWorldContextRoot;
@@ -85,7 +89,7 @@ struct FWorldContextRoot : public ImSlateContext
 		this->PIEInstanceID = GetWorldChecked()->GetOutermost()->GetPIEInstanceID();
 		if (auto Viewport = InWorld->GetGameViewport())
 		{
-			this->Viewports.Add(SNew(SImViewportGame, 1023)
+			this->Viewports.Add(SNew(SImViewportGame, IMSLATE_VIEWPORT_Z_ORDER)
 								.GameViewportClient(Viewport)
 								.Visibility(EVisibility::SelfHitTestInvisible));
 			WeakViewPortClient = Viewport;
@@ -103,7 +107,7 @@ struct FWorldContextRoot : public ImSlateContext
 				auto IncLevelEditor = StaticCastSharedPtr<SLevelViewport>(EditorViewport)->GetParentLevelEditor().Pin();
 				if (!IncLevelEditor)
 					continue;
-				this->Viewports.Add(SNew(SImViewportGame, 1023)
+				this->Viewports.Add(SNew(SImViewportGame, IMSLATE_VIEWPORT_Z_ORDER)
 									.LevelEditor(IncLevelEditor)
 									.Visibility(EVisibility::SelfHitTestInvisible));
 			}
@@ -124,6 +128,11 @@ struct FWorldContextRoot : public ImSlateContext
 		}
 		for (auto& Viewport : this->Viewports)
 		{
+			// Detach the virtual keyboard from the engine viewport overlay BEFORE dropping the
+			// viewport — otherwise the overlay keeps the keyboard alive and it lingers on screen
+			// after ImSlate is gone (world teardown / editor map switch). Refs are still valid here.
+			if (Viewport->IsGameViewport())
+				static_cast<SImViewportGame&>(Viewport.Get()).RemoveKeyboard();
 			Viewport->RemoveAllWindow();
 			Viewport->ClearChildren();
 		}
@@ -146,7 +155,7 @@ protected:
 		{
 			if (auto Viewport = RawWorldPtr ? RawWorldPtr->GetGameViewport() : nullptr)
 			{
-				Viewports.Add(SNew(SImViewportGame, 1023)
+				Viewports.Add(SNew(SImViewportGame, IMSLATE_VIEWPORT_Z_ORDER)
 							.GameViewportClient(Viewport)
 							.Visibility(EVisibility::SelfHitTestInvisible));
 				WeakViewPortClient = Viewport;

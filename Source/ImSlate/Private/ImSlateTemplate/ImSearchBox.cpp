@@ -166,6 +166,14 @@ void SImSearchBox::Construct(const FArguments& InArgs)
 	];
 }
 
+bool SImSearchBox::IsVirtualKeyboardActiveForMe() const
+{
+	if (!EditText.IsValid()) return false;
+	if (auto Kb = ImSlate::SImSlateVirtualKeyboard::Get())
+		return Kb->IsShowing() && Kb->IsOwnedBy(EditText.Get());
+	return false;
+}
+
 void SImSearchBox::SetText(const FText& InText)
 {
 	if (EditText) EditText->SetText(InText);
@@ -468,6 +476,9 @@ FReply SImSearchBox::OnPreviewKeyDown(const FGeometry& MyGeometry, const FKeyEve
 
 void SImSearchBox::UpdateHighlight(int32 NewIndex)
 {
+	// Preview-only highlight (like virtual keyboard): Up/Down only moves the highlight,
+	// it does NOT write into the edit. The edit is committed only on Enter (OnTextCommitted)
+	// or click (OnSuggestionSelected). This avoids navigation changing the live text/value.
 	if (SuggestionButtons.IsValidIndex(HighlightIndex))
 		SuggestionButtons[HighlightIndex]->SetButtonStyle(&GetSuggestionButtonStyle());
 
@@ -475,15 +486,6 @@ void SImSearchBox::UpdateHighlight(int32 NewIndex)
 
 	if (SuggestionButtons.IsValidIndex(HighlightIndex))
 		SuggestionButtons[HighlightIndex]->SetButtonStyle(&GetSuggestionHighlightStyle());
-
-	if (HighlightIndex < 0)
-	{
-		if (EditText.IsValid() && !TextBeforeNavigate.IsEmpty())
-			EditText->SetText(FText::FromString(TextBeforeNavigate));
-		return;
-	}
-	if (CurrentSuggestions.IsValidIndex(HighlightIndex) && EditText.IsValid())
-		EditText->SetText(FText::FromString(CurrentSuggestions[HighlightIndex]));
 }
 
 void SImSearchBox::OnTextChanged(const FText& NewText)
@@ -496,9 +498,16 @@ void SImSearchBox::OnTextCommitted(const FText& Text, ETextCommit::Type Type)
 	if (Type != ETextCommit::OnCleared)
 	{
 		if (HighlightIndex >= 0 && CurrentSuggestions.IsValidIndex(HighlightIndex))
+		{
+			// Enter with a highlighted suggestion → commit the highlight and sync it to the edit
 			CommittedText = CurrentSuggestions[HighlightIndex];
+			if (EditText.IsValid())
+				EditText->SetText(FText::FromString(CommittedText));
+		}
 		else
+		{
 			CommittedText = Text.ToString();
+		}
 		bCommitted = true;
 		ClearSuggestions();
 	}

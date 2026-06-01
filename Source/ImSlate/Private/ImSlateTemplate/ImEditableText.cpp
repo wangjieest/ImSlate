@@ -7,6 +7,8 @@
 #include "Framework/Text/TextLayout.h"
 #include "Framework/Text/SlateTextLayout.h"
 #include "Widgets/Text/SlateEditableTextLayout.h"
+#include "UObject/GarbageCollection.h"  // GIsGarbageCollecting
+#include "HAL/PlatformApplicationMisc.h"  // FPlatformApplicationMisc::RequiresVirtualKeyboard
 #include "PrivateFieldAccessor.h"
 
 // The caret's pixel position comes from FTextLayout::GetLocationAt (public), but the
@@ -97,7 +99,10 @@ FReply SImEditableText::OnKeyChar(const FGeometry& MyGeometry, const FCharacterE
 	if (auto Keyboard = ImSlate::SImSlateVirtualKeyboard::Get())
 	{
 		if (Keyboard->IsShowing())
-			Keyboard->SyncFromEditor(GetText().ToString());
+		{
+			const int32 Caret = EditableTextLayout ? EditableTextLayout->GetCursorLocation().GetOffset() : -1;
+			Keyboard->SyncFromEditor(GetText().ToString(), Caret);  // sync caret too (single-line offset)
+		}
 	}
 	return Reply;
 }
@@ -127,21 +132,62 @@ FReply SImEditableText::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& 
 			const FKey Key = InKeyEvent.GetKey();
 			if (Key == EKeys::Enter)  { Keyboard->Hide(true);  return FReply::Handled(); }
 			if (Key == EKeys::Escape) { Keyboard->Hide(false); return FReply::Handled(); }
+
+			// Ctrl+V paste: SEditableText's paste goes through UICommandList which doesn't route
+			// reliably here (modal keyboard / focus), so Ctrl+V was a no-op. Call paste directly.
+			if (Key == EKeys::V && InKeyEvent.IsControlDown() && EditableTextLayout && !IsTextReadOnly())
+			{
+				EditableTextLayout->PasteTextFromClipboard();
+				const int32 PasteCaret = EditableTextLayout->GetCursorLocation().GetOffset();
+				Keyboard->SyncFromEditor(GetText().ToString(), PasteCaret);
+				return FReply::Handled();
+			}
+
+			// While the virtual keyboard is open, DON'T allow Shift+arrow/Home/End to make a
+			// selection. Downgrade to a plain caret move by re-issuing the same key without the
+			// Shift modifier, so the cursor still moves but no range is selected.
+			const bool bIsNavKey = (Key == EKeys::Left || Key == EKeys::Right
+				|| Key == EKeys::Up || Key == EKeys::Down
+				|| Key == EKeys::Home || Key == EKeys::End);
+			if (bIsNavKey && InKeyEvent.IsShiftDown())
+			{
+				FModifierKeysState NoShift(
+					/*bIsLeftShift*/ false, /*bIsRightShift*/ false,
+					InKeyEvent.IsLeftControlDown(), InKeyEvent.IsRightControlDown(),
+					InKeyEvent.IsLeftAltDown(), InKeyEvent.IsRightAltDown(),
+					InKeyEvent.IsLeftCommandDown(), InKeyEvent.IsRightCommandDown(),
+					InKeyEvent.AreCapsLocked());
+				FKeyEvent PlainKey(Key, NoShift, InKeyEvent.GetUserIndex(),
+					InKeyEvent.IsRepeat(), InKeyEvent.GetCharacter(), InKeyEvent.GetKeyCode());
+				FReply NavReply = SEditableText::OnKeyDown(MyGeometry, PlainKey);
+				const int32 NavCaret = EditableTextLayout ? EditableTextLayout->GetCursorLocation().GetOffset() : -1;
+				Keyboard->SyncFromEditor(GetText().ToString(), NavCaret);
+				return NavReply;
+			}
 		}
 	}
 	FReply Reply = SEditableText::OnKeyDown(MyGeometry, InKeyEvent);
 	if (auto Keyboard = ImSlate::SImSlateVirtualKeyboard::Get())
 	{
 		if (Keyboard->IsShowing())
-			Keyboard->SyncFromEditor(GetText().ToString());
+		{
+			const int32 Caret = EditableTextLayout ? EditableTextLayout->GetCursorLocation().GetOffset() : -1;
+			Keyboard->SyncFromEditor(GetText().ToString(), Caret);  // sync caret too (arrow keys / edits)
+		}
 	}
 	return Reply;
 }
 
 SImEditableText::~SImEditableText()
 {
-	// Keyboard follows this editable's lifecycle: when the bound editable is
-	// destroyed, dismiss the keyboard (no-op if it was rebound to another one).
+	// Keyboard follows this editable's lifecycle: when the bound editable is destroyed, dismiss
+	// the keyboard (no-op if rebound to another one).
+	// GUARD: during GC / world teardown / engine exit, the current UWorld is null and calling
+	// SImSlateVirtualKeyboard::Get() → GImSlate would try to CREATE a FWorldContextRoot for a
+	// null world, dereferencing it (GetPackage) and crashing. In that state the keyboard is being
+	// destroyed too, so notifying is pointless — skip it.
+	if (GIsGarbageCollecting || IsEngineExitRequested())
+		return;
 	if (auto Keyboard = ImSlate::SImSlateVirtualKeyboard::Get())
 		Keyboard->NotifyOwnerDestroyed(this);
 }
@@ -154,7 +200,7 @@ FReply SImEditableText::OnFocusReceived(const FGeometry& MyGeometry, const FFocu
 	if (bPreviewDisplayMode)
 		return FReply::Handled();
 
-	if (ImSlate::SImSlateVirtualKeyboard::ShouldUseVirtualKeyboard())
+	if (ImSlate::SImSlateVirtualKeyboard::ShouldUseVirtualKeyboard(this))
 	{
 		if (auto Keyboard = ImSlate::SImSlateVirtualKeyboard::Get())
 		{
@@ -171,7 +217,15 @@ FReply SImEditableText::OnFocusReceived(const FGeometry& MyGeometry, const FFocu
 					// Always apply Text: on OnEnter it's the edited text; on OnCleared (Esc) it's
 					// the original text captured at open time, so this RESTORES the field (the live
 					// OnTextChanged sync had been updating it during editing).
-					This->SetText(FText::FromString(Text));
+					const FText NewText = FText::FromString(Text);
+					This->SetText(NewText);
+					// SetText only updates the value — it does NOT fire SEditableText's OnTextChanged/
+					// OnTextCommitted delegates. Downstream business logic (XConsole command, search
+					// filters, dependent UI) listens on those delegates, so without this it wouldn't
+					// react to a keyboard Done/Cancel. Broadcast both explicitly (these protected
+					// overrides call OnTextChangedCallback/OnTextCommittedCallback ExecuteIfBound).
+					This->OnTextChanged(NewText);
+					This->OnTextCommitted(NewText, Type);
 					if (This->VKCommitCallback)
 						This->VKCommitCallback(Text, Type);
 				}
@@ -179,6 +233,11 @@ FReply SImEditableText::OnFocusReceived(const FGeometry& MyGeometry, const FFocu
 			Params.SuggestionProvider = VKSuggestionProvider;
 			Params.Owner = AsShared();
 			Keyboard->Show(Params);
+
+			// The ORIGINAL edit must NOT keep keyboard focus: input flows through the virtual
+			// keyboard's preview (it takes the "fake focus" — Slate user focus without IME/OS
+			// keyboard). The keyboard's Show() moves user focus onto its preview. We just don't
+			// call super here (no IME, no OS keyboard on this original edit).
 			return FReply::Handled();
 		}
 	}

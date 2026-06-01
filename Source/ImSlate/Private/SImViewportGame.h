@@ -10,6 +10,7 @@ class IMSLATE_API SImViewportGame final : public SImSlateViewport
 public:
 	using FArguments = SImSlateViewport::FArguments;
 	void Construct(const FArguments& InArgs, int32 InZOrder = 1024);
+	virtual ~SImViewportGame();  // removes the virtual keyboard from the viewport overlay
 
 public:
 	virtual void BringWindowToFront(const TSharedRef<SImSlateWindow>& InWindow) override;
@@ -25,10 +26,14 @@ public:
 
 	TSharedPtr<class SImSlateVirtualKeyboard> GetOrCreateVirtualKeyboard();
 	void EnsureKeyboardInViewport();
+	void RemoveKeyboard();  // detach the virtual keyboard from the engine viewport overlay
 
 protected:
 	virtual void OnArrangeChildren(const FGeometry& AllottedGeometry, FArrangedChildren& ArrangedChildren) const override;
 	TSharedPtr<class SImSlateVirtualKeyboard> VirtualKeyboard;
+
+	// Overlay the keyboard was added to (game path), so the destructor can remove it.
+	TWeakPtr<class SOverlay> WeakKeyboardOverlay;
 
 #if WITH_EDITOR
 	TWeakPtr<ILevelEditor> WeakLevelEditor;

@@ -116,6 +116,11 @@ auto ImFactoryCreate(const UObject* InCtx = nullptr)
 // Scale helper for all ImSlate controls
 IMSLATE_API float GetImSlateEffectiveScale();
 
+// Keyboard-specific scale = GetImSlateEffectiveScale() × imslate.KeyboardScale. The virtual
+// keyboard (layout AND the key widgets' ComputeDesiredSize / gesture thresholds) must all use
+// THIS so the keys, spacing and hit areas scale together. Defined in ImVirtualKeyboard.cpp.
+IMSLATE_API float GetImSlateKeyboardScale();
+
 inline FSlateFontInfo GetImSlateDefaultFont(int32 BaseSize = 10)
 {
 	int32 ScaledSize = FMath::RoundToInt(BaseSize * FMath::Max(GetImSlateEffectiveScale(), 1.f));

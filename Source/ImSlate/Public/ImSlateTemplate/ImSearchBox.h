@@ -34,6 +34,10 @@ public:
 
 	bool HasPendingCommit() const { return bCommitted; }
 	bool IsMenuOpen() const { return bSuggestionsVisible; }
+	// True while the virtual keyboard is open editing THIS box's text. During that time the
+	// edit field is the source of truth, so callers must NOT overwrite it from external data
+	// (otherwise deleting/clearing to empty gets reverted by the stale external string).
+	bool IsVirtualKeyboardActiveForMe() const;
 	bool ConsumeNeedsSuggestionRefresh() { bool b = bNeedsSuggestionRefresh; bNeedsSuggestionRefresh = false; return b; }
 	FString ConsumeCommit();
 

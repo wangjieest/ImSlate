@@ -4,11 +4,13 @@
 
 #include "ImSlatePrivate.h"
 #include "SImViewportGame.h"
+#include "SImSlateWindow.h"
 #include "ImSlateTemplate/ImEditableText.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "UnrealClient.h"
 #include "Framework/Application/SlateApplication.h"
+#include "HAL/PlatformApplicationMisc.h"  // FPlatformApplicationMisc::ClipboardPaste
 #include "Framework/Text/TextLayout.h"
 #include "Widgets/Input/SEditableText.h"
 #include "Widgets/Layout/SBox.h"
@@ -16,6 +18,8 @@
 #include "Widgets/Text/STextBlock.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/SOverlay.h"
+#include "Styling/CoreStyle.h"          // FCoreStyle::Get / FButtonStyle
+#include "Brushes/SlateColorBrush.h"    // FSlateColorBrush (selected-suggestion fill)
 
 namespace ImSlate
 {
@@ -25,6 +29,81 @@ static FAutoConsoleVariableRef CVar_ForceVirtualKeyboard(
 	TEXT("imslate.ForceVirtualKeyboard"),
 	GForceVirtualKeyboard,
 	TEXT("Force virtual keyboard on desktop for testing."));
+
+// The global GetImSlateEffectiveScale() is tuned for panels; on high-PPI phones the engine
+// divides the physical density by ContentScaleFactor (r.MobileContentScaleFactor, e.g. 2.68 on
+// iPhone 17), so the effective scale lands ~1.8 and the on-screen keys feel too small. Rather
+// than inflate ALL panels globally, the keyboard gets its own extra multiplier on top.
+float GImSlateKeyboardScale = 1.5f;
+static FAutoConsoleVariableRef CVar_ImSlateKeyboardScale(
+	TEXT("imslate.KeyboardScale"),
+	GImSlateKeyboardScale,
+	TEXT("Extra size multiplier for the virtual keyboard only (on top of imslate.LayoutScale). 1.0 = same as panels."));
+
+// Keyboard-local scale: panel effective scale × keyboard multiplier. ALL keyboard sizing
+// (keys, spacing, popups, height caps) AND the key widgets' ComputeDesiredSize / gesture
+// thresholds (ImVirtualKey.cpp) use this so the whole keyboard scales uniformly. Exported via
+// ImSlateFactory.h as GetImSlateKeyboardScale; GetKbScale is the file-local short alias.
+static float GetKbScale()
+{
+	return GetImSlateEffectiveScale() * FMath::Max(GImSlateKeyboardScale, 0.1f);
+}
+
+// Exported alias (declared in ImSlateFactory.h) so the key widgets in ImVirtualKey.cpp can use the
+// SAME scale as the keyboard layout — otherwise keys sized by GetImSlateEffectiveScale while the
+// layout/spacing used GetKbScale, making keys too small relative to their slots.
+IMSLATE_API float GetImSlateKeyboardScale()
+{
+	return GetKbScale();
+}
+
+// Minimum edge margin (logical px, ×KbScale) applied on top of the OS safe area. Default 0:
+// on desktop the OS safe inset is 0, so the keyboard sits flush to the edge (no extra gap). On
+// mobile the OS safe inset already provides the gap. Raise this if you want a guaranteed margin
+// on all platforms. NOTE: it's a MAX with the safe inset, NOT added — so a large mobile safe
+// inset is used as-is, and this only kicks in where the safe inset is smaller (e.g. desktop).
+float GImSlateKeyboardEdgeMargin = 0.f;
+static FAutoConsoleVariableRef CVar_ImSlateKeyboardEdgeMargin(
+	TEXT("imslate.KeyboardEdgeMargin"),
+	GImSlateKeyboardEdgeMargin,
+	TEXT("Min keyboard edge margin in logical px (×KeyboardScale), max'd with the OS safe area. 0 = flush on desktop."));
+
+// Extra LEFT/RIGHT margin on mobile when the screen is in LANDSCAPE, as a fraction of screen
+// width. Phones in landscape put cutouts/rounded corners on the left & right; this pulls the
+// keyboard edges further in so keys stay reachable and unobscured. Applied via max() like the
+// other margins (so it only widens, never shrinks). 0 disables.
+float GImSlateKeyboardLandscapeSideFrac = 0.04f;
+static FAutoConsoleVariableRef CVar_ImSlateKeyboardLandscapeSideFrac(
+	TEXT("imslate.KeyboardLandscapeSideFrac"),
+	GImSlateKeyboardLandscapeSideFrac,
+	TEXT("Mobile landscape extra left/right keyboard margin as a fraction of screen width (0 = off)."));
+
+// Keyboard edge margin as an FMargin: max(OS safe-area inset, EdgeMargin[, landscape side]) per
+// side. Used by BOTH the keyboard body and the sibling suggestion overlay so they line up. Top is
+// not padded (the keyboard is bottom-anchored). Returns local Slate units.
+static FMargin GetKbSafeMargin()
+{
+	FMargin Safe(0.f);
+	if (FSlateApplication::IsInitialized())
+		FSlateApplicationBase::Get().GetSafeZoneSize(Safe, FVector2f::ZeroVector);
+	const float E = FMath::Max(GImSlateKeyboardEdgeMargin, 0.f) * GetKbScale();
+
+	// Mobile + landscape: add an extra left/right inset (fraction of screen width).
+	float SideExtra = 0.f;
+#if PLATFORM_IOS || PLATFORM_ANDROID
+	if (GImSlateKeyboardLandscapeSideFrac > 0.f && FSlateApplication::IsInitialized())
+	{
+		const FVector2D Screen = FSlateApplicationBase::Get().GetPreferredWorkArea().GetSize();
+		if (Screen.X > Screen.Y)  // landscape
+			SideExtra = Screen.X * GImSlateKeyboardLandscapeSideFrac;
+	}
+#endif
+
+	// max (not add): mobile safe inset used as-is; E / SideExtra only fill in where it's smaller.
+	const float Left  = FMath::Max3(Safe.Left,  E, SideExtra);
+	const float Right = FMath::Max3(Safe.Right, E, SideExtra);
+	return FMargin(Left, 0.f, Right, FMath::Max(Safe.Bottom, E));
+}
 
 TSharedPtr<SImSlateVirtualKeyboard> SImSlateVirtualKeyboard::Get()
 {
@@ -43,10 +122,34 @@ TSharedPtr<SImSlateVirtualKeyboard> SImSlateVirtualKeyboard::Get()
 	return nullptr;
 }
 
-bool SImSlateVirtualKeyboard::ShouldUseVirtualKeyboard()
+bool SImSlateVirtualKeyboard::ShouldUseVirtualKeyboard(const SWidget* InWidget)
 {
-	// Always use our virtual keyboard when an instance is available
-	return Get().IsValid() || GForceVirtualKeyboard;
+	// Desktop testing override
+	if (GForceVirtualKeyboard)
+		return Get().IsValid();
+
+	if (!Get().IsValid())
+		return false;
+
+	// Walk up the parent chain to find the owning ImSlate window.
+	// In-viewport windows (game viewport overlay) have no OS window/IME → use virtual keyboard.
+	// Floated-out windows (host viewport = real SWindow) have OS keyboard → don't.
+	if (InWidget)
+	{
+		TSharedPtr<SWidget> Cur = const_cast<SWidget*>(InWidget)->AsShared();
+		while (Cur.IsValid())
+		{
+			if (Cur->GetType() == TEXT("SImSlateWindow"))
+			{
+				auto* Window = static_cast<SImSlateWindow*>(Cur.Get());
+				return Window->IsViewportGame();
+			}
+			Cur = Cur->GetParentWidget();
+		}
+	}
+
+	// No widget context: fall back to platform check
+	return FPlatformApplicationMisc::RequiresVirtualKeyboard();
 }
 
 // ==================== Layout Data ====================
@@ -287,10 +390,8 @@ TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetSymbolLayout()
 	return Rows;
 }
 
-// Keyboard sizing caps in LOGICAL pixels (multiplied by the effective DPI scale at use sites).
+// Keyboard sizing caps in LOGICAL pixels (multiplied by the keyboard scale at use sites).
 static constexpr float GMaxKeyboardHeight = 300.f;
-static constexpr float GMaxKeyHeight = 48.f;
-static constexpr float GMinKeyWidth = 32.f;
 
 // ==================== Construct ====================
 
@@ -298,7 +399,7 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 {
 	SetVisibility(EVisibility::Collapsed);
 
-	float Scale = GetImSlateEffectiveScale();
+	float Scale = GetKbScale();
 
 	// Preview-row keys: persistent KeyDefs (not rebuilt by BuildKeyboard).
 	ToggleTypeKeyDef = MakeShared<FVirtualKeyDef>();
@@ -347,7 +448,11 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 		.VAlign(VAlign_Bottom)
 		.Padding(TAttribute<FMargin>::CreateLambda([this]() -> FMargin {
 			const float UnitH = PreviewKeysRoot.IsValid() ? PreviewKeysRoot->GetCachedGeometry().GetLocalSize().Y : 0.f;
-			return FMargin(0.f, 0.f, 0.f, UnitH);
+			// Left/right: keep off the device cutouts (same inset the keyboard body uses).
+			// Bottom: sit directly above the preview row, which is itself lifted by the safe-area
+			// bottom inset + extra — so add that here too, otherwise the band would overlap it.
+			const FMargin Safe = GetKbSafeMargin();
+			return FMargin(Safe.Left, 0.f, Safe.Right, UnitH + Safe.Bottom);
 		}))
 		[
 			SNew(SBox)
@@ -377,6 +482,17 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 			+ SVerticalBox::Slot()
 			.AutoHeight()
 			[
+				// Edge margin: keep the keyboard off the device's left/right cutouts and bottom
+				// home-indicator. = max(OS safe inset, imslate.KeyboardEdgeMargin) per side; on
+				// desktop the inset is 0 and the default EdgeMargin is 0, so the keyboard sits
+				// flush (no left/right gap). Top is NOT padded — keyboard is bottom-anchored and
+				// the spacer above handles the top. (We use a plain SBox + GetKbSafeMargin instead
+				// of SSafeZone so the same max(safe, min) rule applies and isn't double-added.)
+				SNew(SBox)
+				.HAlign(HAlign_Fill)
+				.VAlign(VAlign_Fill)
+				.Padding(TAttribute<FMargin>::CreateLambda([]() -> FMargin { return GetKbSafeMargin(); }))
+				[
 				SAssignNew(PreviewKeysRoot, SVerticalBox)
 
 				// Preview row: [ToggleType] [preview text] [Done]
@@ -395,8 +511,8 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 						.VAlign(VAlign_Center)
 						[
 							SNew(SBox)
-							.WidthOverride(54.f)
-							.HeightOverride(30.f)
+							.WidthOverride(TAttribute<FOptionalSize>::CreateLambda([]() { return FOptionalSize(54.f * GetKbScale()); }))
+							.HeightOverride(TAttribute<FOptionalSize>::CreateLambda([]() { return FOptionalSize(32.f * GetKbScale()); }))  // match keyboard key height (SImSlateKey: 32×scale)
 							[
 								ToggleTypeKey.ToSharedRef()
 							]
@@ -417,8 +533,8 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 						.VAlign(VAlign_Center)
 						[
 							SNew(SBox)
-							.WidthOverride(64.f)
-							.HeightOverride(30.f)
+							.WidthOverride(TAttribute<FOptionalSize>::CreateLambda([]() { return FOptionalSize(64.f * GetKbScale()); }))
+							.HeightOverride(TAttribute<FOptionalSize>::CreateLambda([]() { return FOptionalSize(32.f * GetKbScale()); }))  // match keyboard key height (SImSlateKey: 32×scale)
 							[
 								DoneKey.ToSharedRef()
 							]
@@ -431,7 +547,7 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 				.AutoHeight()
 				[
 					SNew(SBox)
-					.MaxDesiredHeight(GMaxKeyboardHeight * GetImSlateEffectiveScale())
+					.MaxDesiredHeight(GMaxKeyboardHeight * GetKbScale())
 					[
 						SNew(SBorder)
 						.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
@@ -443,6 +559,7 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 						]
 					]
 				]
+				]  // end edge-margin SBox (around PreviewKeysRoot)
 			]
 		]
 	];
@@ -479,8 +596,11 @@ SImSlateVirtualKeyboard::EKeyboardLayoutMode SImSlateVirtualKeyboard::ComputeLay
 	if (Width <= 0.f)
 		return EKeyboardLayoutMode::FullScreen;  // unknown yet — start collapsed
 
-	float Scale = GetImSlateEffectiveScale();
-	float KeyH = FMath::Min(32.f * Scale, GMaxKeyHeight * Scale);
+	float Scale = GetKbScale();
+	// Base key height is 32 logical px; Scale already includes the keyboard multiplier (GetKbScale).
+	// (The old FMath::Min(32, GMaxKeyHeight=48) was dead — 32 is always smaller, never reached 48.
+	// Size is now driven by imslate.KeyboardScale.)
+	float KeyH = 32.f * Scale;
 	float ComfortKeyW = KeyH * 1.3f;
 	float SideWidth = 5.f * ComfortKeyW + 5.f * 4.f * Scale;
 	float MinGap = 60.f * Scale;
@@ -494,6 +614,18 @@ void SImSlateVirtualKeyboard::Tick(const FGeometry& AllottedGeometry, const doub
 	SCompoundWidget::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
 
 	if (!bVisible) return;
+
+	// Grab Slate user focus onto the keyboard root once it's in the tree (Tick implies parented).
+	// This is the deferred follow-up to Show()'s bPendingFocus — see Show() for why it can't be
+	// done there. SetKeyboardFocus mirrors the pattern used in SImSearchBox.
+	if (bPendingFocus)
+	{
+		if (FSlateApplication::IsInitialized()
+			&& FSlateApplication::Get().SetKeyboardFocus(SharedThis(this), EFocusCause::SetDirectly))
+		{
+			bPendingFocus = false;
+		}
+	}
 
 	// AllottedGeometry here is authoritative (unlike GetCachedGeometry timing during
 	// Construct/Show). Rebuild only when the resulting layout mode actually changes.
@@ -524,7 +656,7 @@ void SImSlateVirtualKeyboard::BuildKeyboard()
 
 void SImSlateVirtualKeyboard::BuildFullScreenLayout()
 {
-	float Scale = GetImSlateEffectiveScale();
+	float Scale = GetKbScale();
 	float KeySpacing = 4.f * Scale;
 
 	auto AddRow = [&](const TArray<FVirtualKeyDef>& Keys) {
@@ -563,7 +695,7 @@ void SImSlateVirtualKeyboard::BuildFullScreenLayout()
 
 void SImSlateVirtualKeyboard::BuildSplitLayout()
 {
-	float Scale = GetImSlateEffectiveScale();
+	float Scale = GetKbScale();
 	float KeySpacing = 4.f * Scale;
 
 	auto AddRowsToBox = [&](TSharedRef<SVerticalBox> Box, const TArray<TArray<FVirtualKeyDef>>& Rows) {
@@ -625,8 +757,8 @@ void SImSlateVirtualKeyboard::BuildSplitLayout()
 
 	// Both T9 and T26 use the SAME side width — a thumb's reach is a physical span,
 	// not a column count. Each half fills this fixed width regardless of key count.
-	float SplitScale = GetImSlateEffectiveScale();
-	float SplitKeyH = FMath::Min(32.f * SplitScale, GMaxKeyHeight * SplitScale);
+	float SplitScale = GetKbScale();
+	float SplitKeyH = 32.f * SplitScale;  // base 32 logical px (× KeyboardScale); old Min(32,48) was dead
 	float ComfortKeyW = SplitKeyH * 1.3f;
 	float SideWidth = 5.f * ComfortKeyW + 5.f * 4.f * SplitScale;
 
@@ -675,7 +807,7 @@ TSharedRef<SImSlateKey> SImSlateVirtualKeyboard::MakeBoundKey(const FVirtualKeyD
 
 void SImSlateVirtualKeyboard::BuildKeyRow(TSharedRef<SHorizontalBox> RowBox, const TArray<FVirtualKeyDef>& Keys)
 {
-	float Scale = GetImSlateEffectiveScale();
+	float Scale = GetKbScale();
 
 	int32 BaseIndex = PersistentKeyDefs.Num();
 	PersistentKeyDefs.Append(Keys);
@@ -749,6 +881,13 @@ void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
 		CursorBlinkTimer = RegisterActiveTimer(0.5f, FWidgetActiveTimerDelegate::CreateLambda(
 			[this](double, float) -> EActiveTimerReturnType {
 				if (!bVisible) { CursorBlinkTimer.Reset(); return EActiveTimerReturnType::Stop; }
+				// Owner gone (panel closed / widget destroyed) → hide keyboard
+				if (!BoundOwner.IsValid())
+				{
+					CursorBlinkTimer.Reset();
+					Hide(false);
+					return EActiveTimerReturnType::Stop;
+				}
 				bCursorVisible = !bCursorVisible;
 				if (PreviewEdit.IsValid())
 					PreviewEdit->SetPreviewCaretVisible(bCursorVisible);  // caret is drawn by PreviewEdit
@@ -759,6 +898,12 @@ void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
 
 	UpdatePreview();
 	UpdateSuggestions();
+
+	// Take Slate user focus onto the keyboard ROOT so physical keys route here (not to the
+	// editor viewport's global shortcuts). Deferred to Tick: right now the widget may have just
+	// been made Visible and isn't in the widget tree yet, so SetKeyboardFocus/FindPathToWidget
+	// could fail. Tick runs once the keyboard is parented & has authoritative geometry.
+	bPendingFocus = true;
 }
 
 void SImSlateVirtualKeyboard::Hide(bool bCommit)
@@ -766,7 +911,13 @@ void SImSlateVirtualKeyboard::Hide(bool bCommit)
 	if (!bVisible) return;
 
 	bVisible = false;
+	bPendingFocus = false;
 	SetVisibility(EVisibility::Collapsed);
+
+	// Release focus back to the game/editor viewport so its shortcuts work again once the
+	// keyboard is gone (we no longer SupportsKeyboardFocus while hidden).
+	if (FSlateApplication::IsInitialized() && HasAnyUserFocusOrFocusedDescendants())
+		FSlateApplication::Get().SetAllUserFocusToGameViewport();
 
 	if (bCommit)
 	{
@@ -783,6 +934,8 @@ void SImSlateVirtualKeyboard::Hide(bool bCommit)
 	OnTextChanged = nullptr;
 	SuggestionProvider = nullptr;
 	BoundOwner.Reset();
+	CurrentSuggestions.Reset();
+	SelectedSuggestionIndex = -1;
 }
 
 bool SImSlateVirtualKeyboard::IsOwnedBy(const SWidget* Widget) const
@@ -867,11 +1020,23 @@ int32 SImSlateVirtualKeyboard::OnPaint(const FPaintArgs& Args, const FGeometry& 
 
 // ==================== Editor Sync ====================
 
-void SImSlateVirtualKeyboard::SyncFromEditor(const FString& Text)
+void SImSlateVirtualKeyboard::SyncFromEditor(const FString& Text, int32 CaretPos)
 {
-	if (!bVisible || CurrentText == Text) return;
+	if (!bVisible) return;
+
+	// Follow the editor's real caret when provided (physical typing/arrows move it); else keep
+	// the old position clamped. Compute the target caret first so we can detect caret-only
+	// changes (e.g. a bare arrow key moves the caret without changing the text).
+	const int32 NewCaret = (CaretPos >= 0)
+		? FMath::Clamp(CaretPos, 0, Text.Len())
+		: FMath::Clamp(CursorPosition, 0, Text.Len());
+
+	// Bail only when NOTHING changed — both text and caret. Previously bailing on text-equality
+	// alone meant arrow-key caret moves (text unchanged) never updated the preview caret.
+	if (CurrentText == Text && CursorPosition == NewCaret) return;
+
 	CurrentText = Text;
-	CursorPosition = FMath::Clamp(CursorPosition, 0, CurrentText.Len());
+	CursorPosition = NewCaret;
 	bCursorVisible = true;
 	if (PreviewEdit.IsValid())
 	{
@@ -896,7 +1061,7 @@ void SImSlateVirtualKeyboard::HandlePreviewDrag(const FVector2D& ScreenPos)
 	float DeltaX = ScreenPos.X - PreviewDragLastPos.X;
 	PreviewDragLastPos = ScreenPos;
 	PreviewDragAccum += DeltaX;
-	float Step = 12.f * GetImSlateEffectiveScale();
+	float Step = 12.f * GetKbScale();
 	while (PreviewDragAccum > Step)  { MoveCursor(1);  PreviewDragAccum -= Step; UpdatePreview(); }
 	while (PreviewDragAccum < -Step) { MoveCursor(-1); PreviewDragAccum += Step; UpdatePreview(); }
 }
@@ -953,6 +1118,11 @@ void SImSlateVirtualKeyboard::UpdateSuggestions()
 {
 	if (!SuggestionBar.IsValid()) return;
 
+	// Input changed → the candidate list is being refreshed, so the old keyboard selection is no
+	// longer meaningful. Reset it. (Up/Down navigation rebuilds the bar via PopulateSuggestionBar
+	// directly, NOT through here, so this never clears a fresh selection.)
+	SelectedSuggestionIndex = -1;
+
 	// Consume async results first
 	TArray<FString> AsyncResults;
 	if (AsyncSuggestionQueue.Dequeue(AsyncResults))
@@ -983,25 +1153,92 @@ void SImSlateVirtualKeyboard::PopulateSuggestionBar(const TArray<FString>& Sugge
 	if (!SuggestionBar.IsValid()) return;
 	SuggestionBar->ClearChildren();
 
-	float Scale = GetImSlateEffectiveScale();
+	float Scale = GetKbScale();
 	int32 MaxItems = 12;
-	for (int32 i = 0; i < FMath::Min(Suggestions.Num(), MaxItems); ++i)
+	const int32 Count = FMath::Min(Suggestions.Num(), MaxItems);
+
+	// Cache the visible candidates so Up/Down can navigate them and Enter can commit the selection.
+	CurrentSuggestions.Reset();
+	for (int32 i = 0; i < Count; ++i)
+		CurrentSuggestions.Add(Suggestions[i]);
+	// Keep selection in range (a shorter new list may invalidate the old index).
+	if (SelectedSuggestionIndex >= Count)
+		SelectedSuggestionIndex = -1;
+
+	// Selected vs unselected candidate buttons share the SAME flat brush type and the SAME paddings,
+	// so they are identical in size/shape and the label sits at the same place — only the fill color
+	// differs. (The earlier approach reused the default "Button" style for unselected and a flat box
+	// for selected; their differing brush margins/paddings made the selected one a different shape
+	// and pushed its text lower.) Built once and reused.
+	auto MakeFlatStyle = [](const FLinearColor& FillColor) -> FButtonStyle {
+		FButtonStyle S = FCoreStyle::Get().GetWidgetStyle<FButtonStyle>("Button");
+		FSlateColorBrush Fill(FillColor);
+		S.SetNormal(Fill);
+		S.SetHovered(Fill);
+		S.SetPressed(Fill);
+		S.SetNormalPadding(FMargin(0.f));   // identical padding for both states → identical text pos
+		S.SetPressedPadding(FMargin(0.f));
+		return S;
+	};
+	static const FButtonStyle UnselectedStyle = MakeFlatStyle(FLinearColor(0.18f, 0.18f, 0.18f, 1.f));  // dark grey
+	static const FButtonStyle SelectedStyle   = MakeFlatStyle(FLinearColor(0.10f, 0.45f, 0.90f, 1.f));  // blue
+
+	const FSlateFontInfo NormalFont = GetImSlateDefaultFont(8);
+	const FSlateFontInfo BoldFont   = FCoreStyle::GetDefaultFontStyle("Bold", NormalFont.Size);
+
+	for (int32 i = 0; i < Count; ++i)
 	{
 		FString SugCopy = Suggestions[i];
+		const bool bSelected = (i == SelectedSuggestionIndex);
 		SuggestionBar->AddSlot()
 		.Padding(2.f * Scale)
 		[
 			SNew(SButton)
+			.ContentPadding(FMargin(6.f * Scale, 2.f * Scale))  // same content padding both states
+			.ButtonStyle(bSelected ? &SelectedStyle : &UnselectedStyle)
 			.OnClicked_Lambda([this, SugCopy]() { OnSuggestionClicked(SugCopy); return FReply::Handled(); })
 			[
 				SNew(STextBlock)
 				.Text(FText::FromString(SugCopy))
-				.Font(GetImSlateDefaultFont(8))
+				// Selected → bold; both white. Bold makes the selection pop without an odd text color.
+				.Font(bSelected ? BoldFont : NormalFont)
+				.ColorAndOpacity(FSlateColor(FLinearColor::White))
 			]
 		];
 	}
 
 	Invalidate(EInvalidateWidgetReason::Layout);
+}
+
+void SImSlateVirtualKeyboard::MoveSuggestionSelection(int32 Delta)
+{
+	if (CurrentSuggestions.Num() == 0)
+	{
+		SelectedSuggestionIndex = -1;
+		return;
+	}
+	const int32 Last = CurrentSuggestions.Num() - 1;
+	int32 NewIdx;
+	if (SelectedSuggestionIndex < 0 && Delta < 0)
+	{
+		// Nothing selected yet + Up → wrap up into the LAST item (so the first Up press selects
+		// something instead of staying unselected). Down from nothing still goes to the first item.
+		NewIdx = Last;
+	}
+	else
+	{
+		// Range is [-1, Last]: -1 = nothing selected. Clamp (no wrap) at the ends.
+		NewIdx = FMath::Clamp(SelectedSuggestionIndex + Delta, -1, Last);
+	}
+	if (NewIdx != SelectedSuggestionIndex)
+	{
+		SelectedSuggestionIndex = NewIdx;
+		// Rebuild the bar to repaint the highlight (cheap — at most MaxItems buttons). Pass a COPY:
+		// PopulateSuggestionBar resets CurrentSuggestions before refilling from its argument, so
+		// passing the member directly would clear it mid-read.
+		const TArray<FString> Copy = CurrentSuggestions;
+		PopulateSuggestionBar(Copy);
+	}
 }
 
 // ==================== Input Handling ====================
@@ -1083,6 +1320,90 @@ void SImSlateVirtualKeyboard::OnKeyAction(EVirtualKeyAction Action)
 	}
 }
 
+FReply SImSlateVirtualKeyboard::OnKeyChar(const FGeometry& MyGeometry, const FCharacterEvent& InCharacterEvent)
+{
+	if (!bVisible)
+		return FReply::Unhandled();
+
+	const TCHAR Ch = InCharacterEvent.GetCharacter();
+	// Only printable characters get inserted. Control chars (Backspace/Enter/Esc/Tab/etc.) and Space
+	// are handled in OnKeyDown so we don't insert them twice. The OS already applied Shift/CapsLock
+	// to produce the correct case, so insert the character verbatim — do NOT route through OnKeyInput
+	// (its IsUpperCase()/ToUpper() would re-case it against the virtual keyboard's ShiftState).
+	// Non-printables are still SWALLOWED (return Handled): the keyboard is modal while open, so no
+	// char event may leak to the layer underneath.
+	if (Ch < 32 || Ch == 127 || Ch == TEXT(' '))
+		return FReply::Handled();
+
+	InsertText(FString::Chr(Ch));
+	UpdatePreview();
+	UpdateSuggestions();
+	return FReply::Handled();
+}
+
+FReply SImSlateVirtualKeyboard::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
+{
+	if (!bVisible)
+		return FReply::Unhandled();
+
+	const FKey Key = InKeyEvent.GetKey();
+
+	// Ctrl+V paste: no EVirtualKeyAction for paste, so read the clipboard and reuse the insert path.
+	if (Key == EKeys::V && InKeyEvent.IsControlDown())
+	{
+		FString Clip;
+		FPlatformApplicationMisc::ClipboardPaste(Clip);
+		// Single-line: strip newlines so a multi-line clipboard doesn't break the preview.
+		Clip.ReplaceInline(TEXT("\r\n"), TEXT(" "));
+		Clip.ReplaceInline(TEXT("\r"), TEXT(" "));
+		Clip.ReplaceInline(TEXT("\n"), TEXT(" "));
+		if (!Clip.IsEmpty())
+		{
+			InsertText(Clip);
+			UpdatePreview();
+			UpdateSuggestions();
+		}
+		return FReply::Handled();
+	}
+
+	// Up/Down navigate the candidate (suggestion) list when there is one.
+	if (Key == EKeys::Down)             { MoveSuggestionSelection(+1); return FReply::Handled(); }
+	if (Key == EKeys::Up)               { MoveSuggestionSelection(-1); return FReply::Handled(); }
+
+	// Enter: if a candidate is highlighted (Up/Down picked one), commit THAT word; otherwise the
+	// usual Done (commit the typed text).
+	if (Key == EKeys::Enter)
+	{
+		if (CurrentSuggestions.IsValidIndex(SelectedSuggestionIndex))
+			OnSuggestionClicked(CurrentSuggestions[SelectedSuggestionIndex]);
+		else
+			OnKeyAction(EVirtualKeyAction::Enter);
+		return FReply::Handled();
+	}
+
+	// Map physical keys onto the SAME actions as the on-screen keys (OnKeyAction → UpdatePreview
+	// → bound editable + suggestions stay in sync).
+	if (Key == EKeys::Escape)           { OnKeyAction(EVirtualKeyAction::Cancel);    return FReply::Handled(); }
+	if (Key == EKeys::BackSpace)        { OnKeyAction(EVirtualKeyAction::Backspace); return FReply::Handled(); }
+	if (Key == EKeys::Left)             { OnKeyAction(EVirtualKeyAction::Left);      return FReply::Handled(); }
+	if (Key == EKeys::Right)            { OnKeyAction(EVirtualKeyAction::Right);     return FReply::Handled(); }
+	if (Key == EKeys::SpaceBar)         { OnKeyAction(EVirtualKeyAction::Space);     return FReply::Handled(); }
+
+	// While the keyboard is open it is the focused, modal input target: SWALLOW every remaining key
+	// (F-keys, letters' raw KeyDown, etc.) so nothing leaks to the game / editor viewport shortcuts
+	// underneath. (Printable chars are produced via OnKeyChar; this only governs KeyDown routing.)
+	return FReply::Handled();
+}
+
+FReply SImSlateVirtualKeyboard::OnKeyUp(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
+{
+	// Modal while open: swallow ALL key-up events too, so the paired up of any key (whose down we
+	// swallowed) can't trigger a viewport shortcut underneath that fires on release.
+	if (!bVisible)
+		return FReply::Unhandled();
+	return FReply::Handled();
+}
+
 void SImSlateVirtualKeyboard::OnKeyLongPress(const FVirtualKeyDef& KeyDef, const FGeometry& KeyGeometry)
 {
 	if (KeyDef.LongPressChars.Num() == 0 || !RootOverlay.IsValid()) return;
@@ -1105,7 +1426,7 @@ void SImSlateVirtualKeyboard::OnKeyLongPress(const FVirtualKeyDef& KeyDef, const
 	// not a fixed 50 (which left the popup overlapping the key row).
 	float PopupHeight = ActivePopup->GetDesiredSize().Y;
 	if (PopupHeight <= 0.f)
-		PopupHeight = 48.f * GetImSlateEffectiveScale();  // fallback before first layout
+		PopupHeight = 48.f * GetKbScale();  // fallback before first layout
 	float PopupY = KeyLocalPos.Y - PopupHeight - 6.f;
 	PopupY = FMath::Max(0.f, PopupY);
 
@@ -1175,7 +1496,7 @@ void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, con
 
 	if (bIsStepDrag)
 	{
-		float Scale = GetImSlateEffectiveScale();
+		float Scale = GetKbScale();
 		FSlateFontInfo Font = GetImSlateDefaultFont(7);
 		FLinearColor Dim(0.5f, 0.5f, 0.5f, 1.f);
 
@@ -1206,7 +1527,7 @@ void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, con
 			.WidthOverride(PopupWidth)
 			[
 				SNew(SBox)
-				.HeightOverride(28.f)
+				.HeightOverride(28.f * GetKbScale())
 				[
 					SNew(SBorder)
 					.BorderImage(&GetPopupBgBrush())
@@ -1234,7 +1555,7 @@ void SImSlateVirtualKeyboard::OnKeyPressVisual(const FVirtualKeyDef& KeyDef, con
 	if (!KeyDef.Swipe.HasAny()) return;
 	ActiveKeyDef = &KeyDef;
 
-	float Scale = GetImSlateEffectiveScale();
+	float Scale = GetKbScale();
 	FSlateFontInfo Font = GetImSlateDefaultFont(12);  // slightly smaller than before (was 14) to fit cells snugly
 	FLinearColor HintColor(0.9f, 0.9f, 0.9f, 1.f);
 
