@@ -223,6 +223,15 @@ protected:
 	bool bSavedNoResize = false;          // whether NoResize was already set before maximize
 	bool bWasInHostBeforeMaximize = false;// popped into a host SWindow before maximize → restore there
 
+public:
+	// When restoring a maximized window back to a host popup, the host's real on-screen geometry
+	// (absolute) to apply. host pos/size live in the real SWindow, not ActualPos. Read & consumed by
+	// SImViewportHost::MakePopupWindow so it positions/sizes the popup correctly REGARDLESS of when
+	// the SWindow is actually created (avoids the "set before SWindow exists → no-op" race).
+	TOptional<FVector2D> PendingHostPos;
+	TOptional<FVector2D> PendingHostSize;
+protected:
+
 	TAttribute<FVector2D> ContentScale;
 	TAttribute<FLinearColor> ColorAndOpacity;
 	TAttribute<FSlateColor> ForegroundColor;

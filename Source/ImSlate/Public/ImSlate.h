@@ -159,7 +159,9 @@ IMSLATE_API bool			TextButton(ImStr Label, const FText& InText, const ImVec2& In
 inline		bool			TextButton(ImStr Label, const FString& InStr, const ImVec2& InSize = ImVec2(0, 0)) { return TextButton(Label, FText::FromString(InStr), InSize); }
 IMSLATE_API bool			ImageButton(ImStr Label, UObject* InTexture, const ImVec2& InSize = ImVec2(0, 0));
 
-IMSLATE_API bool			CheckBox(ImStr Label, bool& bIsChecked, const ImVec2& InSize = ImVec2(0, 0));
+// AccentColor tints the checked-state fill of the mark (blue by default). Pass e.g. green to set an
+// "enable / is-set" toggle apart from a regular value checkbox.
+IMSLATE_API bool			CheckBox(ImStr Label, bool& bIsChecked, const ImVec2& InSize = ImVec2(0, 0), const FLinearColor& AccentColor = FLinearColor(0.10f, 0.45f, 0.90f, 1.f));
 
 IMSLATE_API ImSliderStatus_	InputFloat(ImStr Label, decltype(FVector::ZeroVector.X)& ValRef, float ValMin = FLT_MIN, float ValMax = FLT_MAX, float step = 0.0f, float step_fast = 0.0f, int32 NumDecimals = 3, bool bResetState = false, ImSlateFloatFlags_ flags = ImSlateFloatFlags_None, const ImVec2& InSize = ImVec2(0, 0));
 

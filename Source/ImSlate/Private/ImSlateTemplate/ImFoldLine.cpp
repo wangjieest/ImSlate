@@ -17,9 +17,33 @@ FReply SImFoldLine::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointe
 {
 	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
 	{
-		bIsFolded = !bIsFolded;
-		SetTextWithFoldIndicator(OriginalText);
-		return FReply::Handled();
+		// Record the press but DON'T consume the event (return Unhandled): consuming it here would
+		// stop the engine from recognising a press-and-drag as a scroll/pan, so dragging up/down
+		// over a fold header would do nothing instead of scrolling the panel. The actual toggle
+		// happens on release if it was a tap (see OnMouseButtonUp).
+		bPressActive = true;
+		PressScreenPos = MouseEvent.GetScreenSpacePosition();
+	}
+	return FReply::Unhandled();
+}
+
+FReply SImFoldLine::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton && bPressActive)
+	{
+		bPressActive = false;
+		// Toggle only on a TAP: release inside our bounds with negligible movement since press.
+		// A drag (scroll) moves far and/or the engine's pan capture steals the Up, so we usually
+		// won't reach here for a drag — but guard with a distance threshold regardless.
+		const float DragThreshold = 8.f * ImSlate::GetImSlateEffectiveScale();
+		const float Moved = (MouseEvent.GetScreenSpacePosition() - PressScreenPos).Size();
+		const bool bInside = MyGeometry.IsUnderLocation(MouseEvent.GetScreenSpacePosition());
+		if (bInside && Moved <= DragThreshold)
+		{
+			bIsFolded = !bIsFolded;
+			SetTextWithFoldIndicator(OriginalText);
+			return FReply::Handled();
+		}
 	}
 	return FReply::Unhandled();
 }

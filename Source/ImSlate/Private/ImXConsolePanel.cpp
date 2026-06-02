@@ -42,7 +42,7 @@ static FXConsoleCommandLambdaFull XVar_ImSlateXConsole(
 	});
 
 //////////////////////////////////////////////////////////////////////////
-// Desktop hotkey: Right Ctrl toggles the panel (game/PIE runtime only)
+// Desktop hotkey: Alt+X toggles the panel (game/PIE runtime only)
 //////////////////////////////////////////////////////////////////////////
 #if PLATFORM_DESKTOP
 
@@ -50,11 +50,11 @@ static bool GImSlateXConsoleHotkey = true;
 static FAutoConsoleVariableRef CVar_ImSlateXConsoleHotkey(
 	TEXT("imslate.XConsoleHotkey"),
 	GImSlateXConsoleHotkey,
-	TEXT("Enable Right-Ctrl hotkey to toggle the ImSlate XConsole panel on desktop (game/PIE only)."));
+	TEXT("Enable Alt+X hotkey to toggle the ImSlate XConsole panel on desktop (game/PIE only)."));
 
 // A Slate-global input pre-processor so the hotkey works regardless of which widget/PlayerController
 // has focus. Toggles only when a game world is active (so it never fires in the editor at rest), and
-// returns Unhandled so Right-Ctrl still passes through to the game and other listeners.
+// returns Unhandled so the keys still pass through to the game and other listeners.
 class FImXConsoleHotkeyProcessor : public IInputProcessor
 {
 public:
@@ -62,14 +62,16 @@ public:
 
 	virtual bool HandleKeyDownEvent(FSlateApplication&, const FKeyEvent& InKeyEvent) override
 	{
+		// Alt+X (Right-Ctrl was taken). Trigger on the X key while Alt is held.
 		if (GImSlateXConsoleHotkey
-			&& InKeyEvent.GetKey() == EKeys::RightControl
+			&& InKeyEvent.GetKey() == EKeys::X
+			&& InKeyEvent.IsAltDown()
 			&& !InKeyEvent.IsRepeat())
 		{
 			if (UWorld* World = GetXConsoleGameWorld())
 				ToggleXConsolePanel(TOptional<bool>(), World);  // no arg = flip current state
 		}
-		return false;  // don't swallow — let Right-Ctrl pass through
+		return false;  // don't swallow — let the keys pass through
 	}
 };
 
@@ -365,7 +367,9 @@ void UImXConsolePanel::DrawParamWidget(const FName& TypeName, FString& Value, bo
 	if (bIsOptional && !bIsOptionalBool)
 	{
 		FString OptId = FString::Printf(TEXT("%s_opt%d"), *CmdName, Index);
-		ImSlate::CheckBox(FStringView(OptId), bEnabled);
+		// Green accent marks this as the "enable / is-set" toggle for an optional parameter, to
+		// distinguish it from a regular (blue) value checkbox.
+		ImSlate::CheckBox(FStringView(OptId), bEnabled, ImVec2(0, 0), FLinearColor(0.20f, 0.80f, 0.30f, 1.f));
 		ImSlate::SameLine();
 	}
 
@@ -668,10 +672,20 @@ void UImXConsolePanel::DrawCommandEntry(FImXConsoleCommandInfo& Info)
 	if (ImSlate::TextButton("CmdName", FText::FromString(LeafDisplay), ImVec2(0, XConsoleRowHeight)))
 		ExecuteCommand(Info);
 
-	// Parameters — each on same line, fill remaining width
+	// Parameters — each on same line, fill remaining width. A TOptional param draws as
+	// [enable-checkbox][input] kept tight together (default SameLine inside DrawParamWidget), while
+	// DIFFERENT params are separated by a wider gap, so it's visually clear which checkbox belongs
+	// to which input (i.e. which params are optional checkbox-gated).
+	const float ParamGap = 20.f * ImSlate::GetImSlateEffectiveScale();
 	for (int32 i = 0; i < Info.ParamTypes.Num(); ++i)
 	{
 		ImSlate::SameLine();
+		if (i > 0)
+		{
+			// Wider gap between consecutive params (group separator).
+			ImSlate::Dummy(ImVec2(ParamGap, 1.f));
+			ImSlate::SameLine();
+		}
 		const FString& TypeStr = Info.ParamTypes[i].ToString();
 		bool bIsOptional = TypeStr.StartsWith(TEXT("TOptional<"));
 		DrawParamWidget(Info.ParamTypes[i], Info.ParamValues[i], Info.ParamEnabled[i], bIsOptional, i, Info.Name);
@@ -741,7 +755,12 @@ void UImXConsolePanel::DrawCommandsTab()
 	bool bNeedSpacing = false;
 	for (const FString& Cat : Categories)
 	{
-		auto& SubCats = CommandTree[Cat];
+		// Defensive: use Find (not operator[]/FindChecked). A command executed during this same
+		// draw pass can mutate CommandTree (rehash) and invalidate Cat — FindChecked would crash.
+		auto* SubCatsPtr = CommandTree.Find(Cat);
+		if (!SubCatsPtr)
+			continue;
+		auto& SubCats = *SubCatsPtr;
 		if (!SearchFilter.IsEmpty())
 		{
 			bool bAny = false;

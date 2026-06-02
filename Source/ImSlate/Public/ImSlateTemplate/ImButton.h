@@ -40,9 +40,16 @@ public:
 
 	void QuitCustomState();
 
+	// When enabled, a press that turns into a vertical drag releases mouse capture and lets the
+	// event fall through to the parent panel's scroll/pan, instead of the button swallowing it.
+	// Used by list-row style buttons (e.g. fold headers) so dragging up/down over them scrolls the
+	// list. Off by default (normal buttons keep capturing).
+	void SetReleaseCaptureOnDragScroll(bool bEnable) { bReleaseCaptureOnDragScroll = bEnable; }
+
 public:
 	FReply OnFocusReceived(const FGeometry& MyGeometry, const FFocusEvent& InFocusEvent) override;
 	void OnFocusLost(const FFocusEvent& InFocusEvent) override;
+	FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	FReply OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	FReply OnDragDetected(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
@@ -59,6 +66,10 @@ protected:
 
 	bool bInDragDrop = false;
 	virtual void Drop();
+
+	bool bReleaseCaptureOnDragScroll = false;  // see SetReleaseCaptureOnDragScroll
+	FVector2D PressScreenPos = FVector2D::ZeroVector;
+	bool bPressActive = false;
 
 protected:
 

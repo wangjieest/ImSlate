@@ -304,9 +304,14 @@ public:
 		else
 			return SWidget::OnCursorQuery(MyGeometry, CursorEvent);
 	}
+	// Resize is disabled when NoResize is set (e.g. while maximized). Guard explicitly: when the
+	// handle isn't arranged its geometry is zero and IsInArea() would read as always-true, so a
+	// drag could still resize. Checking the flag prevents that.
+	bool IsResizeAllowed() const { return Target && !(Target->Flags & ImSlateWindowFlags_NoResize); }
+
 	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
 	{
-		if (IsInArea(MyGeometry, MouseEvent))
+		if (IsResizeAllowed() && IsInArea(MyGeometry, MouseEvent))
 		{
 			OrignalSize = Target->IsViewportGame() ? Target->GetCachedGeometry().GetLocalSize() : Target->GetCachedGeometry().GetAbsoluteSize();
 			return SImSlateDragingBase<>::OnMouseButtonDown(MyGeometry, MouseEvent);
@@ -318,7 +323,7 @@ public:
 	}
 	virtual FReply OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
 	{
-		if (IsInArea(MyGeometry, MouseEvent))
+		if (IsResizeAllowed() && IsInArea(MyGeometry, MouseEvent))
 		{
 			OrignalSize = Target->IsViewportGame() ? Target->GetCachedGeometry().GetLocalSize() : Target->GetCachedGeometry().GetAbsoluteSize();
 			return SImSlateDragingBase<>::OnTouchStarted(MyGeometry, MouseEvent);
@@ -970,10 +975,17 @@ void SImSlateWindow::ToggleMaximize()
 
 		// If the window had been popped out into a host SWindow, maximizing means "go fullscreen
 		// in the viewport": pull it back into the game viewport first, so fullscreen always == fill
-		// the viewport (consistent), and remember to restore it to the host on un-maximize.
+		// the viewport (consistent), and remember to restore it to a host on un-maximize.
 		bWasInHostBeforeMaximize = !IsViewportGame();
 		if (bWasInHostBeforeMaximize)
+		{
+			// Save the host popup's REAL on-screen geometry now (it lives in the SWindow, not in
+			// ActualPos). Stash it as the pending host geometry so the restored popup is recreated
+			// at the same place & size (consumed in SImViewportHost::MakePopupWindow).
+			PendingHostPos = GetCachedGeometry().GetAbsolutePosition();
+			PendingHostSize = GetCachedGeometry().GetAbsoluteSize();
 			MoveToViewport(GetViewportGame());
+		}
 
 		const FVector2D ViewportSize = Viewport->GetCachedGeometry().GetLocalSize();
 
@@ -993,14 +1005,34 @@ void SImSlateWindow::ToggleMaximize()
 		if (!bSavedNoResize) Flags &= ~ImSlateWindowFlags_NoResize;
 		bShowResizeHandle = bSavedShowResizeHandle;
 
-		// If it was popped out into a host before maximizing, send it back to the host.
 		if (bWasInHostBeforeMaximize && bSupportImViewportHost)
-			MoveToViewport(SelectViewport());
-		bWasInHostBeforeMaximize = false;
+		{
+			// SPECIAL CASE (host popup restore): the popup's real pos/size live in the SWindow, not
+			// in ActualPos. Recreate the host with PendingHostPos/Size (consumed in
+			// SImViewportHost::MakePopupWindow) — do NOT use SetWindowSize/DragingWindowPos here
+			// (SavedPos is the stale host ActualPos, and it would fight the pending geometry).
+			// SelectViewportHost (not SelectViewport): the still-fullscreen window would otherwise
+			// be judged as belonging to the game viewport.
+			bWasInHostBeforeMaximize = false;
+			// Capture the host size BEFORE MoveToViewport — it triggers MakePopupWindow which
+			// consumes (Resets) PendingHostSize.
+			const TOptional<FVector2D> HostSize = PendingHostSize;
+			MoveToViewport(SelectViewportHost(this, false));
 
-		if (!SavedSize.IsZero())
-			SetWindowSize(SavedSize);
-		DragingWindowPos(SavedPos, SavedPos);
+			// IMPORTANT: maximizing set ActualSize to the (game) fullscreen size and MakePopupWindow
+			// only resizes the real SWindow — it does NOT write ActualSize back. Restore ActualSize
+			// to the host's real size here, otherwise a later dock back to the game viewport would
+			// arrange the window using the stale fullscreen ActualSize.
+			if (HostSize.IsSet())
+				ActualSize = HostSize.GetValue();
+		}
+		else
+		{
+			// ORIGINAL in-viewport restore (unchanged): put back the saved local pos/size.
+			if (!SavedSize.IsZero())
+				SetWindowSize(SavedSize);
+			DragingWindowPos(SavedPos, SavedPos);
+		}
 	}
 	Invalidate(EInvalidateWidgetReason::Layout);
 }

@@ -30,6 +30,7 @@
 #include "Widgets/Views/SListView.h"
 #include "ImSlateTemplate/ImSearchBox.h"
 #include "ImSlateTemplate/ImVirtualKeyboard.h"
+#include "ImSlateTemplate/ImCheckBox.h"  // SImCheckBox::SetCheckAccentColor
 
 namespace ImSlate
 {
@@ -992,18 +993,21 @@ public:
 	ECheckBoxState CurState = ECheckBoxState::Undetermined;
 };
 
-bool CheckBox(ImStr Label, bool& bIsChecked, const ImVec2& InSize)
+bool CheckBox(ImStr Label, bool& bIsChecked, const ImVec2& InSize, const FLinearColor& AccentColor)
 {
 	auto ItemPtr = Item<SCheckBox>(Label, [&](FItemSlotPod& InItem) {
-		InItem.bFillWidth = true;
-		InItem.StretchValue = 1.f;
-		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Fill;
+		// Don't fill width — a checkbox is a fixed-size mark. Filling made it stretch to whatever
+		// column width it landed in, so the same checkbox looked different sizes in different rows.
+		// Left-align at its natural (check-mark) size so all checkboxes look identical.
+		InItem.bFillWidth = false;
+		InItem.HAlignment = HAlign_Left;
+		InItem.VAlignment = VAlign_Center;
 
 		TSharedRef<SCheckBox> WidgetRef = ImFactoryCreate<UImCheckBox>();
 
 		//WidgetRef->SetEnabled(!(flags & ImInputTextFlags_ReadOnly));
 		WidgetRef->SetIsChecked(bIsChecked);
+		StaticCastSharedRef<SImCheckBox>(WidgetRef)->SetCheckAccentColor(AccentColor);  // tint the mark
 		SetDesiredSize(WidgetRef, InSize);
 
 		auto Meta = MakeShared<FCheckBoxMeta>();
@@ -1042,10 +1046,10 @@ bool CheckBox(ImStr Label, bool& bIsChecked, const ImVec2& InSize)
 bool CheckBox(ImStr Label, ECheckBoxState& CheckState, const ImVec2& InSize)
 {
 	auto ItemPtr = Item<SCheckBox>(Label, [&](FItemSlotPod& InItem) {
-		InItem.bFillWidth = true;
-		InItem.StretchValue = 1.f;
-		InItem.HAlignment = HAlign_Fill;
-		InItem.VAlignment = VAlign_Fill;
+		// Fixed-size mark, left-aligned (see the bool overload above for why — no fill stretch).
+		InItem.bFillWidth = false;
+		InItem.HAlignment = HAlign_Left;
+		InItem.VAlignment = VAlign_Center;
 
 		TSharedRef<SCheckBox> WidgetRef = ImFactoryCreate<UImCheckBox>();
 

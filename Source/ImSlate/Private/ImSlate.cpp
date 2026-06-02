@@ -14,6 +14,7 @@
 #include "ImSlateStyleSetting.h"
 #include "ImSlateTemplates.h"
 #include "ImSlateTemplate/ImVirtualKeyboard.h"
+#include "ImSlateTemplate/ImButton.h"  // SImButton::SetReleaseCaptureOnDragScroll (fold drag-scroll)
 #include "Internationalization/Text.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "PrivateFieldAccessor.h"
@@ -586,6 +587,12 @@ bool Begin(ImStr Name, bool* bIsOpen, ImWindowFlags Flags, int32 Id)
 
 		CurWindow->FlagsPreviousFrame = CurWindow->Flags;
 		CurWindow->Flags = (ImSlateWindowFlags)Flags;
+		// While maximized the window must stay non-movable / non-resizable. Flags are driven by the
+		// caller's Begin() every frame (immediate mode), so re-apply NoMove|NoResize here — otherwise
+		// the per-frame Flags assignment above would wipe out what ToggleMaximize set and the window
+		// would become draggable/resizable again next frame.
+		if (CurWindow->IsMaximized())
+			CurWindow->Flags |= (ImSlateWindowFlags_NoMove | ImSlateWindowFlags_NoResize);
 		CurWindow->LastFrameActive = CurFrame;
 	}
 	else
@@ -1204,7 +1211,14 @@ bool FoldLine(ImStr Label, const FText& InText, float InHeight /*= 0.f*/)
 		if (InHeight > 0.f)
 			InItem.SetMinHeight(InHeight);
 
-		TSharedRef<SButton> WidgetRef = ImFactoryCreate<UImButton>();
+		// Create an SImButton directly (NOT ImFactoryCreate<UImButton>, which builds a plain SButton —
+		// casting that to SImButton and writing SImButton members corrupts memory). Pass null owner:
+		// the fold header doesn't need a backing UObject. This gives us SetReleaseCaptureOnDragScroll
+		// so a vertical drag over the header scrolls the panel instead of being swallowed by capture.
+		// Use UImButton's default style so the header looks the same as it did before this change.
+		TSharedRef<SImButton> WidgetRef = SNew(SImButton, nullptr)
+			.ButtonStyle(&GetDefault<UImButton>()->GetStyle());
+		WidgetRef->SetReleaseCaptureOnDragScroll(true);
 		auto Meta = MakeShared<FFoldMeta>();
 		WidgetRef->AddMetadata(Meta);
 		auto Ptr = &Meta.Get();

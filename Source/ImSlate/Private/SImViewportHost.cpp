@@ -126,8 +126,17 @@ TSharedPtr<SWindow> SImViewportHost::MakePopupWindow(SImSlateWindow* InWindow, b
 {
 	check(InWindow);
 	Window = InWindow;
-	FVector2D WindowPosition = InWindow->GetCachedGeometry().GetAbsolutePosition();
-	FVector2D WindowSize = InWindow->GetCachedGeometry().GetAbsoluteSize();
+	// Prefer an explicitly requested host geometry (set when restoring a maximized popup) over the
+	// current cached geometry — at restore time the window is still fullscreen in the game viewport,
+	// so its cached geometry would be the fullscreen rect, not the original popup. Consume it once.
+	FVector2D WindowPosition = InWindow->PendingHostPos.IsSet()
+		? InWindow->PendingHostPos.GetValue()
+		: InWindow->GetCachedGeometry().GetAbsolutePosition();
+	FVector2D WindowSize = InWindow->PendingHostSize.IsSet()
+		? InWindow->PendingHostSize.GetValue()
+		: InWindow->GetCachedGeometry().GetAbsoluteSize();
+	InWindow->PendingHostPos.Reset();
+	InWindow->PendingHostSize.Reset();
 	bool bGotWindowSize = !WindowSize.IsNearlyZero();
 	auto OwnerWindow = WeakOwner.Pin();
 	if (!OwnerWindow)

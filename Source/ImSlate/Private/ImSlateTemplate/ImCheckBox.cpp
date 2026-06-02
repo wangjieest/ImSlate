@@ -16,14 +16,22 @@
 class SImCheckMark : public SLeafWidget
 {
 public:
-	SLATE_BEGIN_ARGS(SImCheckMark) {}
+	SLATE_BEGIN_ARGS(SImCheckMark)
+		: _AccentColor(FLinearColor(0.10f, 0.45f, 0.90f, 1.f))  // default blue
+		{}
 		SLATE_ARGUMENT(TFunction<ECheckBoxState()>, StateGetter)
+		SLATE_ARGUMENT(FLinearColor, AccentColor)
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs)
 	{
 		StateGetter = InArgs._StateGetter;
+		AccentColor = InArgs._AccentColor;
 		SetCanTick(false);
+		// The mark reads its state via a getter in OnPaint and has NO TAttribute dependency, so a
+		// state change (click) doesn't invalidate it on its own. Make it volatile so it repaints
+		// every frame and always reflects the current tri-state. (It's a tiny leaf — negligible cost.)
+		ForceVolatile(true);
 	}
 
 	virtual FVector2D ComputeDesiredSize(float) const override
@@ -41,30 +49,44 @@ public:
 		const FVector2D TL((Sz.X - Side) * 0.5f, (Sz.Y - Side) * 0.5f);  // center the square
 		const auto PG = G.ToPaintGeometry();
 
-		// One shared box brush with a FIXED small corner radius (NOT height-based, which would round
-		// a square into a circle). All three states use this SAME outer box shape — only the fill
-		// colour and the inner glyph differ, so the outline is identical across states.
-		auto MakeBoxBrush = [](const FLinearColor& Fill, const FLinearColor& Outline, float OutlineW) {
-			FSlateRoundedBoxBrush B(Fill, Outline, OutlineW);
-			B.OutlineSettings.RoundingType = ESlateBrushRoundingType::FixedRadius;
-			B.OutlineSettings.CornerRadii = FVector4(3.f, 3.f, 3.f, 3.f);
-			return B;
-		};
-		const FLinearColor Blue(0.10f, 0.45f, 0.90f, 1.f);
-		const FLinearColor BoxGrey(0.30f, 0.30f, 0.30f, 1.f);
-		const FLinearColor OutlineGrey(0.6f, 0.6f, 0.6f, 1.f);
+		// Strongly-distinct tri-state colours that all read clearly on the light-blue panel bg:
+		//   Unchecked    → SOLID dark-grey box (was transparent → invisible on light bg)
+		//   Checked      → accent fill (blue default / green for enable toggles) + white tick
+		//   Undetermined → orange fill + white dash (clearly different from both above)
+		// Softer, less-saturated tri-state palette.
+		//   Unchecked    → empty: faint translucent fill (just an outlined box, no solid colour)
+		//   Checked      → soft accent fill + white tick
+		//   Undetermined → soft amber fill + white dash
+		const FLinearColor UncheckedFill(0.25f, 0.25f, 0.28f, 0.35f);  // faint → reads as "empty box"
+		const FLinearColor SoftAccent(AccentColor.R * 0.8f, AccentColor.G * 0.8f, AccentColor.B * 0.8f, 1.f);  // dim RGB, keep opaque
+		const FLinearColor SoftAmber(0.85f, 0.62f, 0.30f, 1.f);        // muted amber, not bright orange
 		const float LineW = 2.f * ImSlate::GetImSlateEffectiveScale();
 
-		FSlateRoundedBoxBrush BoxBrush = (State == ECheckBoxState::Checked)
-			? MakeBoxBrush(Blue, OutlineGrey, 1.f)
+		const FLinearColor FillColor = (State == ECheckBoxState::Checked)
+			? SoftAccent
 			: (State == ECheckBoxState::Undetermined)
-				? MakeBoxBrush(BoxGrey, OutlineGrey, 1.f)
-				: MakeBoxBrush(FLinearColor::Transparent, OutlineGrey, 1.5f);  // Unchecked: empty
+				? SoftAmber
+				: UncheckedFill;
+
+		// Use a STATIC white RoundedBox brush and pass the per-state colour via MakeBox's InTint
+		// (last arg). Building a fresh FSlateRoundedBoxBrush each paint and relying on its internal
+		// TintColor did NOT update on screen (the brush's resource handle is rebuilt every frame and
+		// the colour didn't take) — tinting a stable brush works, same as SImFoldLine does it.
+		static FSlateBrush BoxBrush = []() {
+			FSlateBrush B;
+			B.DrawAs = ESlateBrushDrawType::RoundedBox;
+			B.TintColor = FLinearColor::White;  // tinted per-call via InTint
+			B.OutlineSettings.RoundingType = ESlateBrushRoundingType::FixedRadius;
+			B.OutlineSettings.CornerRadii = FVector4(3.f, 3.f, 3.f, 3.f);
+			B.OutlineSettings.Color = FLinearColor(0.7f, 0.7f, 0.7f, 1.f);
+			B.OutlineSettings.Width = 1.f;
+			return B;
+		}();
 
 		auto BoxGeom = G.MakeChild(FVector2f(Side, Side), FSlateLayoutTransform(FVector2f(TL))).ToPaintGeometry();
-		FSlateDrawElement::MakeBox(Out, LayerId, BoxGeom, &BoxBrush);
+		FSlateDrawElement::MakeBox(Out, LayerId, BoxGeom, &BoxBrush, ESlateDrawEffect::None, FillColor);
 
-		// Inner glyph on top of the (identical) box.
+		// Inner glyph on top of the box.
 		if (State == ECheckBoxState::Checked)
 		{
 			// White tick.
@@ -77,17 +99,18 @@ public:
 		}
 		else if (State == ECheckBoxState::Undetermined)
 		{
-			// Horizontal dash.
+			// White horizontal dash.
 			const float y = TL.Y + Side * 0.5f;
 			FSlateDrawElement::MakeLines(Out, LayerId + 1, PG,
 				{FVector2D(TL.X + Side * 0.24f, y), FVector2D(TL.X + Side * 0.76f, y)},
-				ESlateDrawEffect::None, FLinearColor(0.9f, 0.9f, 0.9f, 1.f), true, LineW);
+				ESlateDrawEffect::None, FLinearColor::White, true, LineW);
 		}
 		return LayerId + 2;
 	}
 
 private:
 	TFunction<ECheckBoxState()> StateGetter;
+	FLinearColor AccentColor = FLinearColor(0.10f, 0.45f, 0.90f, 1.f);
 };
 
 SImCheckBox::SImCheckBox()
@@ -138,6 +161,21 @@ void SImCheckBox::Construct(const FArguments& InArgs)
 	UncheckedSound = InArgs._UncheckedSoundOverride.Get(InArgs._Style->UncheckedSlateSound);
 }
 
+FReply SImCheckBox::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	FReply Reply = SCheckBox::OnMouseButtonUp(MyGeometry, MouseEvent);
+	// The base may have toggled the state here; repaint so the self-painted mark updates.
+	Invalidate(EInvalidateWidgetReason::Paint);
+	return Reply;
+}
+
+FReply SImCheckBox::OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
+{
+	FReply Reply = SCheckBox::OnTouchEnded(MyGeometry, InTouchEvent);
+	Invalidate(EInvalidateWidgetReason::Paint);
+	return Reply;
+}
+
 void SImCheckBox::SetStyle(const FCheckBoxStyle* InStyle, const FImCheckBoxExtraStyle* InExtraStyle)
 {
 	Style = InStyle;
@@ -184,6 +222,7 @@ void SImCheckBox::BuildCheckBox(TSharedRef<SWidget> InContent)
 					// Self-painted tri-state mark (clearer than the default themed check images).
 					SNew(SImCheckMark)
 					.StateGetter([this]() { return IsCheckboxChecked.Get(); })
+					.AccentColor(CheckAccentColor)
 				]
 			]
 			+ SHorizontalBox::Slot()

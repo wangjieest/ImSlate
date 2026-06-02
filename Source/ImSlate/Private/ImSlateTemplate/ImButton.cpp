@@ -45,7 +45,10 @@ void SImButton::Construct(const FArguments& InArgs, UImMultiStateButton* InButto
 
 	ButtonObject = InButtonObject;
 
-	SetButtonExtraStyle(&InButtonObject->ExtraStyle);
+	// InButtonObject may be null for lightweight uses (e.g. a fold header that only needs the
+	// base button behaviour + SetReleaseCaptureOnDragScroll). Only pull the extra style when present.
+	if (InButtonObject)
+		SetButtonExtraStyle(&InButtonObject->ExtraStyle);
 }
 
 void SImButton::SetButtonExtraStyle(const FImButtonExtraStyle* ButtonStyle)
@@ -84,6 +87,7 @@ void SImButton::QuitCustomState()
 
 FReply SImButton::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
+	bPressActive = false;
 	if (IsDragging())
 	{
 		Drop();
@@ -102,11 +106,15 @@ void SImButton::OnDropOperation()
 void SImButton::Drop()
 {
 	bInDragDrop = false;
-	ButtonObject->OnDragEnd.Broadcast();
+	if (ButtonObject.IsValid())
+		ButtonObject->OnDragEnd.Broadcast();
 }
 
 FReply SImButton::OnDragDetected(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
+	// No backing UObject (e.g. fold header) → no UMG-style drag-drop; nothing to do.
+	if (!ButtonObject.IsValid())
+		return FReply::Unhandled();
 	ButtonObject->OnDragQuery.Broadcast(MyGeometry, MouseEvent);
 	if (IsValid(ButtonObject->DragDropOp))
 	{
@@ -123,8 +131,34 @@ FReply SImButton::OnDragDetected(const FGeometry& MyGeometry, const FPointerEven
 	return FReply::Unhandled();
 }
 
+FReply SImButton::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	if (bReleaseCaptureOnDragScroll)
+	{
+		bPressActive = true;
+		PressScreenPos = MouseEvent.GetScreenSpacePosition();
+	}
+	return SButton::OnMouseButtonDown(MyGeometry, MouseEvent);
+}
+
 FReply SImButton::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
+	// List-row buttons (fold headers): once a press becomes a vertical drag, release mouse capture
+	// and stop consuming the event so the parent panel's scroll/pan takes over (drag-to-scroll).
+	if (bReleaseCaptureOnDragScroll && bPressActive && HasMouseCapture())
+	{
+		const float Moved = (MouseEvent.GetScreenSpacePosition() - PressScreenPos).Size();
+		const float Threshold = 6.f * ImSlate::GetImSlateEffectiveScale();
+		if (Moved > Threshold)
+		{
+			bPressActive = false;
+			// Releasing capture + returning Unhandled lets the engine route the ongoing drag to the
+			// panel as a scroll/pan gesture. The click is cancelled (no toggle), which is what we
+			// want for a drag.
+			return FReply::Handled().ReleaseMouseCapture();
+		}
+	}
+
 	auto Reply = SButton::OnMouseMove(MyGeometry, MouseEvent);
 	// pressed & moving
 	if (IsPressed())
@@ -139,13 +173,15 @@ FReply SImButton::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& 
 
 void SImButton::OnFocusLost(const FFocusEvent& InFocusEvent)
 {
-	ButtonObject->OnUnFocused.Broadcast();
+	if (ButtonObject.IsValid())
+		ButtonObject->OnUnFocused.Broadcast();
 	SButton::OnFocusLost(InFocusEvent);
 }
 
 FReply SImButton::OnFocusReceived(const FGeometry& MyGeometry, const FFocusEvent& InFocusEvent)
 {
-	ButtonObject->OnFocused.Broadcast();
+	if (ButtonObject.IsValid())
+		ButtonObject->OnFocused.Broadcast();
 	return SWidget::OnFocusReceived(MyGeometry, InFocusEvent);
 }
 
@@ -162,7 +198,7 @@ const FSlateBrush* SImButton::GetBorder() const
 	{
 		return &CurrentStyle->Disabled;
 	}
-	else if (IsDragging())
+	else if (IsDragging() && DraggedImage)
 	{
 		return DraggedImage;
 	}
@@ -174,7 +210,7 @@ const FSlateBrush* SImButton::GetBorder() const
 	{
 		return &CurrentStyle->Hovered;
 	}
-	else if (IsFocused())
+	else if (IsFocused() && FocusedImage)
 	{
 		return FocusedImage;
 	}

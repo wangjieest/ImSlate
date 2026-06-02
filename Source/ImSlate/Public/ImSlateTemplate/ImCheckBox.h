@@ -50,8 +50,25 @@ public:
 
 	void SetOnCheckStateChanged(FOnCheckStateChanged InDelegate);
 
+	// Accent (Checked fill) color of the self-painted mark. Default blue; e.g. green to mark an
+	// "enable / is-set" toggle distinctly from a regular value checkbox. Rebuilds the mark.
+	void SetCheckAccentColor(const FLinearColor& InColor)
+	{
+		CheckAccentColor = InColor;
+		if (ContentContainer.IsValid())
+			BuildCheckBox(ContentContainer->GetContent());
+	}
+
+	// Our tri-state mark (SImCheckMark) is a self-painted leaf that reads its state in OnPaint via
+	// a getter — it has NO TAttribute dependency, so a click (ToggleCheckedState changes the state
+	// WITHOUT invalidating anything) wouldn't repaint it. Override the click/touch handlers to
+	// invalidate paint after the base toggles, so the mark reflects the new state.
+	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
+
 protected:
 	const FImCheckBoxExtraStyle* ExtraStyle = nullptr;
+	FLinearColor CheckAccentColor = FLinearColor(0.10f, 0.45f, 0.90f, 1.f);  // Checked-fill color (blue default)
 };
 
 UCLASS()
