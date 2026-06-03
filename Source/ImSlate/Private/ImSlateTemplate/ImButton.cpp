@@ -46,7 +46,7 @@ void SImButton::Construct(const FArguments& InArgs, UImMultiStateButton* InButto
 	ButtonObject = InButtonObject;
 
 	// InButtonObject may be null for lightweight uses (e.g. a fold header that only needs the
-	// base button behaviour + SetReleaseCaptureOnDragScroll). Only pull the extra style when present.
+	// base button behaviour + SetMousePressBehavior). Only pull the extra style when present.
 	if (InButtonObject)
 		SetButtonExtraStyle(&InButtonObject->ExtraStyle);
 }
@@ -91,20 +91,20 @@ FReply SImButton::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEve
 	bPressActive = false;
 	if (bDragScrolling)
 	{
-		// This press was a drag-scroll, not a click — consume the up and don't fire OnClicked.
+		// This press was a drag, not a click — consume the up and don't fire OnClicked.
 		bDragScrolling = false;
-		if (DragScrollEndHandler)
-			DragScrollEndHandler(MouseEvent.GetScreenSpacePosition());
+		if (PressBehavior.OnDragEnd)
+			PressBehavior.OnDragEnd(MouseEvent.GetScreenSpacePosition());
 		return FReply::Handled().ReleaseMouseCapture();
 	}
-	// No-scroll path: down didn't capture (it bubbled to the window for the move). A tap (no drag) must
-	// still fold — fire the click manually, since SButton never saw a captured press.
-	if (bWasPress && DragScrollHandler && CanWindowScroll && !CanWindowScroll())
+	// Bubble-on-press path: down didn't capture (it bubbled to the window for the move). A tap (no drag)
+	// must still fire — do the click manually, since SButton never saw a captured press.
+	if (bWasPress && PressBehavior.IsSet() && PressBehavior.ShouldBubbleOnPress && PressBehavior.ShouldBubbleOnPress())
 	{
 		const float TapTol = 6.f * ImSlate::GetImSlateEffectiveScale();
 		if ((MouseEvent.GetScreenSpacePosition() - PressScreenPos).Size() < TapTol)
-			return ExecuteOnClick();   // tap → fold toggle
-		return FReply::Unhandled();    // was a drag → the window handled the move
+			return ExecuteOnClick();   // tap → click (e.g. fold toggle)
+		return FReply::Unhandled();    // was a drag → the ancestor handled the move
 	}
 	if (IsDragging())
 	{
@@ -151,26 +151,27 @@ FReply SImButton::OnDragDetected(const FGeometry& MyGeometry, const FPointerEven
 
 FReply SImButton::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
-	if (bReleaseCaptureOnDragScroll || DragScrollHandler)
+	if (PressBehavior.IsSet())
 	{
 		bPressActive = true;
 		bDragScrolling = false;
 		PressScreenPos = MouseEvent.GetScreenSpacePosition();
 		LastDragPos = PressScreenPos;
-		// Content can't scroll → DON'T capture; let the press bubble up to the window so the window does
-		// DetectDrag(self) → OnDragDetected → window move. This is the titlebar path (a child capturing or
-		// detecting the window did not carry content). A tap (no drag) is turned into a click in OnMouseButtonUp.
-		if (DragScrollHandler && CanWindowScroll && !CanWindowScroll())
+		// Behaviour asks to bubble (e.g. content can't scroll) → DON'T capture; let the press bubble up so
+		// an ancestor (the window) does DetectDrag(self) → OnDragDetected → move. This is the titlebar path
+		// (a child capturing or detecting the window did not carry content). A tap (no drag) is turned into
+		// a click in OnMouseButtonUp.
+		if (PressBehavior.ShouldBubbleOnPress && PressBehavior.ShouldBubbleOnPress())
 			return FReply::Unhandled();
 	}
-	return SButton::OnMouseButtonDown(MyGeometry, MouseEvent);  // capture (scroll + click)
+	return SButton::OnMouseButtonDown(MyGeometry, MouseEvent);  // capture (drag + click)
 }
 
 FReply SImButton::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
-	// List-row buttons (fold headers): once a press becomes a vertical drag, release mouse capture
-	// and stop consuming the event so the parent panel's scroll/pan takes over (drag-to-scroll).
-	if (bPressActive && HasMouseCapture() && (DragScrollHandler || bReleaseCaptureOnDragScroll))
+	// Buttons with a press behaviour (e.g. fold headers): once a press becomes a drag, forward it to the
+	// behaviour so the parent panel's scroll / the window's move takes over (instead of clicking).
+	if (bPressActive && HasMouseCapture() && PressBehavior.IsSet())
 	{
 		const FVector2D Cur = MouseEvent.GetScreenSpacePosition();
 		const float Threshold = 6.f * ImSlate::GetImSlateEffectiveScale();
@@ -181,16 +182,16 @@ FReply SImButton::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& 
 		}
 		if (bDragScrolling)
 		{
-			if (DragScrollHandler)
+			if (PressBehavior.OnDragMove)
 			{
-				// Forward (press, current); handler returns scroll(Handled, keep capture) or move-window
-				// (BeginDragDrop, drag-drop takes over). The click is cancelled in OnMouseButtonUp.
+				// Forward (press, current); behaviour returns Handled (it took over — keep capture &
+				// keep forwarding) or Unhandled (declined). The click is cancelled in OnMouseButtonUp.
 				LastDragPos = Cur;
-				FReply R = DragScrollHandler(PressScreenPos, Cur);
+				FReply R = PressBehavior.OnDragMove(PressScreenPos, Cur);
 				if (R.IsEventHandled())
 					return R;
 			}
-			// Legacy fallback: no handler set — release capture (old behaviour, no one took over).
+			// Behaviour declined — release capture so an ancestor can take over (old fallback).
 			bPressActive = false;
 			return FReply::Handled().ReleaseMouseCapture();
 		}
@@ -214,7 +215,7 @@ FReply SImButton::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& 
 // others fall through to SButton (which lets touch fall back to mouse as before).
 FReply SImButton::OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
 {
-	if (bReleaseCaptureOnDragScroll || DragScrollHandler)
+	if (PressBehavior.IsSet())
 	{
 		bPressActive = true;
 		bDragScrolling = false;
@@ -228,7 +229,7 @@ FReply SImButton::OnTouchStarted(const FGeometry& MyGeometry, const FPointerEven
 
 FReply SImButton::OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
 {
-	if (bPressActive && (DragScrollHandler || bReleaseCaptureOnDragScroll))
+	if (bPressActive && PressBehavior.IsSet())
 	{
 		const FVector2D Cur = InTouchEvent.GetScreenSpacePosition();
 		const float Threshold = 6.f * ImSlate::GetImSlateEffectiveScale();
@@ -240,10 +241,10 @@ FReply SImButton::OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent&
 		}
 		if (bDragScrolling)
 		{
-			if (DragScrollHandler)
+			if (PressBehavior.OnDragMove)
 			{
 				LastDragPos = Cur;
-				FReply R = DragScrollHandler(PressScreenPos, Cur);  // scroll or move-window(BeginDragDrop)
+				FReply R = PressBehavior.OnDragMove(PressScreenPos, Cur);  // scroll / move-window
 				if (R.IsEventHandled())
 					return R;
 			}
@@ -263,9 +264,9 @@ FReply SImButton::OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent&
 		Release();
 		if (bWasDrag)
 		{
-			if (DragScrollEndHandler)
-				DragScrollEndHandler(InTouchEvent.GetScreenSpacePosition());
-			return FReply::Handled().ReleaseMouseCapture();  // was a scroll, not a tap → no click
+			if (PressBehavior.OnDragEnd)
+				PressBehavior.OnDragEnd(InTouchEvent.GetScreenSpacePosition());
+			return FReply::Handled().ReleaseMouseCapture();  // was a drag, not a tap → no click
 		}
 		// A tap: fire the click (e.g. fold toggle), since SButton's own touch path is a no-op.
 		return ExecuteOnClick().ReleaseMouseCapture();

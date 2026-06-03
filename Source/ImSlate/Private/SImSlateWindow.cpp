@@ -776,38 +776,9 @@ void SImSlateWindow::SetScrollTarget(FVector2D In)
 	ChildPanel->SetScrollTarget(In);
 }
 
-void SImSlateWindow::ScrollContentBy(FVector2D Delta)
-{
-	// If the content has room to scroll, scroll it (content moves opposite to the finger → -Delta.Y).
-	// Note: when it CAN scroll but is already at the top/bottom, ScrollByDelta clamps and nothing moves —
-	// we intentionally do NOT fall back to moving the window in that case (per design).
-	if (ChildPanel && ChildPanel->CanScroll())
-	{
-		ChildPanel->ScrollByDelta(-Delta.Y);
-		return;
-	}
-
-	// No scroll room → drag-move the whole window by the finger delta (unless moving is disabled).
-	if (!(Flags & ImSlateWindowFlags_NoMove))
-	{
-		const FVector2D CurAbs = GetCachedGeometry().GetAbsolutePosition();
-		const FVector2D NewAbs = CurAbs + Delta;
-		const FVector2D NewLocal = Viewport ? Viewport->AbsoluteToLocal(NewAbs) : NewAbs;
-		DragingWindowPos(NewLocal, NewAbs);
-	}
-}
-
 bool SImSlateWindow::CanScrollContent() const
 {
 	return ChildPanel && ChildPanel->CanScroll();
-}
-
-// Begin the SAME window drag-drop the titlebar uses (FImSlateDragOperation), so move + viewport/host
-// switching + drop are all handled by the proven drag-drop path — not hand-rolled. AbsGrabOffset =
-// press screen pos - window abs pos (same convention as OnDragDetected:1386).
-TSharedRef<FDragDropOperation> SImSlateWindow::MakeWindowDragOp(FVector2D AbsGrabOffset)
-{
-	return FImSlateDragOperation::New(ToSharedRef(), AbsGrabOffset);  // same op the titlebar uses (OnDragDetected)
 }
 
 void SImSlateWindow::PanContentMove(FVector2D PressPos, FVector2D CurPos)

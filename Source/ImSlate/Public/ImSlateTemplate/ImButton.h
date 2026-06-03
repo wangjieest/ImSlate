@@ -9,6 +9,28 @@
 #include "ImButton.generated.h"
 
 
+// A pluggable press/drag behaviour for SImButton. The button itself knows nothing about scrolling,
+// windows or folds — it only detects "this press became a drag" and forwards it here. Whoever installs
+// the behaviour (e.g. a fold header) decides what a drag means (scroll the panel, move the window, ...).
+//
+// Press routing:
+//   - ShouldBubbleOnPress() returning true makes OnMouseButtonDown return Unhandled (DON'T capture), so
+//     the press bubbles to an ancestor (e.g. the window does DetectDrag(self) → move). A tap is then
+//     turned back into a click in OnMouseButtonUp. Returning false keeps the normal SButton capture.
+// Drag:
+//   - OnDragMove(press, cur) is called once the pointer crosses the drag threshold (per move). Return
+//     Handled() to keep owning the drag (button keeps capture & keeps forwarding), or Unhandled() to
+//     decline (the press falls back to bubbling / the click is left to fire).
+//   - OnDragEnd(cur) is called when a drag releases.
+struct FImMousePressBehavior
+{
+	TFunction<bool()> ShouldBubbleOnPress;                       // true → don't capture on press, bubble up
+	TFunction<FReply(FVector2D Press, FVector2D Cur)> OnDragMove;  // a past-threshold drag move
+	TFunction<void(FVector2D Cur)> OnDragEnd;                    // drag released
+
+	bool IsSet() const { return (bool)OnDragMove; }
+};
+
 /**
  * Slate's Buttons are clickable Widgets that can contain arbitrary widgets as its Content().
  */
@@ -40,24 +62,10 @@ public:
 
 	void QuitCustomState();
 
-	// When enabled, a press that turns into a vertical drag releases mouse capture and lets the
-	// event fall through to the parent panel's scroll/pan, instead of the button swallowing it.
-	// Used by list-row style buttons (e.g. fold headers) so dragging up/down over them scrolls the
-	// list. Off by default (normal buttons keep capturing).
-	void SetReleaseCaptureOnDragScroll(bool bEnable) { bReleaseCaptureOnDragScroll = bEnable; }
-
-	// Drag-to-scroll: when set, a vertical drag over this button (while it holds capture) is forwarded
-	// to this handler as a per-move Y delta — instead of releasing capture. Used by fold headers to pan
-	// the content panel. The handler typically calls SImSlateWindow::ScrollContentBy.
-	// Handler returns the FReply to propagate: Handled() to keep scrolling (button keeps capture), or
-	// Handled().BeginDragDrop(...) to hand the gesture to a window drag-drop (move-window). Unhandled to decline.
-	void SetDragScrollHandler(TFunction<FReply(FVector2D, FVector2D)> InHandler) { DragScrollHandler = MoveTemp(InHandler); }
-	void SetDragScrollEndHandler(TFunction<void(FVector2D)> InHandler) { DragScrollEndHandler = MoveTemp(InHandler); }
-	// Down-detect for move-window: on press, if content can't scroll, arm a DetectDrag on this target
-	// (the owning window) so a drag becomes a stable down-detected window move (= host switch), like the
-	// titlebar — instead of an unstable move-time DetectDrag. CanScroll decides scroll-vs-move at press.
-	void SetDragDetectTarget(TSharedRef<SWidget> InTarget) { DragDetectTarget = InTarget; }
-	void SetCanWindowScroll(TFunction<bool()> InFn) { CanWindowScroll = MoveTemp(InFn); }
+	// Install a press/drag behaviour (see FImMousePressBehavior). When set, this button forwards drags to
+	// it (used by fold headers to scroll the panel / move the window). When unset, the button is a plain
+	// SButton. Off by default (normal buttons just click).
+	void SetMousePressBehavior(FImMousePressBehavior InBehavior) { PressBehavior = MoveTemp(InBehavior); }
 
 public:
 	FReply OnFocusReceived(const FGeometry& MyGeometry, const FFocusEvent& InFocusEvent) override;
@@ -83,14 +91,9 @@ protected:
 	bool bInDragDrop = false;
 	virtual void Drop();
 
-	bool bReleaseCaptureOnDragScroll = false;  // see SetReleaseCaptureOnDragScroll
+	FImMousePressBehavior PressBehavior;            // pluggable drag behaviour; see SetMousePressBehavior
 	FVector2D PressScreenPos = FVector2D::ZeroVector;
 	bool bPressActive = false;
-
-	TFunction<FReply(FVector2D, FVector2D)> DragScrollHandler;  // forwarded drag: (press pos, current pos) → FReply
-	TFunction<void(FVector2D)> DragScrollEndHandler;           // drag released at (current pos)
-	TWeakPtr<SWidget> DragDetectTarget;                        // window to DetectDrag for move-window
-	TFunction<bool()> CanWindowScroll;                        // press-time scroll-vs-move decision
 	bool bDragScrolling = false;                    // this press has crossed the drag threshold
 	FVector2D LastDragPos = FVector2D::ZeroVector;  // last pointer pos, for per-move delta
 

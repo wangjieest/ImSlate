@@ -14,7 +14,7 @@
 #include "ImSlateStyleSetting.h"
 #include "ImSlateTemplates.h"
 #include "ImSlateTemplate/ImVirtualKeyboard.h"
-#include "ImSlateTemplate/ImButton.h"  // SImButton::SetReleaseCaptureOnDragScroll (fold drag-scroll)
+#include "ImSlateTemplate/ImButton.h"  // SImButton::SetMousePressBehavior (fold header drag)
 #include "Internationalization/Text.h"
 #include "Kismet/KismetMathLibrary.h"
 #include "PrivateFieldAccessor.h"
@@ -1226,24 +1226,26 @@ bool FoldLine(ImStr Label, const FText& InText, float InHeight /*= 0.f*/)
 
 		// Create an SImButton directly (NOT ImFactoryCreate<UImButton>, which builds a plain SButton —
 		// casting that to SImButton and writing SImButton members corrupts memory). Pass null owner:
-		// the fold header doesn't need a backing UObject. This gives us SetReleaseCaptureOnDragScroll
-		// so a vertical drag over the header scrolls the panel instead of being swallowed by capture.
+		// the fold header doesn't need a backing UObject.
 		// Use UImButton's default style so the header looks the same as it did before this change.
 		TSharedRef<SImButton> WidgetRef = SNew(SImButton, nullptr)
 			.ButtonStyle(&GetDefault<UImButton>()->GetStyle());
-		WidgetRef->SetReleaseCaptureOnDragScroll(true);
-		// Drag-to-scroll: forward a vertical drag over the header to the window's content scroll, so
-		// dragging the fold header pans the list. Gated at run time by the imslate.DragScrollContent CVar.
+		// Install the fold-header drag behaviour (all scroll/move-window knowledge lives HERE, not in the
+		// button — the button only forwards drags to this behaviour). Gated by imslate.DragScrollContent.
+		//   - ShouldBubbleOnPress: content CAN'T scroll → don't capture on press; let it bubble to the window
+		//     so the window does DetectDrag(self) → move (host switch), exactly like the titlebar.
+		//   - OnDragMove: content CAN scroll → pan it (Handled = button keeps capture & keeps forwarding);
+		//     otherwise decline (Unhandled) so the bubbled press drives the window move.
+		//   - OnDragEnd: end the content pan.
 		if (auto* Win = GImSlate->CurrentWindow)
 		{
 			TWeakPtr<SImSlateWindow> WeakWin = StaticCastSharedRef<SImSlateWindow>(Win->AsShared());
-			// Stable move-window via DOWN-detect: at press, the button arms DetectDrag(window) when content
-			// can't scroll (set up here), so a drag becomes window->OnDragDetected (host switch) just like
-			// the titlebar. The move handler below only handles the scroll case; the no-scroll case returns
-			// Unhandled so the button releases capture and the down-armed drag-detect takes over.
-			WidgetRef->SetDragDetectTarget(Win->AsShared());
-			WidgetRef->SetCanWindowScroll([WeakWin]() { auto W = WeakWin.Pin(); return W.IsValid() && W->CanScrollContent(); });
-			WidgetRef->SetDragScrollHandler([WeakWin](FVector2D Press, FVector2D Cur) -> FReply {
+			FImMousePressBehavior Behavior;
+			Behavior.ShouldBubbleOnPress = [WeakWin]() {
+				auto W = WeakWin.Pin();
+				return W.IsValid() && !W->CanScrollContent();  // can't scroll → bubble (window move)
+			};
+			Behavior.OnDragMove = [WeakWin](FVector2D Press, FVector2D Cur) -> FReply {
 				auto W = WeakWin.Pin();
 				if (!W || !GImSlateDragScrollContent)
 					return FReply::Unhandled();
@@ -1252,14 +1254,14 @@ bool FoldLine(ImStr Label, const FText& InText, float InHeight /*= 0.f*/)
 					W->PanContentMove(Press, Cur);
 					return FReply::Handled();  // scrolling — button keeps capture & keeps forwarding
 				}
-				// Can't scroll → decline; the down-armed DetectDrag(window) drives the move (host switch).
-				return FReply::Unhandled();
-			});
-			WidgetRef->SetDragScrollEndHandler([WeakWin](FVector2D Cur) {
+				return FReply::Unhandled();  // can't scroll → the bubbled press drives the window move
+			};
+			Behavior.OnDragEnd = [WeakWin](FVector2D Cur) {
 				if (GImSlateDragScrollContent)
 					if (auto W = WeakWin.Pin())
 						W->PanContentEnd(Cur);
-			});
+			};
+			WidgetRef->SetMousePressBehavior(MoveTemp(Behavior));
 		}
 		auto Meta = MakeShared<FFoldMeta>();
 		WidgetRef->AddMetadata(Meta);

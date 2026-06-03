@@ -8,9 +8,11 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "HAL/IConsoleManager.h"
-#include "Framework/Application/IInputProcessor.h"
-#include "Framework/Application/SlateApplication.h"
 #include "Misc/CoreDelegates.h"
+#include "GameFramework/PlayerInput.h"
+#include "EnhancedPlayerInput.h"
+#include "UObject/UObjectIterator.h"
+#include "UObject/UObjectGlobals.h"  // FCoreUObjectDelegates::PostLoadMapWithWorld
 
 #if GMP_EXTEND_CONSOLE
 
@@ -43,63 +45,78 @@ static FXConsoleCommandLambdaFull XVar_ImSlateXConsole(
 
 //////////////////////////////////////////////////////////////////////////
 // Desktop hotkey: Alt+~ or Ctrl+~ toggles the panel (game/PIE runtime only)
+//
+// Implemented via UE's DebugExecBindings (the same mechanism the ImGui plugin uses for its
+// Right-Shift toggle): a key+modifier chord is injected into UPlayerInput::DebugExecBindings and
+// bound to an exec console command. This is the engine-native debug-key path (like the `~` console
+// key) and works reliably inside PIE — unlike a Slate IInputProcessor, which the PIE viewport /
+// CommonUI input stack can consume before it reaches us.
 //////////////////////////////////////////////////////////////////////////
 #if PLATFORM_DESKTOP
 
-static bool GImSlateXConsoleHotkey = true;
-static FAutoConsoleVariableRef CVar_ImSlateXConsoleHotkey(
-	TEXT("imslate.XConsoleHotkey"),
-	GImSlateXConsoleHotkey,
-	TEXT("Enable Alt+~ / Ctrl+~ hotkey to toggle the ImSlate XConsole panel on desktop (game/PIE only)."));
+// Exec command the chords are bound to. Flips the panel for the current game world.
+static FAutoConsoleCommand GCmd_ImSlateXConsoleToggle(
+	TEXT("imslate.XConsole.Toggle"),
+	TEXT("Toggle the ImSlate XConsole panel (bound to Alt+~ / Ctrl+~ on desktop)."),
+	FConsoleCommandDelegate::CreateLambda([] {
+		if (UWorld* World = GetXConsoleGameWorld())
+			ToggleXConsolePanel(TOptional<bool>(), World);  // no arg = flip current state
+	}));
 
-// A Slate-global input pre-processor so the hotkey works regardless of which widget/PlayerController
-// has focus. Toggles only when a game world is active (so it never fires in the editor at rest), and
-// returns Unhandled so the keys still pass through to the game and other listeners.
-class FImXConsoleHotkeyProcessor : public IInputProcessor
+// Inject (or refresh) a chord → command binding into one player input's DebugExecBindings.
+static void ApplyXConsoleKeyBind(UPlayerInput* PlayerInput, const FKey& Key, bool bAlt, bool bCtrl, const TCHAR* Command)
 {
-public:
-	virtual void Tick(const float, FSlateApplication&, TSharedRef<ICursor>) override {}
+	if (!PlayerInput)
+		return;
 
-	virtual bool HandleKeyDownEvent(FSlateApplication&, const FKeyEvent& InKeyEvent) override
-	{
-		// (Alt or Ctrl) + ~ toggles the panel. Both accelerators are accepted.
-		if (GImSlateXConsoleHotkey
-			&& InKeyEvent.GetKey() == EKeys::Tilde
-			&& (InKeyEvent.IsAltDown() || InKeyEvent.IsControlDown())
-			&& !InKeyEvent.IsRepeat())
-		{
-			if (UWorld* World = GetXConsoleGameWorld())
-				ToggleXConsolePanel(TOptional<bool>(), World);  // no arg = flip current state
-		}
-		return false;  // don't swallow — let the keys pass through
-	}
-};
+	FKeyBind KeyBind;
+	KeyBind.Command = Command;
+	KeyBind.Key = Key;
+	KeyBind.bDisabled = false;
+	// Require exactly this modifier; ignore the others so e.g. Ctrl+~ doesn't also need Alt.
+	KeyBind.Alt = bAlt;       KeyBind.bIgnoreAlt = !bAlt;
+	KeyBind.Control = bCtrl;  KeyBind.bIgnoreCtrl = !bCtrl;
+	KeyBind.Shift = false;    KeyBind.bIgnoreShift = true;
+	KeyBind.Cmd = false;      KeyBind.bIgnoreCmd = true;
 
-static TSharedPtr<FImXConsoleHotkeyProcessor> GImXConsoleHotkeyProcessor;
+	// Replace an existing binding for the same command+key, else append. (One command is bound by
+	// two chords — Alt and Ctrl — so match on command AND key, not command alone.)
+	const int32 Index = PlayerInput->DebugExecBindings.IndexOfByPredicate([&](const FKeyBind& Existing) {
+		return Existing.Command.Equals(KeyBind.Command, ESearchCase::IgnoreCase) && Existing.Key == KeyBind.Key;
+	});
+	if (Index != INDEX_NONE)
+		PlayerInput->DebugExecBindings[Index] = KeyBind;
+	else
+		PlayerInput->DebugExecBindings.Add(KeyBind);
+}
 
-// Register/unregister the processor with Slate. Registered lazily the first time the module/world
-// is up (see the static initializer below) and torn down on Slate shutdown.
+// Inject the Alt+~ and Ctrl+~ chords into the EnhancedPlayerInput CDO (so all future PIE/game
+// sessions inherit them) and into any already-living player input instances (so a running PIE
+// session picks them up immediately). Mirrors ImGui's DebugExecBindings::UpdatePlayerInputs.
+static void InstallXConsoleHotkeys()
+{
+	const TCHAR* Cmd = TEXT("imslate.XConsole.Toggle");
+	// NOTE: don't name the param `PI` — UE defines `#define PI` (UnrealMathUtility.h), which would
+	// macro-expand it to a float literal.
+	auto BindBoth = [&](UPlayerInput* InPlayerInput) {
+		ApplyXConsoleKeyBind(InPlayerInput, EKeys::Tilde, /*Alt*/true,  /*Ctrl*/false, Cmd);
+		ApplyXConsoleKeyBind(InPlayerInput, EKeys::Tilde, /*Alt*/false, /*Ctrl*/true,  Cmd);
+	};
+
+	if (UEnhancedPlayerInput* DefaultPlayerInput = GetMutableDefault<UEnhancedPlayerInput>())
+		BindBoth(DefaultPlayerInput);
+	for (TObjectIterator<UEnhancedPlayerInput> It; It; ++It)
+		BindBoth(*It);
+}
+
+// Install on engine init (covers all PIE sessions started afterwards) and again on each map load
+// (covers the running session's freshly-created player input). Guarded to desktop only.
 struct FImXConsoleHotkeyRegistrar
 {
-	static void RegisterNow()
-	{
-		if (FSlateApplication::IsInitialized() && !GImXConsoleHotkeyProcessor.IsValid())
-		{
-			GImXConsoleHotkeyProcessor = MakeShared<FImXConsoleHotkeyProcessor>();
-			FSlateApplication::Get().RegisterInputPreProcessor(GImXConsoleHotkeyProcessor);
-		}
-	}
-
 	FImXConsoleHotkeyRegistrar()
 	{
-		// Slate already up (module loaded late) → register now; otherwise wait for PostEngineInit.
-		RegisterNow();
-		FCoreDelegates::OnPostEngineInit.AddLambda([] { RegisterNow(); });
-		FCoreDelegates::OnEnginePreExit.AddLambda([] {
-			if (FSlateApplication::IsInitialized() && GImXConsoleHotkeyProcessor.IsValid())
-				FSlateApplication::Get().UnregisterInputPreProcessor(GImXConsoleHotkeyProcessor);
-			GImXConsoleHotkeyProcessor.Reset();
-		});
+		FCoreDelegates::OnPostEngineInit.AddLambda([] { InstallXConsoleHotkeys(); });
+		FCoreUObjectDelegates::PostLoadMapWithWorld.AddLambda([](UWorld*) { InstallXConsoleHotkeys(); });
 	}
 };
 static FImXConsoleHotkeyRegistrar GImXConsoleHotkeyRegistrar;
