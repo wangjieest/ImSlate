@@ -650,6 +650,7 @@ FReply SImSlatePanel::OnMouseWheel(const FGeometry& MyGeometry, const FPointerEv
 {
 	if ((Window->Flags & ImSlateWindowFlags_NoScrollWithMouse) == 0 && ScrollHandle->IsNeeded())
 	{
+		StopInertialScrolling();  // wheel input must not fight a leftover coast velocity
 		auto NewScrollOffset = ScrollOffset;
 		NewScrollOffset -= MouseEvent.GetWheelDelta() * GetGlobalScrollAmount();
 		if (OnScrollOffset(NewScrollOffset))
@@ -676,6 +677,7 @@ bool SImSlatePanel::IsPanEnabled() const
 
 void SImSlatePanel::BeginPanCandidate(const FPointerEvent& PointerEvent)
 {
+	StopInertialScrolling();  // pressing into the list halts the coast (like grabbing a spinning wheel)
 	FingerOwningInteraction = PointerEvent.GetPointerIndex();
 	PressScreenPos = PointerEvent.GetScreenSpacePosition();
 	LastMoveScreenPos = PressScreenPos;
@@ -692,6 +694,8 @@ bool SImSlatePanel::TryStartPan(const FGeometry& MyGeometry, const FPointerEvent
 		PanMode = EPanMode::Scroll;
 		bPanningCapture = true;
 		LastMoveScreenPos = PointerEvent.GetScreenSpacePosition();  // capture origin for per-move delta
+		LastScrollSampleTime = FSlateApplication::Get().GetCurrentTime();  // seed so Tick's pause check is sane
+		SetScrollTickActive(true);  // run pause-detect Tick for this drag
 		OutReply = FReply::Handled().CaptureMouse(AsShared());
 		return true;
 	}
@@ -708,6 +712,10 @@ void SImSlatePanel::ApplyPanDelta(const FGeometry& MyGeometry, FVector2D CurAbsS
 	{
 		const float Scale = MyGeometry.Scale > 0.f ? MyGeometry.Scale : 1.f;
 		ScrollByDelta(-ScreenDelta.Y / Scale);  // content moves opposite to the finger
+		// Sample velocity for flick-to-coast. Sign matches the offset delta above (-ScreenDelta.Y), so the
+		// coast continues in the content-move direction. Sampled in screen space; converted by Scale on use.
+		LastScrollSampleTime = FSlateApplication::Get().GetCurrentTime();
+		InertialScrollManager.AddScrollSample(-ScreenDelta.Y, LastScrollSampleTime);
 	}
 }
 
@@ -717,6 +725,91 @@ void SImSlatePanel::EndPan()
 	PendingDragTrigger = 0.f;
 	bPanningCapture = false;
 	PanMode = EPanMode::None;
+	SetScrollTickActive(false);  // drag over → stop the pause-detect Tick (back to zero-cost idle)
+}
+
+//------------------------------------------------------------------------------------------------------
+// Inertial scrolling (flick-to-coast). Same building blocks as SImSlateVirtualList: FInertialScrollManager
+// + an active timer that only runs while coasting (no per-frame cost otherwise).
+//------------------------------------------------------------------------------------------------------
+
+// Inertial sample window (seconds). Matches FInertialScrollManager's default SampleTimeout. While dragging,
+// if the finger pauses longer than this the residual velocity is cleared (in Tick, like SScrollBox), so a
+// release after a pause coasts with zero velocity = no inertia.
+static constexpr double GImInertialSampleTimeout = 0.1;
+
+void SImSlatePanel::BeginInertialScrolling()
+{
+	// No gate here: a pause during the drag already zeroed the velocity (see Tick), so on release the
+	// velocity is whatever the finger genuinely had. Start the coast timer; it stops itself when the
+	// velocity decays to zero or hits an edge (so starting with ~0 velocity stops on the first tick).
+	if (!InertialTimerHandle.IsValid())
+	{
+		bIsInertialScrolling = true;
+		InertialTimerHandle = RegisterActiveTimer(0.f, FWidgetActiveTimerDelegate::CreateSP(this, &SImSlatePanel::UpdateInertialScroll));
+	}
+}
+
+void SImSlatePanel::StopInertialScrolling()
+{
+	bIsInertialScrolling = false;
+	if (InertialTimerHandle.IsValid())
+	{
+		if (TSharedPtr<FActiveTimerHandle> Pinned = InertialTimerHandle.Pin())
+			UnRegisterActiveTimer(Pinned.ToSharedRef());
+		InertialTimerHandle.Reset();
+	}
+	// Zero the velocity so a fresh press doesn't inherit leftover coast.
+	InertialScrollManager.ClearScrollVelocity();
+}
+
+void SImSlatePanel::SetScrollTickActive(bool bActive)
+{
+	// Toggle Tick only for the duration of a scroll drag. Outside a drag the panel stays SetCanTick(false)
+	// (the constructor's default), so there is no per-frame cost when idle.
+	SetCanTick(bActive);
+}
+
+void SImSlatePanel::Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime)
+{
+	SPanel::Tick(AllottedGeometry, InCurrentTime, InDeltaTime);
+
+	// SScrollBox::Tick mirror: while a scroll drag is captured, if the finger has paused longer than the
+	// sample timeout, zero the residual velocity. Because this happens DURING the drag (screen already
+	// static), clearing causes no visual jump — and a release after the pause then coasts with zero
+	// velocity = no inertia. (SScrollBox.cpp: `if (bTouchPanningCapture && now-LastScrollTime > 0.10) ClearScrollVelocity()`.)
+	if (bPanningCapture && PanMode == EPanMode::Scroll
+		&& (FSlateApplication::Get().GetCurrentTime() - LastScrollSampleTime) > GImInertialSampleTimeout)
+	{
+		InertialScrollManager.ClearScrollVelocity();
+	}
+}
+
+EActiveTimerReturnType SImSlatePanel::UpdateInertialScroll(double InCurrentTime, float InDeltaTime)
+{
+	bool bKeepTicking = false;
+
+	InertialScrollManager.UpdateScrollVelocity(InDeltaTime);
+	const float Scale = GetCachedGeometry().Scale > 0.f ? GetCachedGeometry().Scale : 1.f;
+	// Velocity is in screen space and already carries the content-move direction (we fed AddScrollSample
+	// with the same sign ApplyPanDelta scrolls by). Convert to local space for the offset.
+	const float VelocityLocal = InertialScrollManager.GetScrollVelocity() / Scale;
+
+	if (!FMath::IsNearlyZero(VelocityLocal))
+	{
+		// OnScrollOffset returns false when clamped at an edge (nothing moved) → stop coasting.
+		if (OnScrollOffset(ScrollOffset + VelocityLocal * InDeltaTime))
+			bKeepTicking = true;
+		else
+			InertialScrollManager.ClearScrollVelocity();
+	}
+
+	if (!bKeepTicking)
+	{
+		bIsInertialScrolling = false;
+		InertialTimerHandle.Reset();
+	}
+	return bKeepTicking ? EActiveTimerReturnType::Continue : EActiveTimerReturnType::Stop;
 }
 
 void SImSlatePanel::ExternalPanMove(FVector2D PressPos, FVector2D CurPos)
@@ -728,10 +821,13 @@ void SImSlatePanel::ExternalPanMove(FVector2D PressPos, FVector2D CurPos)
 
 	if (!bPanningCapture)
 	{
+		StopInertialScrolling();        // a fresh drag cancels any leftover coast
 		PanMode = EPanMode::Scroll;
 		bPanningCapture = true;        // active (the child owns capture, not us)
 		PressScreenPos = PressPos;
 		LastMoveScreenPos = CurPos;    // origin; first frame applies no delta (avoids a jump)
+		LastScrollSampleTime = FSlateApplication::Get().GetCurrentTime();  // seed pause check
+		SetScrollTickActive(true);     // run pause-detect Tick for this forwarded drag
 		return;
 	}
 
@@ -742,7 +838,10 @@ void SImSlatePanel::ExternalPanMove(FVector2D PressPos, FVector2D CurPos)
 
 void SImSlatePanel::ExternalPanEnd(FVector2D CurPos)
 {
+	const bool bWasScroll = bPanningCapture && PanMode == EPanMode::Scroll;
 	EndPan();
+	if (bWasScroll)
+		BeginInertialScrolling();  // coast with the flick velocity sampled during the forwarded drag
 }
 
 FReply SImSlatePanel::OnPreviewMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
@@ -821,7 +920,10 @@ FReply SImSlatePanel::OnMouseMove(const FGeometry& MyGeometry, const FPointerEve
 FReply SImSlatePanel::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	const bool bWasCapturing = bPanningCapture;  // only Scroll captures; move-window runs as drag-drop
+	const bool bWasScroll = bWasCapturing && PanMode == EPanMode::Scroll;
 	EndPan();
+	if (bWasScroll)
+		BeginInertialScrolling();  // coast with whatever flick velocity was sampled during the drag
 	if (bWasCapturing)
 		return FReply::Handled().ReleaseMouseCapture();
 	return FReply::Unhandled();  // just a click — let it through

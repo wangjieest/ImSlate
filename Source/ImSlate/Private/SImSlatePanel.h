@@ -3,6 +3,7 @@
 #include "ImSlateFwd.h"
 #include "SImSlateLayout.h"
 #include "SlotBase.h"
+#include "Framework/Layout/InertialScrollManager.h"
 #include "Widgets/DeclarativeSyntaxSupport.h"
 #include "Widgets/Layout/SScrollBar.h"
 #include "Widgets/SPanel.h"
@@ -348,6 +349,23 @@ protected:
 	bool TryStartPan(const FGeometry& MyGeometry, const FPointerEvent& PointerEvent, FReply& OutReply);
 	void ApplyPanDelta(const FGeometry& MyGeometry, FVector2D CurAbsScreenPos, FVector2D ScreenDelta);
 	void EndPan();
+
+	// --- Inertial scrolling (flick-to-coast), same mechanism as SImSlateVirtualList ---
+	// FInertialScrollManager samples drag velocity; on release we coast via an active timer until the
+	// velocity decays to zero or we hit a scroll edge. The timer self-unregisters when it stops, so there
+	// is ZERO per-frame cost when not coasting (SetCanTick stays false).
+	FInertialScrollManager InertialScrollManager;
+	TWeakPtr<FActiveTimerHandle> InertialTimerHandle;
+	bool bIsInertialScrolling = false;
+	double LastScrollSampleTime = 0.0;
+	void BeginInertialScrolling();                                       // register the coast timer
+	void StopInertialScrolling();                                        // unregister + clear velocity
+	EActiveTimerReturnType UpdateInertialScroll(double InCurrentTime, float InDeltaTime);
+	// Tick runs ONLY while a scroll drag is active (toggled via SetCanTick at pan start/end — otherwise the
+	// panel stays SetCanTick(false), zero cost). It mirrors SScrollBox::Tick: if the finger pauses past the
+	// sample timeout, clear the residual velocity so a release after a pause produces no inertia.
+	virtual void Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime) override;
+	void SetScrollTickActive(bool bActive);
 
 	// BeginGroup/EndGroup: per-arrange merged background rects keyed by GroupId.
 	// Filled during OnArrangeChildren (item rects already include -ScrollOffset), drawn in OnPaint below children.
