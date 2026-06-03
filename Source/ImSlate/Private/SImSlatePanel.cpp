@@ -6,6 +6,8 @@
 #include "SImSlateViewport.h"
 #include "SImSlateWindow.h"
 #include "Types/SlateEnums.h"
+#include "Rendering/DrawElements.h"
+#include "Framework/Application/SlateApplication.h"
 #include "XConsoleManager.h"
 #include "GenericPlatform/GenericPlatformApplicationMisc.h"
 #include "HAL/PlatformApplicationMisc.h"
@@ -15,6 +17,12 @@ static FAutoConsoleVariableRef CVar_ImSlateLayoutScale(
 	TEXT("imslate.LayoutScale"),
 	GImSlateLayoutScale,
 	TEXT("Content layout scale for ImSlate panels. 1.0 = default. >1.0 = larger widgets/text."));
+
+int32 GImSlateDragScrollContent = 1;
+static FAutoConsoleVariableRef CVar_ImSlateDragScrollContent(
+	TEXT("imslate.DragScrollContent"),
+	GImSlateDragScrollContent,
+	TEXT("Drag/touch-to-scroll on panel content (e.g. drag a fold header to scroll). 1=on, 0=off."));
 XMetaVar(TEXT("imslate.LayoutScale"), DisplayName, TEXT("UI Scale"))(ClampMin, 0.5)(ClampMax, 4.0)(UIMin, 0.5)(UIMax, 4.0);
 
 // Reference physical density (PPI). On desktop, scale=1 looks right and desktops sit around
@@ -264,7 +272,11 @@ void SImSlatePanel::Construct(const FArguments& InArgs, SImSlateWindow* InParent
 #endif
 	Window = InParent;
 
-	SetVisibility(EVisibility::SelfHitTestInvisible);
+	// Visible (not SelfHitTestInvisible) so the panel itself receives preview/down/move over blank areas
+	// and can drive content-pan (drag-to-scroll / drag-move). Blank-area press no longer passes through to
+	// the window; the panel takes over scroll/move-window itself (see OnMouseMove/TryStartPan). Children
+	// still hit-test normally and a sub-threshold press is never consumed, so their clicks are unaffected.
+	SetVisibility(EVisibility::Visible);
 	bHideScrollBar = InArgs._HideScollBar || (Window->Flags & ImSlateWindowFlags_NoScrollbar);
 
 	SetClipping(InParent->GetClipping());
@@ -297,6 +309,7 @@ bool SImSlatePanel::OnScrollOffset(float NewOffset)
 
 void SImSlatePanel::OnArrangeChildren(const FGeometry& AllottedGeometry, FArrangedChildren& ArrangedChildren) const
 {
+	CachedGroupRects.Reset();
 	if (Children.Num() <= 0)
 		return;
 
@@ -470,6 +483,27 @@ void SImSlatePanel::OnArrangeChildren(const FGeometry& AllottedGeometry, FArrang
 						}
 					}
 					ArrangedChildren.AddWidget(ChildVisibility, AllottedGeometry.MakeChild(CurChild.GetWidget(), LocalPosition, LocalSize));
+
+					// Accumulate group background rect: union of all items sharing CurChild.GroupId.
+					// LocalPosition/LocalSize are final panel-local coords (already include -ScrollOffset).
+					if (CurChild.GroupId != 0)
+					{
+						const FSlateRect ItemRect(LocalPosition.X, LocalPosition.Y, LocalPosition.X + LocalSize.X, LocalPosition.Y + LocalSize.Y);
+						FGroupRect& GR = CachedGroupRects.FindOrAdd(CurChild.GroupId);
+						if (!GR.bInit)
+						{
+							GR.Rect = ItemRect;
+							GR.Color = CurChild.GroupColor;  // colour from the first slot of the group
+							GR.bInit = true;
+						}
+						else
+						{
+							GR.Rect.Left = FMath::Min(GR.Rect.Left, ItemRect.Left);
+							GR.Rect.Top = FMath::Min(GR.Rect.Top, ItemRect.Top);
+							GR.Rect.Right = FMath::Max(GR.Rect.Right, ItemRect.Right);
+							GR.Rect.Bottom = FMath::Max(GR.Rect.Bottom, ItemRect.Bottom);
+						}
+					}
 				}
 			}
 		}
@@ -627,6 +661,178 @@ FReply SImSlatePanel::OnMouseWheel(const FGeometry& MyGeometry, const FPointerEv
 	return FReply::Unhandled();
 }
 
+//------------------------------------------------------------------------------------------------------
+// Drag/touch pan (SScrollBox-style). Step 1: mouse, scroll-only. MoveWindow added in Step 3, touch in Step 4.
+//------------------------------------------------------------------------------------------------------
+
+bool SImSlatePanel::IsPanEnabled() const
+{
+	if (!GImSlateDragScrollContent)
+		return false;
+	if (Window && (Window->Flags & ImSlateWindowFlags_NoMouseInputs))
+		return false;
+	return true;
+}
+
+void SImSlatePanel::BeginPanCandidate(const FPointerEvent& PointerEvent)
+{
+	FingerOwningInteraction = PointerEvent.GetPointerIndex();
+	PressScreenPos = PointerEvent.GetScreenSpacePosition();
+	LastMoveScreenPos = PressScreenPos;
+	PendingDragTrigger = 0.f;
+	bPanningCapture = false;
+	PanMode = EPanMode::None;
+}
+
+bool SImSlatePanel::TryStartPan(const FGeometry& MyGeometry, const FPointerEvent& PointerEvent, FReply& OutReply)
+{
+	if (CanScroll())
+	{
+		// Scroll: the panel captures and drives the scroll itself.
+		PanMode = EPanMode::Scroll;
+		bPanningCapture = true;
+		LastMoveScreenPos = PointerEvent.GetScreenSpacePosition();  // capture origin for per-move delta
+		OutReply = FReply::Handled().CaptureMouse(AsShared());
+		return true;
+	}
+
+	// Can't scroll: move-window is driven by the DetectDrag armed in OnMouseButtonDown (stable down-detect),
+	// not started here in the middle of a move.
+	return false;
+}
+
+void SImSlatePanel::ApplyPanDelta(const FGeometry& MyGeometry, FVector2D CurAbsScreenPos, FVector2D ScreenDelta)
+{
+	// Only Scroll reaches here: move-window is handed off to drag-drop at TryStartPan, not driven per-move.
+	if (PanMode == EPanMode::Scroll)
+	{
+		const float Scale = MyGeometry.Scale > 0.f ? MyGeometry.Scale : 1.f;
+		ScrollByDelta(-ScreenDelta.Y / Scale);  // content moves opposite to the finger
+	}
+}
+
+void SImSlatePanel::EndPan()
+{
+	FingerOwningInteraction.Reset();
+	PendingDragTrigger = 0.f;
+	bPanningCapture = false;
+	PanMode = EPanMode::None;
+}
+
+void SImSlatePanel::ExternalPanMove(FVector2D PressPos, FVector2D CurPos)
+{
+	// Scroll only: the child (e.g. fold header) forwards here only when content CAN scroll; when it can't,
+	// the child begins a window drag-drop itself (move + viewport/host switch), so this is never the mover.
+	if (!IsPanEnabled() || !CanScroll())
+		return;
+
+	if (!bPanningCapture)
+	{
+		PanMode = EPanMode::Scroll;
+		bPanningCapture = true;        // active (the child owns capture, not us)
+		PressScreenPos = PressPos;
+		LastMoveScreenPos = CurPos;    // origin; first frame applies no delta (avoids a jump)
+		return;
+	}
+
+	const FVector2D Delta = CurPos - LastMoveScreenPos;
+	LastMoveScreenPos = CurPos;
+	ApplyPanDelta(GetCachedGeometry(), CurPos, Delta);
+}
+
+void SImSlatePanel::ExternalPanEnd(FVector2D CurPos)
+{
+	EndPan();
+}
+
+FReply SImSlatePanel::OnPreviewMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	// Tunnel phase: only mark a scroll candidate when content can scroll. When it can't, do NOT register —
+	// the press must bubble to the window (DetectDrag(self) → move), exactly like the titlebar. Never consume.
+	if (IsPanEnabled() && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton && CanScroll())
+		BeginPanCandidate(MouseEvent);
+	return FReply::Unhandled();
+}
+
+FReply SImSlatePanel::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	// Blank-area press (no child consumed).
+	if (IsPanEnabled() && MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+	{
+		if (CanScroll())
+		{
+			// Scrollable → consume the press (Handled) so it does NOT bubble to the window's DetectDrag;
+			// we drive the scroll on move. Track a candidate for that.
+			if (!FingerOwningInteraction.IsSet())
+				BeginPanCandidate(MouseEvent);
+			return FReply::Handled();
+		}
+		// Not scrollable → DON'T consume: let the press bubble to SImSlateWindow::OnMouseButtonDown, which
+		// does DetectDrag(self) → OnDragDetected → window move. This is EXACTLY how the titlebar works
+		// (SImHeaderArea returns Unhandled too). The window detecting on ITSELF is what carries content;
+		// a child detecting the window did not work.
+	}
+	return FReply::Unhandled();
+}
+
+FReply SImSlatePanel::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	if (!FingerOwningInteraction.IsSet() || FingerOwningInteraction.GetValue() != MouseEvent.GetPointerIndex())
+		return FReply::Unhandled();
+
+	// Only a left-button-held drag pans. A hover move (button up) means the press ended elsewhere — e.g. a
+	// child button captured the click and we never saw OnMouseButtonUp — so drop the stale candidate.
+	// Without this, hovering after expanding a control accumulates movement and spuriously captures.
+	if (!bPanningCapture && !MouseEvent.IsMouseButtonDown(EKeys::LeftMouseButton))
+	{
+		EndPan();
+		return FReply::Unhandled();
+	}
+
+	const FVector2D Cur = MouseEvent.GetScreenSpacePosition();
+
+	if (!bPanningCapture)
+	{
+		// Accumulate until past the drag threshold; below it, children keep receiving clicks.
+		PendingDragTrigger += (Cur - LastMoveScreenPos).Size();
+		LastMoveScreenPos = Cur;
+		if (PendingDragTrigger > FSlateApplication::Get().GetDragTriggerDistance())
+		{
+			FReply Reply = FReply::Unhandled();
+			if (TryStartPan(MyGeometry, MouseEvent, Reply))
+			{
+				// Scroll captures (bPanningCapture set); move-window started a drag-drop — stop tracking here.
+				if (!bPanningCapture)
+					EndPan();
+				return Reply;
+			}
+			EndPan();  // nothing to do
+		}
+		return FReply::Unhandled();
+	}
+
+	// Capturing: drive the pan with the per-move delta.
+	const FVector2D Delta = Cur - LastMoveScreenPos;
+	LastMoveScreenPos = Cur;
+	ApplyPanDelta(MyGeometry, Cur, Delta);
+	return FReply::Handled();
+}
+
+FReply SImSlatePanel::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	const bool bWasCapturing = bPanningCapture;  // only Scroll captures; move-window runs as drag-drop
+	EndPan();
+	if (bWasCapturing)
+		return FReply::Handled().ReleaseMouseCapture();
+	return FReply::Unhandled();  // just a click — let it through
+}
+
+void SImSlatePanel::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
+{
+	SPanel::OnMouseCaptureLost(CaptureLostEvent);
+	EndPan();
+}
+
 int32 SImSlatePanel::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
 {
 	FArrangedChildren ArrangedChildren(EVisibility::Visible);
@@ -637,7 +843,48 @@ int32 SImSlatePanel::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGe
 	OutDrawElements.PushClip(ClippingZone);
 	ON_SCOPE_EXIT { OutDrawElements.PopClip(); };
 
+	// Draw group backgrounds underneath children (same LayerId → drawn first = below).
+	PaintGroupBackgrounds(AllottedGeometry, OutDrawElements, LayerId);
+
 	return PaintArrangedChildren(Args, ArrangedChildren, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
+}
+
+void SImSlatePanel::PaintGroupBackgrounds(const FGeometry& AllottedGeometry, FSlateWindowElementList& OutDrawElements, int32 LayerId) const
+{
+	if (CachedGroupRects.Num() == 0)
+		return;
+
+	// STATIC white RoundedBox brush; per-group colour passed via MakeBox's InTint (last arg).
+	// Rebuilding a brush each paint does NOT update on screen — tint a stable brush instead (see ImCheckBox.cpp).
+	// Faint fill (tinted per-group via InTint) + a fixed subtle outline that draws a visible frame.
+	// InTint only affects the fill; the outline colour comes from OutlineSettings and is NOT tinted
+	// (verified by ImCheckBox: its box outline stays grey while the fill is tinted per state).
+	static FSlateBrush GroupBrush = []() {
+		FSlateBrush B;
+		B.DrawAs = ESlateBrushDrawType::RoundedBox;
+		B.TintColor = FLinearColor::White;
+		B.OutlineSettings.RoundingType = ESlateBrushRoundingType::FixedRadius;
+		B.OutlineSettings.CornerRadii = FVector4(4.f, 4.f, 4.f, 4.f);
+		B.OutlineSettings.Color = FLinearColor(0.06f, 0.30f, 0.12f, 0.85f);
+		B.OutlineSettings.Width = 1.5f;
+		return B;
+	}();
+
+	for (const auto& Pair : CachedGroupRects)
+	{
+		const FGroupRect& GR = Pair.Value;
+		if (!GR.bInit || GR.Color.A <= 0.f)
+			continue;
+		// Expand outward so the group reads as a panel/frame around the controls instead of a colour
+		// strip hidden behind their opaque backgrounds — a margin of bg is left visible on all sides.
+		const float Pad = 3.f * FMath::Max(GImSlateLayoutScale, 1.f);
+		const FVector2D Pos(GR.Rect.Left - Pad, GR.Rect.Top - Pad);
+		const FVector2D Size(GR.Rect.Right - GR.Rect.Left + 2.f * Pad, GR.Rect.Bottom - GR.Rect.Top + 2.f * Pad);
+		if (Size.X <= 0.f || Size.Y <= 0.f)
+			continue;
+		const auto BoxGeom = AllottedGeometry.MakeChild(FVector2f(Size), FSlateLayoutTransform(FVector2f(Pos))).ToPaintGeometry();
+		FSlateDrawElement::MakeBox(OutDrawElements, LayerId, BoxGeom, &GroupBrush, ESlateDrawEffect::None, GR.Color);
+	}
 }
 
 float SImSlatePanel::GetDesiredWidth() const

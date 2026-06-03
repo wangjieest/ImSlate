@@ -507,6 +507,10 @@ public:
 	mutable int32 ParentIdx = -1;
 	float AspectRatio = 0.f;
 
+	// BeginGroup/EndGroup: items sharing the same non-zero GroupId draw a shared background of GroupColor
+	uint32 GroupId = 0;
+	FLinearColor GroupColor = FLinearColor::Transparent;
+
 	FItemSlotPod(uint32 InKey = 0)
 		: SlotPadding(FMargin(0))
 		, MaxWidth(0.f)
@@ -531,7 +535,9 @@ public:
 			&& Lhs.FlagBits == Rhs.FlagBits
 			&& Lhs.StretchToCol == Rhs.StretchToCol
 			&& Lhs.ParentIdx == Rhs.ParentIdx
-			&& Lhs.AspectRatio == Rhs.AspectRatio;
+			&& Lhs.AspectRatio == Rhs.AspectRatio
+			&& Lhs.GroupId == Rhs.GroupId
+			&& Lhs.GroupColor == Rhs.GroupColor;
 	}
 	bool Equal(const FItemSlotPod& Other) const { return *this == Other; }
 	void Apply(const FItemSlotPod& Other)

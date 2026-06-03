@@ -29,6 +29,7 @@
 DEFINE_LOG_CATEGORY(LogImSlate);
 
 extern float GImSlateLayoutScale;
+extern int32 GImSlateDragScrollContent;
 
 namespace ImSlate
 {
@@ -1059,6 +1060,12 @@ namespace Internal
 				g.NextItemData.SlotPadding.Left = g.CurrentIndent;
 			}
 
+			// Apply current group context. Write always (even when CurrentGroupId == 0) so that
+			// a reused item that left its group gets its stale GroupId cleared.
+			g.NextItemData.Flags |= ImSlateNextItemDataFlags_Group;
+			g.NextItemData.GroupId = g.CurrentGroupId;
+			g.NextItemData.GroupColor = g.CurrentGroupColor;
+
 			// Register item in tree (assigns current fold context as parent)
 			g.CurrentWindow->SetItemParent(ItemId);
 			if (Slot.ApplyNextItem(g.NextItemData))
@@ -1122,6 +1129,12 @@ bool FItemSlotPod::ApplyNextItem(const ImSlateNextItemData& NextItemData)
 
 	if (NextItemData.Flags & ImSlateNextItemDataFlags_AspectRatio)
 		AspectRatio = NextItemData.AspectRatio;
+
+	if (NextItemData.Flags & ImSlateNextItemDataFlags_Group)
+	{
+		GroupId = NextItemData.GroupId;
+		GroupColor = NextItemData.GroupColor;
+	}
 
 	return !(*this == Before);
 }
@@ -1219,6 +1232,35 @@ bool FoldLine(ImStr Label, const FText& InText, float InHeight /*= 0.f*/)
 		TSharedRef<SImButton> WidgetRef = SNew(SImButton, nullptr)
 			.ButtonStyle(&GetDefault<UImButton>()->GetStyle());
 		WidgetRef->SetReleaseCaptureOnDragScroll(true);
+		// Drag-to-scroll: forward a vertical drag over the header to the window's content scroll, so
+		// dragging the fold header pans the list. Gated at run time by the imslate.DragScrollContent CVar.
+		if (auto* Win = GImSlate->CurrentWindow)
+		{
+			TWeakPtr<SImSlateWindow> WeakWin = StaticCastSharedRef<SImSlateWindow>(Win->AsShared());
+			// Stable move-window via DOWN-detect: at press, the button arms DetectDrag(window) when content
+			// can't scroll (set up here), so a drag becomes window->OnDragDetected (host switch) just like
+			// the titlebar. The move handler below only handles the scroll case; the no-scroll case returns
+			// Unhandled so the button releases capture and the down-armed drag-detect takes over.
+			WidgetRef->SetDragDetectTarget(Win->AsShared());
+			WidgetRef->SetCanWindowScroll([WeakWin]() { auto W = WeakWin.Pin(); return W.IsValid() && W->CanScrollContent(); });
+			WidgetRef->SetDragScrollHandler([WeakWin](FVector2D Press, FVector2D Cur) -> FReply {
+				auto W = WeakWin.Pin();
+				if (!W || !GImSlateDragScrollContent)
+					return FReply::Unhandled();
+				if (W->CanScrollContent())
+				{
+					W->PanContentMove(Press, Cur);
+					return FReply::Handled();  // scrolling — button keeps capture & keeps forwarding
+				}
+				// Can't scroll → decline; the down-armed DetectDrag(window) drives the move (host switch).
+				return FReply::Unhandled();
+			});
+			WidgetRef->SetDragScrollEndHandler([WeakWin](FVector2D Cur) {
+				if (GImSlateDragScrollContent)
+					if (auto W = WeakWin.Pin())
+						W->PanContentEnd(Cur);
+			});
+		}
 		auto Meta = MakeShared<FFoldMeta>();
 		WidgetRef->AddMetadata(Meta);
 		auto Ptr = &Meta.Get();
@@ -1303,6 +1345,46 @@ void EndFold()
 		if (g.CurrentWindow)
 			g.CurrentWindow->PopFoldContext();
 		Unindent(Stack.Pop());
+	}
+}
+
+// Group scope stack — per render pass, BeginGroup/EndGroup always paired within Begin/End.
+// Safe: ImSlate renders single-threaded (mirrors GetFoldIndentStack).
+struct FGroupMeta { uint32 Id; FLinearColor Color; };
+static TArray<FGroupMeta, TInlineAllocator<8>>& GetGroupStack()
+{
+	static TArray<FGroupMeta, TInlineAllocator<8>> Stack;
+	return Stack;
+}
+
+bool BeginGroup(ImStr Id, const FLinearColor& GroupColor)
+{
+	ImSlateContext& g = *GImSlate;
+	ImSlateId GroupId = ImSlateScopedId(Id);
+	GetGroupStack().Push({GroupId, GroupColor});
+	g.CurrentGroupId = GroupId;
+	g.CurrentGroupColor = GroupColor;
+	return true;
+}
+
+void EndGroup()
+{
+	ImSlateContext& g = *GImSlate;
+	auto& Stack = GetGroupStack();
+	if (Stack.Num() > 0)
+	{
+		Stack.Pop();
+		// Restore the enclosing group context (supports nesting), or clear if none.
+		if (Stack.Num() > 0)
+		{
+			g.CurrentGroupId = Stack.Last().Id;
+			g.CurrentGroupColor = Stack.Last().Color;
+		}
+		else
+		{
+			g.CurrentGroupId = 0;
+			g.CurrentGroupColor = FLinearColor::Transparent;
+		}
 	}
 }
 
@@ -1437,6 +1519,16 @@ void SetNextItemFillWidth(float InFactor)
 	g.NextItemData.Flags |= ImSlateNextItemDataFlags_FillWidth;
 	g.NextItemData.bFillWidth = true;
 	g.NextItemData.StretchValue = InFactor;
+}
+
+// Force the next item to size to its content (no horizontal fill). Sets the FillWidth flag with
+// bFillWidth=false so ApplyNextItem overrides any control that hard-codes bFillWidth=true (e.g. CheckBox).
+void SetNextItemAutoWidth()
+{
+	ImSlateContext& g = *GImSlate;
+	g.NextItemData.Flags |= ImSlateNextItemDataFlags_FillWidth;
+	g.NextItemData.bFillWidth = false;
+	g.NextItemData.StretchValue = 0.f;
 }
 
 extern bool GForceVirtualKeyboard;

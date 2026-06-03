@@ -119,12 +119,19 @@ IMSLATE_API bool				FoldLine(ImStr Label, const FText& InText, float InHeight = 
 IMSLATE_API bool				BeginFold(ImStr Label, const FText& InText, float IndentWidth = 16.f);
 IMSLATE_API void				EndFold();
 
+// BeginGroup/EndGroup: horizontally-consecutive controls between Begin/End share one group background color.
+// Always returns true (mirrors BeginFold's if-usage). Usage:
+//   if (ImSlate::BeginGroup("id", Color)) { Button(); SameLine(); InputText(); ImSlate::EndGroup(); }
+IMSLATE_API bool				BeginGroup(ImStr Id, const FLinearColor& GroupColor);
+IMSLATE_API void				EndGroup();
+
 // TitleLine: standalone title bar control (use with ImSlateWindowFlags_NoTitleLine)
 // Returns true if close button was clicked (when bOpen != nullptr)
 IMSLATE_API bool				TitleLine(ImStr Label, const FText& InText, bool* bOpen = nullptr);
 
 IMSLATE_API void				SetNextItemAspectRatio(float InRatio);
 IMSLATE_API void				SetNextItemFillWidth(float InFactor);
+IMSLATE_API void				SetNextItemAutoWidth();
 IMSLATE_API void				SetNextItemMinWidth(float InVal);
 IMSLATE_API void				SetNextItemMinHeight(float InVal);
 IMSLATE_API void				SetNextItemMaxWidth(float InVal);

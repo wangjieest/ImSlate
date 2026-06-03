@@ -288,6 +288,11 @@ protected:
 	bool IsInCollapsedSubtree(ImSlateId ItemId) const;
 
 public:
+	// Drag-to-scroll: shift content by a vertical delta (clamped inside OnScrollOffset). Public so the
+	// owning SImSlateWindow can drive it from draggable content widgets.
+	void ScrollByDelta(float DeltaY) { OnScrollOffset(ScrollOffset + DeltaY); }
+	// True when content exceeds the visible height (there is room to scroll).
+	bool CanScroll() const { return TotalActualSize.Y > GetCachedGeometry().GetLocalSize().Y; }
 	void SetItemParent(ImSlateId ItemId);               // assign current fold context as parent
 	void PushFoldContext(ImSlateId FoldId);
 	void PopFoldContext();
@@ -302,6 +307,13 @@ protected:
 	virtual FVector2D ComputeDesiredSize(float LayoutScaleMultiplier) const override;
 	virtual void CacheDesiredSize(float LayoutScaleMultiplier) override;
 	virtual FReply OnMouseWheel(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	// Drag/touch-to-scroll (and drag-move when no scroll room). SScrollBox-style: a preview marks a drag
+	// candidate without consuming the press; a move past the drag threshold captures and takes over.
+	virtual FReply OnPreviewMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override;
 	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled)
 		const override;
 	ImVec2 TotalActualSize;
@@ -312,5 +324,40 @@ protected:
 	float ScrollOffset = 0.f;
 	float ScrollBarWidth = 12.f;
 	mutable TArray<float, TInlineAllocator<4>> RowHeights;
+
+	// --- Drag/touch pan state (SScrollBox-style: preview marks a candidate, over-threshold capture) ---
+	enum class EPanMode : uint8 { None, Scroll, MoveWindow };
+	TOptional<int32> FingerOwningInteraction;            // pointer index of the active drag candidate
+	FVector2D PressScreenPos = FVector2D::ZeroVector;
+	FVector2D LastMoveScreenPos = FVector2D::ZeroVector;
+	float PendingDragTrigger = 0.f;                      // accumulated movement before the threshold
+	bool bPanningCapture = false;                        // crossed threshold & captured
+	EPanMode PanMode = EPanMode::None;                   // locked once at the threshold (no mid-drag switch)
+	FVector2D AbsGrabOffset = FVector2D::ZeroVector;     // MoveWindow only: press pos - window abs pos
+
+	// External pan: a child that holds mouse capture (e.g. fold-header SButton, which captures on down and
+	// thus swallows the panel's own move) forwards its drag here so the SAME scroll/move-window(+viewport
+	// switch) logic runs without the panel needing capture. Pass press + current screen positions; the
+	// child is responsible for its own drag threshold before calling.
+	void ExternalPanMove(FVector2D PressPos, FVector2D CurPos);
+	void ExternalPanEnd(FVector2D CurPos);
+
+	bool IsPanEnabled() const;
+	void BeginPanCandidate(const FPointerEvent& PointerEvent);
+	// Returns true (with OutReply set) when a pan starts this move; false to keep bubbling.
+	bool TryStartPan(const FGeometry& MyGeometry, const FPointerEvent& PointerEvent, FReply& OutReply);
+	void ApplyPanDelta(const FGeometry& MyGeometry, FVector2D CurAbsScreenPos, FVector2D ScreenDelta);
+	void EndPan();
+
+	// BeginGroup/EndGroup: per-arrange merged background rects keyed by GroupId.
+	// Filled during OnArrangeChildren (item rects already include -ScrollOffset), drawn in OnPaint below children.
+	struct FGroupRect
+	{
+		FSlateRect Rect = FSlateRect(0.f, 0.f, 0.f, 0.f);
+		FLinearColor Color = FLinearColor::Transparent;
+		bool bInit = false;
+	};
+	mutable TMap<uint32, FGroupRect> CachedGroupRects;
+	void PaintGroupBackgrounds(const FGeometry& AllottedGeometry, FSlateWindowElementList& OutDrawElements, int32 LayerId) const;
 };
 }  // namespace ImSlate

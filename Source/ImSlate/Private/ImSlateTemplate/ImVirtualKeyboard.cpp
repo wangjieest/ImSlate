@@ -1243,7 +1243,11 @@ void SImSlateVirtualKeyboard::PopulateSuggestionBar(const TArray<FString>& Sugge
 			SNew(SButton)
 			.ContentPadding(FMargin(6.f * Scale, 2.f * Scale))  // same content padding both states
 			.ButtonStyle(bSelected ? &SelectedStyle : &UnselectedStyle)
-			.OnClicked_Lambda([this, SugCopy]() { OnSuggestionClicked(SugCopy); return FReply::Handled(); })
+			// Fire on press, not click: the keyboard window (ActivationPolicy::Never, in the game viewport /
+				// touch) never delivers a full OnClicked — same reason the keys trigger on down-press.
+				.ClickMethod(EButtonClickMethod::MouseDown)
+				.TouchMethod(EButtonTouchMethod::Down)
+				.OnClicked_Lambda([this, SugCopy]() { OnSuggestionClicked(SugCopy); return FReply::Handled(); })
 			[
 				SNew(STextBlock)
 				.Text(FText::FromString(SugCopy))

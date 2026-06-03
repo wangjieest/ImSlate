@@ -153,6 +153,7 @@ enum ImSlateNextItemDataFlags_
 	ImSlateNextItemDataFlags_MinWidth		= 1 << 12,
 	ImSlateNextItemDataFlags_MinHeight		= 1 << 13,
 	ImSlateNextItemDataFlags_AspectRatio	= 1 << 14,
+	ImSlateNextItemDataFlags_Group			= 1 << 15,
 };
 
 struct ImSlateNextItemData : public FItemSlotPod
@@ -315,6 +316,10 @@ struct ImSlateContext
 
 	float														CurrentIndent = 0.f;
 	TArray<float, TInlineAllocator<4>>							IndentStack;
+
+	// BeginGroup/EndGroup: current group context applied to subsequent items (0 = no group)
+	uint32														CurrentGroupId = 0;
+	FLinearColor												CurrentGroupColor = FLinearColor::Transparent;
 
 	bool														bIsFrameStarted = false;
 	bool														bIsFrameEnded = true;

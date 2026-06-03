@@ -996,12 +996,10 @@ public:
 bool CheckBox(ImStr Label, bool& bIsChecked, const ImVec2& InSize, const FLinearColor& AccentColor)
 {
 	auto ItemPtr = Item<SCheckBox>(Label, [&](FItemSlotPod& InItem) {
-		// Don't fill width — a checkbox is a fixed-size mark. Filling made it stretch to whatever
-		// column width it landed in, so the same checkbox looked different sizes in different rows.
-		// Left-align at its natural (check-mark) size so all checkboxes look identical.
-		InItem.bFillWidth = false;
-		InItem.HAlignment = HAlign_Left;
-		InItem.VAlignment = VAlign_Center;
+		InItem.bFillWidth = true;
+		InItem.StretchValue = 1.f;
+		InItem.HAlignment = HAlign_Fill;
+		InItem.VAlignment = VAlign_Fill;
 
 		TSharedRef<SCheckBox> WidgetRef = ImFactoryCreate<UImCheckBox>();
 
@@ -1046,10 +1044,10 @@ bool CheckBox(ImStr Label, bool& bIsChecked, const ImVec2& InSize, const FLinear
 bool CheckBox(ImStr Label, ECheckBoxState& CheckState, const ImVec2& InSize)
 {
 	auto ItemPtr = Item<SCheckBox>(Label, [&](FItemSlotPod& InItem) {
-		// Fixed-size mark, left-aligned (see the bool overload above for why — no fill stretch).
-		InItem.bFillWidth = false;
-		InItem.HAlignment = HAlign_Left;
-		InItem.VAlignment = VAlign_Center;
+		InItem.bFillWidth = true;
+		InItem.StretchValue = 1.f;
+		InItem.HAlignment = HAlign_Fill;
+		InItem.VAlignment = VAlign_Fill;
 
 		TSharedRef<SCheckBox> WidgetRef = ImFactoryCreate<UImCheckBox>();
 

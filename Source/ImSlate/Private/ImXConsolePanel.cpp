@@ -42,7 +42,7 @@ static FXConsoleCommandLambdaFull XVar_ImSlateXConsole(
 	});
 
 //////////////////////////////////////////////////////////////////////////
-// Desktop hotkey: Alt+X toggles the panel (game/PIE runtime only)
+// Desktop hotkey: Alt+~ or Ctrl+~ toggles the panel (game/PIE runtime only)
 //////////////////////////////////////////////////////////////////////////
 #if PLATFORM_DESKTOP
 
@@ -50,7 +50,7 @@ static bool GImSlateXConsoleHotkey = true;
 static FAutoConsoleVariableRef CVar_ImSlateXConsoleHotkey(
 	TEXT("imslate.XConsoleHotkey"),
 	GImSlateXConsoleHotkey,
-	TEXT("Enable Alt+X hotkey to toggle the ImSlate XConsole panel on desktop (game/PIE only)."));
+	TEXT("Enable Alt+~ / Ctrl+~ hotkey to toggle the ImSlate XConsole panel on desktop (game/PIE only)."));
 
 // A Slate-global input pre-processor so the hotkey works regardless of which widget/PlayerController
 // has focus. Toggles only when a game world is active (so it never fires in the editor at rest), and
@@ -62,10 +62,10 @@ public:
 
 	virtual bool HandleKeyDownEvent(FSlateApplication&, const FKeyEvent& InKeyEvent) override
 	{
-		// Alt+X (Right-Ctrl was taken). Trigger on the X key while Alt is held.
+		// (Alt or Ctrl) + ~ toggles the panel. Both accelerators are accepted.
 		if (GImSlateXConsoleHotkey
-			&& InKeyEvent.GetKey() == EKeys::X
-			&& InKeyEvent.IsAltDown()
+			&& InKeyEvent.GetKey() == EKeys::Tilde
+			&& (InKeyEvent.IsAltDown() || InKeyEvent.IsControlDown())
 			&& !InKeyEvent.IsRepeat())
 		{
 			if (UWorld* World = GetXConsoleGameWorld())
@@ -361,6 +361,20 @@ void UImXConsolePanel::DrawParamWidget(const FName& TypeName, FString& Value, bo
 
 	const bool bIsOptionalBool = bIsOptional && (InnerType == TEXT("bool"));
 
+	// Wrap an optional parameter's [enable checkbox + value widget] in one group so they read as a
+	// single unit (shared faint-green background, matching the green enable toggle). TOptional<bool>
+	// is a single tri-state box and needs no grouping.
+	const bool bGroupWrap = bIsOptional && !bIsOptionalBool;
+	if (bGroupWrap)
+	{
+		FString GroupId = FString::Printf(TEXT("%s_grp%d"), *CmdName, Index);
+		// Colour the group by enable state: green = enabled (arg will be passed), grey = disabled (skipped).
+		const FLinearColor GroupCol = bEnabled
+			? FLinearColor(0.20f, 0.80f, 0.30f, 0.30f)
+			: FLinearColor(0.28f, 0.28f, 0.30f, 0.45f);  // disabled: darker, more opaque grey so it clearly reads as off
+		ImSlate::BeginGroup(FStringView(GroupId), GroupCol);
+	}
+
 	// TOptional enable checkbox — EXCEPT for TOptional<bool>, which uses a single tri-state
 	// checkbox below (Undetermined = unset/no-arg, Checked = true, Unchecked = false) instead
 	// of a separate enable box + value box.
@@ -369,6 +383,9 @@ void UImXConsolePanel::DrawParamWidget(const FName& TypeName, FString& Value, bo
 		FString OptId = FString::Printf(TEXT("%s_opt%d"), *CmdName, Index);
 		// Green accent marks this as the "enable / is-set" toggle for an optional parameter, to
 		// distinguish it from a regular (blue) value checkbox.
+		// Auto-width so the checkbox doesn't take a fill-share of the row (it hard-codes bFillWidth=true);
+		// otherwise it and the value InputText split the row 50/50, leaving a big gap before the input.
+		ImSlate::SetNextItemAutoWidth();
 		ImSlate::CheckBox(FStringView(OptId), bEnabled, ImVec2(0, 0), FLinearColor(0.20f, 0.80f, 0.30f, 1.f));
 		ImSlate::SameLine();
 	}
@@ -596,6 +613,9 @@ void UImXConsolePanel::DrawParamWidget(const FName& TypeName, FString& Value, bo
 		ImSlate::SetNextItemFillWidth(1.f);
 		ImSlate::InputText(FStringView(WidgetId), Value);
 	}
+
+	if (bGroupWrap)
+		ImSlate::EndGroup();
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -629,23 +649,29 @@ bool UImXConsolePanel::DrawFold(const FString& Id, const FString& DisplayText)
 
 void UImXConsolePanel::DrawSearchBar()
 {
-	static TArray<FString> SearchNames;
-	if (bNeedsRefresh || SearchNames.IsEmpty())
+	// Keep commands and variables as separate suggestion lists so the search box only suggests
+	// entries from the currently selected tab (ActiveTab 0 = commands, 1 = variables).
+	static TArray<FString> CmdNames;
+	static TArray<FString> VarNames;
+	if (bNeedsRefresh || (CmdNames.IsEmpty() && VarNames.IsEmpty()))
 	{
-		SearchNames.Reset();
+		CmdNames.Reset();
+		VarNames.Reset();
 		for (auto& [Cat, SubCats] : CommandTree)
 			for (auto& [Sub, Cmds] : SubCats)
 				for (auto& Cmd : Cmds)
-					SearchNames.Add(Cmd.Name);
+					CmdNames.Add(Cmd.Name);
 		for (auto& [Cat, SubCats] : VariableTree)
 			for (auto& [Sub, Vars] : SubCats)
 				for (auto& Var : Vars)
-					SearchNames.Add(Var.Name);
+					VarNames.Add(Var.Name);
 	}
+
+	TArray<FString>* Names = (ActiveTab == 0) ? &CmdNames : &VarNames;
 
 	ImSlate::SetNextItemFillWidth(0.7f);
 	// No manual keyboard button: focusing the edit auto-shows the virtual keyboard now.
-	ImSlate::SearchBox("##XConsoleSearch", SearchFilter, &SearchNames, nullptr, ImVec2(0, XConsoleRowHeight), false);
+	ImSlate::SearchBox("##XConsoleSearch", SearchFilter, Names, nullptr, ImVec2(0, XConsoleRowHeight), false);
 
 	ImSlate::SameLine();
 	if (ImSlate::Button("Refresh", ImVec2(80.f, XConsoleRowHeight)))
@@ -672,20 +698,10 @@ void UImXConsolePanel::DrawCommandEntry(FImXConsoleCommandInfo& Info)
 	if (ImSlate::TextButton("CmdName", FText::FromString(LeafDisplay), ImVec2(0, XConsoleRowHeight)))
 		ExecuteCommand(Info);
 
-	// Parameters — each on same line, fill remaining width. A TOptional param draws as
-	// [enable-checkbox][input] kept tight together (default SameLine inside DrawParamWidget), while
-	// DIFFERENT params are separated by a wider gap, so it's visually clear which checkbox belongs
-	// to which input (i.e. which params are optional checkbox-gated).
-	const float ParamGap = 20.f * ImSlate::GetImSlateEffectiveScale();
+	// Parameters — each on same line, fill remaining width
 	for (int32 i = 0; i < Info.ParamTypes.Num(); ++i)
 	{
 		ImSlate::SameLine();
-		if (i > 0)
-		{
-			// Wider gap between consecutive params (group separator).
-			ImSlate::Dummy(ImVec2(ParamGap, 1.f));
-			ImSlate::SameLine();
-		}
 		const FString& TypeStr = Info.ParamTypes[i].ToString();
 		bool bIsOptional = TypeStr.StartsWith(TEXT("TOptional<"));
 		DrawParamWidget(Info.ParamTypes[i], Info.ParamValues[i], Info.ParamEnabled[i], bIsOptional, i, Info.Name);

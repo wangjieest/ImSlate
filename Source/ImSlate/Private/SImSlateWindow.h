@@ -6,6 +6,8 @@
 #include "Widgets/DeclarativeSyntaxSupport.h"
 #include "Widgets/SWidget.h"
 
+class FDragDropOperation;
+
 namespace ImSlate
 {
 class SImSlateViewport;
@@ -104,6 +106,17 @@ public:
 	//mutable TArray<SlateIndex> IndexBuffer;
 
 	void SetScrollTarget(FVector2D In);
+	// Drag-to-scroll: feed a per-move finger delta from a draggable content widget. Scrolls the content
+	// panel when it has scroll room; otherwise moves the window (drag-move fallback).
+	void ScrollContentBy(FVector2D Delta);
+	// Content drag handoff: pan the content when it can scroll; otherwise the caller begins a window
+	// drag-drop (MakeWindowDragOp) so window move + viewport/host switching reuse FImSlateDragOperation
+	// (the exact same op the titlebar uses — no hand-rolled move logic).
+	bool CanScrollContent() const;
+	TSharedRef<FDragDropOperation> MakeWindowDragOp(FVector2D AbsGrabOffset);
+	// Forward a capturing child's scroll drag (e.g. fold header) to the content panel's external pan.
+	void PanContentMove(FVector2D PressPos, FVector2D CurPos);
+	void PanContentEnd(FVector2D CurPos);
 	void CheckCloseButton(bool* bIn);
 
 	// Maximize / restore: fill the whole viewport, then restore the saved pos/size. While
