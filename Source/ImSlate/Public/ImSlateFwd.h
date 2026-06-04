@@ -272,6 +272,7 @@ class FViewportPopupHolder;
 // clang-format off
 struct ImSlateContext;							// Dear ImSlate context (opaque structure, unless including ImSlate_internal.h)
 IMSLATE_API ImSlateContext* GetGImSlate();
+IMSLATE_API ImSlateContext* GetGImSlateForWorld(const class UObject* InObj);	// PIE-safe: context for InObj's world
 
 class SImSlateWindow;
 class SImSlateViewport;
@@ -457,6 +458,19 @@ enum ImSlateInputTextFlags_
 		1
 		<< 18,  // Callback on buffer capacity changes request (beyond 'buf_size' parameter value), allowing the string to grow. Notify when the string wants to be resized (for string types which hold a cache of their Size). You will be provided a new BufSize in the callback and NEED to honor it. (see misc/cpp/imgui_stdlib.h for an example of using this)
 	ImSlateInputTextFlags_CallbackEdit = 1 << 19  // Callback on any edit (note that InputText() already returns true on edit, the callback is useful mainly to manipulate the underlying buffer while focus is active)
+};
+
+// Numeric shaping for InputText's on-screen numeric keypad: type (integer/unsigned/hex) + optional
+// clamp range + optional step (SpinBox-like +/- keys). Passed to InputText so the keypad can hide
+// the dot for integers, hide minus for unsigned, add A-F for hex, and clamp/step typed values.
+struct FImInputNumericSpec
+{
+	bool bInteger = false;    // integer type → keypad hides '.'
+	bool bUnsigned = false;   // unsigned type → keypad hides '-'
+	bool bHex = false;        // hexadecimal → keypad adds A-F
+	TOptional<double> Min;    // clamp lower bound (also used by step)
+	TOptional<double> Max;    // clamp upper bound
+	TOptional<double> Step;   // when set → keypad shows +/- step keys
 };
 
 // Resizing callback data to apply custom constraint. As enabled by SetNextWindowSizeConstraints(). Callback is called during the next Begin().

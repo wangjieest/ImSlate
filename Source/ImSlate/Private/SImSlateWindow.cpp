@@ -13,6 +13,7 @@
 
 //
 #include "AttributeCompatibility.h"
+#include "Application/SlateApplicationBase.h"  // GetSafeZoneSize for maximize safe-area inset
 #include "Brushes/SlateColorBrush.h"
 #include "Engine/Texture2D.h"
 #include "GenericPlatform/GenericApplicationMessageHandler.h"
@@ -562,6 +563,11 @@ public:
 						[
 							SNew(SImage)
 							.Image(HeaderIconBrush())
+							// Icon loading is currently disabled (HeaderIconBrush returns an empty brush),
+							// and an empty image brush renders as a "◇?" missing-resource placeholder.
+							// Collapse the image while there's no real icon texture so the placeholder
+							// doesn't show next to the title.
+							.Visibility_Lambda([this]() { return IconBrush.GetResourceObject() ? EVisibility::SelfHitTestInvisible : EVisibility::Collapsed; })
 						]
 						+ SHorizontalBox::Slot()
 						.HAlign(HAlign_Left)
@@ -608,6 +614,24 @@ public:
 								SNew(SImCloseButton)
 								.OnClicked(this, &SImHeaderArea::OnCloseBtnClick)
 							]
+						]
+						// Right safe-area gutter: when maximized, push the button group left by
+						// safe.Right so close / maximize don't sit under the screen's rounded corner /
+						// notch. Zero width otherwise (and on desktop, where safe = 0).
+						+ SHorizontalBox::Slot()
+						.HAlign(HAlign_Right)
+						.VAlign(VAlign_Fill)
+						.AutoWidth()
+						[
+							SNew(SBox)
+							.WidthOverride(TAttribute<FOptionalSize>::CreateLambda([this]() -> FOptionalSize {
+								if (!Target || !Target->IsMaximized())
+									return FOptionalSize(0.f);
+								FMargin Safe(0.f);
+								if (FSlateApplication::IsInitialized())
+									FSlateApplicationBase::Get().GetSafeZoneSize(Safe, FVector2f::ZeroVector);
+								return FOptionalSize(Safe.Right);
+							}))
 						]
 					]
 				]
@@ -1010,6 +1034,10 @@ void SImSlateWindow::ToggleMaximize()
 		Flags |= (ImSlateWindowFlags_NoMove | ImSlateWindowFlags_NoResize);
 		bShowResizeHandle = false;
 
+		// Maximize fills the whole viewport (corners may fall under the screen's rounded corners /
+		// notch — that's fine, nothing interactive lives there). The titlebar buttons are kept out
+		// of the unsafe corner separately: the header insets its right-side button group by
+		// safe.Right when maximized (see SImHeaderArea), so close / maximize stay tappable.
 		DragingWindowPos(FVector2D::ZeroVector, Viewport->GetCachedGeometry().GetAbsolutePosition());
 		if (ViewportSize.X > 0 && ViewportSize.Y > 0)
 			SetWindowSize(ViewportSize);
@@ -1355,9 +1383,31 @@ FReply SImSlateWindow::OnPreviewMouseButtonDown(const FGeometry& MyGeometry, con
 FReply SImSlateWindow::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	// Slate routes events leaf→root. If we reach here, no child widget handled the click.
-	// Safe to start drag detection for window movement.
-	if (MouseEvent.IsMouseButtonDown(EKeys::LeftMouseButton) && !(Flags & ImSlateWindowFlags_NoMove))
+	// Safe to start drag detection for window movement. (CanStartMoveDrag also permits a drag while
+	// maximized → it restores + follows the finger; see OnDragDetected.)
+	if (MouseEvent.IsMouseButtonDown(EKeys::LeftMouseButton) && CanStartMoveDrag())
 	{
+		return FReply::Handled().DetectDrag(this->AsShared(), EKeys::LeftMouseButton).PreventThrottling();
+	}
+	return FReply::Unhandled();
+}
+
+FReply SImSlateWindow::OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& TouchEvent)
+{
+	// Touch mirror of OnMouseButtonDown. On mobile the window receives TOUCH events, not mouse, so
+	// without this: (1) window-move drag never started, and (2) the touch that bubbled up from the
+	// header / empty area was left half-handled, which broke the press→release pairing of the
+	// titlebar buttons (close / maximize) — they highlighted on touch-down but never fired OnClicked.
+	// As with the mouse path we only reach here if no child (a button, or a scrollable panel) consumed
+	// the touch first, so it's safe to start drag detection. DetectDrag works for touch too:
+	// ProcessPointerMoveEvent routes OnDragDetected once the finger passes the drag threshold (the
+	// same code path mouse uses). Use the touch's pointer index so the correct finger is tracked.
+	if (CanStartMoveDrag())
+	{
+		// DetectDrag matches on FKey: a touch's effecting button maps to LeftMouseButton in Slate
+		// (FSlateUser::DetectDrag compares DragState->TriggerButton == event.GetEffectingButton()),
+		// so use LeftMouseButton here too — same as the mouse path. (DetectDrag has no pointer-index
+		// overload; the finger is tracked via the pointer event's index internally.)
 		return FReply::Handled().DetectDrag(this->AsShared(), EKeys::LeftMouseButton).PreventThrottling();
 	}
 	return FReply::Unhandled();
@@ -1377,9 +1427,29 @@ float SImSlateWindow::GetTitleHeight() const
 
 FReply SImSlateWindow::OnDragDetected(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
-	if ((Flags & ImSlateWindowFlags_NoMove) == 0)
+	if (CanStartMoveDrag())
 	{
+		// Grab offset = finger position relative to the window's top-left (so the window keeps the
+		// same point under the finger while dragging).
 		FVector2D AbsGrabOffset = MouseEvent.GetScreenSpacePosition() - MyGeometry.GetAbsolutePosition();
+
+		// Dragging a MAXIMIZED window restores it first, then follows the finger (desktop-style).
+		// ToggleMaximize() restores the pre-maximize size; the window then shrinks, so the grab
+		// offset (computed against the full-screen geometry) must be rescaled by the width ratio,
+		// otherwise the restored window would jump out from under the finger.
+		if (bMaximized)
+		{
+			const float MaxW = (float)MyGeometry.GetLocalSize().X;
+			const float RatioX = MaxW > 0.f ? (float)(AbsGrabOffset.X / MaxW) : 0.f;
+			const float TitleH = GetTitleHeight();
+
+			ToggleMaximize();  // restores SavedSize and clears NoMove (if it wasn't user-set)
+
+			const float RestoredW = (float)GetWindowSize().X;
+			AbsGrabOffset.X = RatioX * RestoredW;          // keep the finger at the same relative X on the titlebar
+			AbsGrabOffset.Y = FMath::Min((float)AbsGrabOffset.Y, TitleH * 0.5f);  // clamp into the titlebar
+		}
+
 		TSharedRef<FImSlateDragOperation> DragDropOperation = FImSlateDragOperation::New(ToSharedRef(), AbsGrabOffset);
 		return FReply::Handled().BeginDragDrop(DragDropOperation).PreventThrottling();
 	}

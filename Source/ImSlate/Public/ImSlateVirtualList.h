@@ -343,7 +343,20 @@ protected:
 	 */
 	void ScrollDescendantIntoView(const TSharedPtr<SWidget>& WidgetToFind, bool InAnimateScroll = true, EDescendantScrollDestination InDestination = EDescendantScrollDestination::IntoView, float Padding = 0);
 
+public:
+	// --- Public API consumed by FImSlatePanelScrollProcessor (drag-scroll takeover). ---
 	EOrientation GetOrientation();
+
+	// External pan: driven by FImSlatePanelScrollProcessor when a drag started on a child widget
+	// (which holds capture) should scroll this list. Mirrors SImSlatePanel::ExternalPanMove/End but
+	// uses the list's Orientation (GetOrientationAxis) so it works for vertical AND horizontal lists.
+	// Pass press + current SCREEN positions; first call seeds (no scroll), later calls apply the delta.
+	void ExternalPanMove(FVector2D PressPos, FVector2D CurPos);
+	void ExternalPanEnd(FVector2D CurPos);
+	bool CanScroll() const { return GetScrollOffsetOfEnd() > 0.f; }
+	bool IsPanEnabled() const { return true; }
+
+protected:
 	void SetNavigationDestination(const EDescendantScrollDestination NewNavigationDestination);
 	void SetConsumeMouseWheel(EConsumeMouseWheel NewConsumeMouseWheel);
 	void SetOrientation(EOrientation InOrientation);
@@ -487,6 +500,10 @@ protected:
 
 	/** The scrolling and stacking orientation. */
 	EOrientation Orientation = EOrientation::Orient_Vertical;
+
+	/** External-pan state (FImSlatePanelScrollProcessor drives scroll while a child holds capture). */
+	bool bExternalPanActive = false;
+	FVector2D ExternalPanLastScreenPos = FVector2D::ZeroVector;
 
 	/** Style resource for the scrollbar */
 	const FScrollBarStyle* ScrollBarStyle;

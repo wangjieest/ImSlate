@@ -25,6 +25,10 @@ public:
 	virtual FVector2D GetWindowSize(const SImSlateWindow* InWindow) const override;
 
 	TSharedPtr<class SImSlateVirtualKeyboard> GetOrCreateVirtualKeyboard();
+	// Non-creating accessor: returns the keyboard only if it already exists (unlike Get() /
+	// GetOrCreateVirtualKeyboard, which would lazily create one). Used by the app-lifecycle
+	// (suspend/background) handler to hide an already-open keyboard without side-effects.
+	TSharedPtr<class SImSlateVirtualKeyboard> GetExistingVirtualKeyboard() const { return VirtualKeyboard; }
 	void EnsureKeyboardInViewport();
 	void RemoveKeyboard();  // detach the virtual keyboard from the engine viewport overlay
 

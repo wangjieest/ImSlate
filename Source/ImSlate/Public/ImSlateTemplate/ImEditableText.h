@@ -17,11 +17,44 @@ protected:
 	virtual FReply OnFocusReceived(const FGeometry& MyGeometry, const FFocusEvent& InFocusEvent) override;
 	virtual FReply OnKeyChar(const FGeometry& MyGeometry, const FCharacterEvent& InCharacterEvent) override;
 	virtual FReply OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
+	// Keyboard pops on click-RELEASE (no drag) — these track press position and Show on a clean tap.
+	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
+	virtual FReply OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
+	void ShowVirtualKeyboardForSelf();  // build ShowParams + Show the on-screen keyboard for this edit
 
 public:
 	virtual ~SImEditableText();
 
 	void SetBorderImage(const TAttribute<const FSlateBrush*>& InBrushAttribute);
+	// Request a virtual-keyboard layout on focus (Keyboard_Number → numeric pad). Drives both the
+	// self-rendered ImSlate keyboard (mapped in OnFocusReceived) and the OS keyboard.
+	// VirtualKeyboardType is a protected TAttribute on the SEditableText base.
+	void SetVirtualKeyboardType(EKeyboardType InType) { VirtualKeyboardType = InType; }
+	// Numeric-keypad shaping forwarded into FVirtualKeyboardShowParams::Numeric on focus. Stored as
+	// plain fields (not FImNumericKeyboardParams) to avoid pulling the virtual-keyboard UObject header
+	// into this one. Only consumed when VirtualKeyboardType == Keyboard_Number.
+	void SetNumericParams(bool bAllowDecimal, bool bAllowNegative, bool bHex,
+		TOptional<double> Min, TOptional<double> Max, TOptional<double> Step)
+	{
+		bNumAllowDecimal = bAllowDecimal; bNumHex = bHex;
+		// The ImSlate numeric APIs use FLT_MIN / FLT_MAX as "no lower / no upper bound" sentinels
+		// (see InputFloat/NumericFloat defaults). FLT_MIN is the smallest POSITIVE float (~1.17e-38),
+		// NOT the lowest — if it leaks through as a real clamp the value can't go at/below ~0 (e.g. a
+		// float "won't go negative"). Strip the sentinels here so the keypad treats them as unbounded.
+		auto StripSentinel = [](TOptional<double>& V, double Sentinel)
+		{ if (V.IsSet() && FMath::IsNearlyEqual((float)V.GetValue(), (float)Sentinel)) V.Reset(); };
+		StripSentinel(Min, FLT_MIN);
+		StripSentinel(Max, FLT_MAX);
+		NumMin = Min; NumMax = Max; NumStep = Step;
+		// Allow negatives unless an explicit (real) min clamps the range to >= 0.
+		bNumAllowNegative = bAllowNegative && !(NumMin.IsSet() && NumMin.GetValue() >= 0.0);
+	}
+	// Input history: non-empty key → committed entries are persisted per key and shown as recent
+	// suggestions on focus. Filter (optional): only entries passing it are recorded.
+	void SetHistoryKey(const FString& InKey) { HistoryKey = InKey; }
+	void SetHistoryFilter(TFunction<bool(const FString&)> InFilter) { HistoryFilter = MoveTemp(InFilter); }
 	void SetVirtualKeyboardCommitCallback(TFunction<void(const FString&, ETextCommit::Type)> InCallback) { VKCommitCallback = MoveTemp(InCallback); }
 	void SetVirtualKeyboardSuggestionProvider(TFunction<void(const FString&, TArray<FString>&)> InProvider) { VKSuggestionProvider = MoveTemp(InProvider); }
 
@@ -39,6 +72,17 @@ private:
 	TFunction<void(const FString&, TArray<FString>&)> VKSuggestionProvider;
 	bool bPreviewDisplayMode = false;
 	bool bPreviewCaretVisible = true;
+	// Numeric-keypad shaping (see SetNumericParams).
+	bool bNumAllowDecimal = true;
+	bool bNumAllowNegative = true;
+	bool bNumHex = false;
+	TOptional<double> NumMin, NumMax, NumStep;
+	// Input history (see SetHistoryKey/SetHistoryFilter), forwarded into ShowParams on focus.
+	FString HistoryKey;
+	TFunction<bool(const FString&)> HistoryFilter;
+	// Click-release keyboard pop: press position + whether this press is a keyboard-pop candidate.
+	FVector2D VKPressScreenPos = FVector2D::ZeroVector;
+	bool bVKPressTracking = false;
 };
 
 UCLASS(BlueprintType)

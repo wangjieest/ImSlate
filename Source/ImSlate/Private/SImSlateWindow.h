@@ -117,6 +117,12 @@ public:
 	void ToggleMaximize();
 	bool IsMaximized() const { return bMaximized; }
 
+	// Whether a window-move drag may start. Normally = user did not request NoMove. While maximized
+	// the NoMove flag is forced on internally, but we still allow a drag IF the user's original
+	// intent was movable (bSavedNoMove == false) — that drag triggers a restore-then-follow (see
+	// OnDragDetected). So a genuinely user-pinned (NoMove) window stays unmovable even maximized.
+	bool CanStartMoveDrag() const { return bMaximized ? !bSavedNoMove : !(Flags & ImSlateWindowFlags_NoMove); }
+
 	SImViewportGame* IsAreaInGameViewport() const;
 	bool IsViewportGame() const;
 
@@ -205,6 +211,7 @@ protected:
 	virtual void CacheDesiredSize(float LayoutScaleMultiplier) override;
 	virtual FReply OnDragDetected(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& TouchEvent) override;  // touch mirror of OnMouseButtonDown (mobile window move + titlebar buttons)
 	virtual FReply OnMouseWheel(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	virtual FPopupMethodReply OnQueryPopupMethod() const override { return FPopupMethodReply::UseMethod(EPopupMethod::CreateNewWindow).SetShouldThrottle(EShouldThrottle::No); }
 	ImVec2 TotalDesiredSizes;

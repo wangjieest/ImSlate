@@ -195,11 +195,23 @@ SImEditableText::~SImEditableText()
 FReply SImEditableText::OnFocusReceived(const FGeometry& MyGeometry, const FFocusEvent& InFocusEvent)
 {
 	// Preview display mode: never grab focus / pop the keyboard / activate IME.
-	// (We don't call super, so FSlateEditableTextLayout::HandleFocusReceived — which
-	// would EnableTextInputMethodContext / ShowVirtualKeyboard — is never reached.)
 	if (bPreviewDisplayMode)
 		return FReply::Handled();
 
+	// The on-screen keyboard is popped on click-RELEASE (OnMouseButtonUp/OnTouchEnded with no drag),
+	// NOT on focus — so a press-then-drag scrolls the panel instead of popping the keyboard. Here we
+	// only suppress the engine focus handling (no IME / OS keyboard) when the virtual keyboard is the
+	// active input path; the actual Show happens in TryShowVirtualKeyboardOnRelease().
+	if (ImSlate::SImSlateVirtualKeyboard::ShouldUseVirtualKeyboard(this))
+		return FReply::Handled();  // swallow focus → no IME; release handler will Show the keyboard
+
+	return SEditableText::OnFocusReceived(MyGeometry, InFocusEvent);
+}
+
+void SImEditableText::ShowVirtualKeyboardForSelf()
+{
+	if (bPreviewDisplayMode)
+		return;
 	if (ImSlate::SImSlateVirtualKeyboard::ShouldUseVirtualKeyboard(this))
 	{
 		if (auto Keyboard = ImSlate::SImSlateVirtualKeyboard::Get())
@@ -232,16 +244,72 @@ FReply SImEditableText::OnFocusReceived(const FGeometry& MyGeometry, const FFocu
 			};
 			Params.SuggestionProvider = VKSuggestionProvider;
 			Params.Owner = AsShared();
+			// Map the edit's virtual-keyboard type to the on-screen layout: Number → numeric pad.
+			// (GetVirtualKeyboardType returns the engine's ::EKeyboardType, set via the UMG
+			// VirtualKeyboardType property / SetVirtualKeyboardType.)
+			if (GetVirtualKeyboardType() == Keyboard_Number)
+			{
+				Params.InitialKeyboardType = ImSlate::EImKeyboardType::Number;
+				Params.Numeric.bAllowDecimal  = bNumAllowDecimal;
+				Params.Numeric.bAllowNegative = bNumAllowNegative;
+				Params.Numeric.bHex           = bNumHex;
+				Params.Numeric.Min            = NumMin;
+				Params.Numeric.Max            = NumMax;
+				Params.Numeric.Step           = NumStep;
+			}
+			// Input history (persisted per key, shown as recent suggestions).
+			Params.HistoryKey = HistoryKey;
+			Params.HistoryFilter = HistoryFilter;
 			Keyboard->Show(Params);
-
-			// The ORIGINAL edit must NOT keep keyboard focus: input flows through the virtual
-			// keyboard's preview (it takes the "fake focus" — Slate user focus without IME/OS
-			// keyboard). The keyboard's Show() moves user focus onto its preview. We just don't
-			// call super here (no IME, no OS keyboard on this original edit).
-			return FReply::Handled();
+			// The keyboard's Show() moves Slate user focus onto its own preview, so this original
+			// edit doesn't keep focus / pop IME.
 		}
 	}
-	return SEditableText::OnFocusReceived(MyGeometry, InFocusEvent);
+}
+
+// --- Pop the keyboard on click-RELEASE (no drag), so a press-then-drag scrolls instead. ---
+// Mouse and touch share the same logic; PreviewDisplayMode edits never pop a keyboard.
+
+FReply SImEditableText::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	VKPressScreenPos = MouseEvent.GetScreenSpacePosition();
+	bVKPressTracking = !bPreviewDisplayMode;
+	return SEditableText::OnMouseButtonDown(MyGeometry, MouseEvent);
+}
+
+FReply SImEditableText::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	FReply Reply = SEditableText::OnMouseButtonUp(MyGeometry, MouseEvent);
+	// A click (down→up with no meaningful movement) pops the keyboard; a drag does not (it was a
+	// scroll / selection). Threshold = Slate's drag trigger distance.
+	if (bVKPressTracking)
+	{
+		bVKPressTracking = false;
+		const float Moved = FVector2D(MouseEvent.GetScreenSpacePosition() - VKPressScreenPos).Size();
+		if (Moved <= FSlateApplication::Get().GetDragTriggerDistance())
+			ShowVirtualKeyboardForSelf();
+	}
+	return Reply;
+}
+
+FReply SImEditableText::OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
+{
+	VKPressScreenPos = InTouchEvent.GetScreenSpacePosition();
+	bVKPressTracking = !bPreviewDisplayMode;
+	return SEditableText::OnTouchStarted(MyGeometry, InTouchEvent);
+}
+
+FReply SImEditableText::OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
+{
+	FReply Reply = SEditableText::OnTouchEnded(MyGeometry, InTouchEvent);
+	if (bVKPressTracking)
+	{
+		bVKPressTracking = false;
+		const float Moved = FVector2D(InTouchEvent.GetScreenSpacePosition() - VKPressScreenPos).Size();
+		if (Moved <= FSlateApplication::Get().GetDragTriggerDistance())
+			ShowVirtualKeyboardForSelf();
+	}
+	return Reply;
 }
 
 namespace ImSlate

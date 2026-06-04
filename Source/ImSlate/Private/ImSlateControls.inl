@@ -336,7 +336,7 @@ bool Text(ImStr Label, const FText& InText, const ImVec2& InSize, bool bAutoWrap
 	return false;
 }
 
-bool InputText(ImStr Label, FString& InStr, const ImVec2& InSize /* = ImVec2(0, 0)*/, ImSlateInputTextFlags_ Flags /*= ImSlateInputTextFlags_None*/)
+bool InputText(ImStr Label, FString& InStr, const ImVec2& InSize /* = ImVec2(0, 0)*/, ImSlateInputTextFlags_ Flags /*= ImSlateInputTextFlags_None*/, ImStr HistoryKey /* = {} */, const FImInputNumericSpec* Numeric /* = nullptr */)
 {
 	auto ItemPtr = Item<SEditableText>(Label, [&](FItemSlotPod& InItem) {
 		InItem.bFillWidth = true;
@@ -350,6 +350,32 @@ bool InputText(ImStr Label, FString& InStr, const ImVec2& InSize /* = ImVec2(0, 
 
 		WidgetRef->SetText(FText::FromString(InStr));
 		WidgetRef->SetIsReadOnly(!!(Flags & ImSlateInputTextFlags_ReadOnly));
+
+		// Numeric keypad on focus. Prefer the explicit FImInputNumericSpec (type/clamp/step) when the
+		// caller passes one; otherwise fall back to the InputText flags (CharsDecimal/Hex/Scientific).
+		// The widget is a SImEditableText (created from UImEditableText), so the cast is safe.
+		const bool bFlagNumeric = (Flags & (ImSlateInputTextFlags_CharsDecimal | ImSlateInputTextFlags_CharsHexadecimal | ImSlateInputTextFlags_CharsScientific)) != 0;
+		if (Numeric || bFlagNumeric)
+		{
+			TSharedRef<SImEditableText> ImEdit = StaticCastSharedRef<SImEditableText>(WidgetRef);
+			ImEdit->SetVirtualKeyboardType(Keyboard_Number);
+			if (Numeric)
+			{
+				// Explicit spec: integer hides '.', unsigned hides '-', hex adds A-F; clamp + step.
+				ImEdit->SetNumericParams(/*decimal*/!Numeric->bInteger, /*negative*/!Numeric->bUnsigned,
+					/*hex*/Numeric->bHex, Numeric->Min, Numeric->Max, Numeric->Step);
+			}
+			else
+			{
+				const bool bHex = (Flags & ImSlateInputTextFlags_CharsHexadecimal) != 0;
+				const bool bDecimal = (Flags & (ImSlateInputTextFlags_CharsDecimal | ImSlateInputTextFlags_CharsScientific)) != 0;
+				ImEdit->SetNumericParams(/*decimal*/bDecimal, /*negative*/true, /*hex*/bHex, {}, {}, {});
+			}
+		}
+
+		// Input history: enabled only when a non-empty HistoryKey is passed (entries persist per key).
+		if (HistoryKey.Len() > 0)
+			StaticCastSharedRef<SImEditableText>(WidgetRef)->SetHistoryKey(FString(HistoryKey.Len(), HistoryKey.GetData()));
 
 		bool bEnabled = !(Flags & ImSlateInputTextFlags_ReadOnly);
 		WidgetRef->SetEnabled(bEnabled);
@@ -419,7 +445,12 @@ struct FSearchBoxMeta : public TSharedFromThis<FSearchBoxMeta>, public ISlateMet
 		return true;
 	}
 
-	TArray<FString> Filter(const FString& Input, const TArray<FString>* Src, const TFunction<void(const FString&, TArray<FString>&)>& Cb)
+	// bIncludeHistory: SearchBox's OWN dropdown wants history rows merged in (true). The VIRTUAL
+	// KEYBOARD provider must NOT include them (false) — the keyboard shows history from its own
+	// persistent store (FImSlateInputHistory) with delete X buttons; if Filter also fed history here the
+	// keyboard would show a SECOND copy without an X, and deleting the keyboard's copy would leave this
+	// one behind (it reappears on reopen).
+	TArray<FString> Filter(const FString& Input, const TArray<FString>* Src, const TFunction<void(const FString&, TArray<FString>&)>& Cb, bool bIncludeHistory = true)
 	{
 		TArray<FString> HistoryMatches;
 		TArray<FString> Result;
@@ -427,11 +458,14 @@ struct FSearchBoxMeta : public TSharedFromThis<FSearchBoxMeta>, public ISlateMet
 		TArray<FString> Terms;
 		Input.ParseIntoArray(Terms, TEXT(" "), true);
 
-		// History matches first
-		for (const FString& H : History)
+		// History matches first (only when this caller wants them — keyboard provider opts out).
+		if (bIncludeHistory)
 		{
-			if (Terms.Num() == 0 || MatchesAllTerms(H, Terms))
-				HistoryMatches.Add(H);
+			for (const FString& H : History)
+			{
+				if (Terms.Num() == 0 || MatchesAllTerms(H, Terms))
+					HistoryMatches.Add(H);
+			}
 		}
 
 		// Source/callback matches (exclude duplicates from history)
@@ -499,6 +533,11 @@ bool SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestion
 		auto SearchBox = static_cast<SImSearchBox*>(ItemPtr);
 		auto Meta = GetMetaData<FSearchBoxMeta>(ItemPtr);
 
+		// Give the popped virtual keyboard a stable history key (defaults to the Label) so its history
+		// rows get the X delete button and persist. The SearchBox's own dropdown keeps its in-memory
+		// history (FSearchBoxMeta) — the two are intentionally separate for now.
+		SearchBox->SetHistoryKey(FString(Label.Len(), Label.GetData()));
+
 		// Set suggestion provider for virtual keyboard
 		if (Meta)
 		{
@@ -506,7 +545,10 @@ bool SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestion
 			SearchBox->SetKeyboardSuggestionProvider(
 				[WeakM, Suggestions, SuggestionCallback](const FString& Input, TArray<FString>& Out) {
 					if (auto M = WeakM.Pin())
-						Out = M->Filter(Input, Suggestions, SuggestionCallback);
+						// No history here — the keyboard renders history from its own persistent store
+						// (with X). Including it would duplicate it without an X and resurrect deleted
+						// entries on reopen.
+						Out = M->Filter(Input, Suggestions, SuggestionCallback, /*bIncludeHistory*/ false);
 				});
 		}
 

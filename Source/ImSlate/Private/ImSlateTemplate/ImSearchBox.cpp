@@ -67,6 +67,16 @@ void SImSearchBox::SetKeyboardSuggestionProvider(FImSearchBoxSuggestionProvider 
 		StaticCastSharedPtr<SImEditableText>(EditText)->SetVirtualKeyboardSuggestionProvider(InProvider);
 }
 
+void SImSearchBox::SetHistoryKey(const FString& InKey)
+{
+	HistoryKey = InKey;
+	// CRUCIAL: this SearchBox pops the keyboard on FOCUS via the inner SImEditableText, not (only) via
+	// the keyboard button. So the history key must reach the editable too, else its focus-Show() passes
+	// an empty HistoryKey and the keyboard never records/shows history (no X). Mirrors the provider path.
+	if (EditText.IsValid())
+		StaticCastSharedPtr<SImEditableText>(EditText)->SetHistoryKey(InKey);
+}
+
 void SImSearchBox::Construct(const FArguments& InArgs)
 {
 	bUseInlineSuggestions = InArgs._bUseInlineSuggestions;
@@ -97,9 +107,11 @@ void SImSearchBox::Construct(const FArguments& InArgs)
 	MyEditText->SetBorderImage(&EditBgBrush);
 
 	EditText = MyEditText;
-	// If a provider was already set before Construct, forward it to the inner editable.
+	// If a provider / history key was already set before Construct, forward it to the inner editable now.
 	if (KeyboardSuggestionProvider)
 		MyEditText->SetVirtualKeyboardSuggestionProvider(KeyboardSuggestionProvider);
+	if (!HistoryKey.IsEmpty())
+		MyEditText->SetHistoryKey(HistoryKey);
 
 	TSharedRef<SHorizontalBox> EditRow = SNew(SHorizontalBox)
 		+ SHorizontalBox::Slot()
@@ -135,6 +147,7 @@ void SImSearchBox::Construct(const FArguments& InArgs)
 						}
 					};
 					Params.SuggestionProvider = KeyboardSuggestionProvider;
+					Params.HistoryKey = HistoryKey;  // keyboard uses its own persistent history (rows get X)
 					Kb->Show(Params);
 				}
 				return FReply::Handled();
@@ -245,6 +258,7 @@ void SImSearchBox::ShowInline(bool bShow)
 					}
 				};
 				Params.SuggestionProvider = KeyboardSuggestionProvider;
+				Params.HistoryKey = HistoryKey;  // keyboard uses its own persistent history (rows get X)
 				Kb->Show(Params);
 			}
 		}
@@ -367,6 +381,8 @@ void SImSearchBox::SetSuggestions(const TArray<FString>& InItems, int32 HistoryC
 	SuggestionList->ClearChildren();
 	SuggestionButtons.Reset();
 	CurrentSuggestions = InItems;
+	LastHistoryCount = HistoryCount;       // remember for Ctrl+Backspace delete-history
+	DeleteHistoryFn = OnDeleteHistory;
 	HighlightIndex = -1;
 	TextBeforeNavigate.Reset();
 
@@ -380,9 +396,11 @@ void SImSearchBox::SetSuggestions(const TArray<FString>& InItems, int32 HistoryC
 			+ SHorizontalBox::Slot()
 			.FillWidth(1.f)
 			.VAlign(VAlign_Center)
+			.Padding(FMargin(6.f, 0.f, 0.f, 0.f))   // small left inset for the label; row itself is flush
 			[
+				// No ⏰ prefix (glyph missing from font → ◇? tofu); history shown via the trailing X.
 				SNew(STextBlock)
-				.Text(FText::FromString(bIsHistory ? FString::Printf(TEXT("\x23F0 %s"), *ItemCopy) : ItemCopy))
+				.Text(FText::FromString(ItemCopy))
 				.Font(ImSlate::GetImSlateDefaultFont())
 				.ColorAndOpacity(bIsHistory ? FLinearColor(0.7f, 0.85f, 1.f) : FLinearColor::White)
 			];
@@ -390,13 +408,31 @@ void SImSearchBox::SetSuggestions(const TArray<FString>& InItems, int32 HistoryC
 		if (bIsHistory && OnDeleteHistory)
 		{
 			FString DelCopy = ItemCopy;
+			// X delete button: flush to the row's RIGHT edge, filling full height. Uses a TRANSPARENT
+			// flat style (no rounded box of its own) so it doesn't draw a second inset color block —
+			// the glyph sits right in the top/right/bottom corner of the row.
+			static FButtonStyle XStyle = []() {
+				FButtonStyle S = FCoreStyle::Get().GetWidgetStyle<FButtonStyle>("Button");
+				FSlateColorBrush Transparent(FLinearColor(0, 0, 0, 0));
+				FSlateColorBrush Hover(FLinearColor(1, 1, 1, 0.12f));
+				S.SetNormal(Transparent);
+				S.SetHovered(Hover);
+				S.SetPressed(Hover);
+				S.SetNormalPadding(FMargin(0.f));
+				S.SetPressedPadding(FMargin(0.f));
+				return S;
+			}();
 			Row->AddSlot()
 			.AutoWidth()
-			.VAlign(VAlign_Center)
-			.Padding(FMargin(4.f, 0.f))
+			.HAlign(HAlign_Right)
+			.VAlign(VAlign_Fill)
+			.Padding(FMargin(0.f))
 			[
 				SNew(SButton)
-				.ButtonStyle(&GetSuggestionButtonStyle())
+				.ButtonStyle(&XStyle)
+				.ContentPadding(FMargin(10.f, 0.f))   // click width; no vertical padding → fills full height
+				.VAlign(VAlign_Fill)
+				.HAlign(HAlign_Center)
 				.ClickMethod(EButtonClickMethod::MouseDown)
 				.OnClicked_Lambda([this, DelCopy, OnDeleteHistory]() {
 					OnDeleteHistory(DelCopy);
@@ -406,7 +442,8 @@ void SImSearchBox::SetSuggestions(const TArray<FString>& InItems, int32 HistoryC
 					SNew(STextBlock)
 					.Text(FText::FromString(TEXT("\x2715")))
 					.Font(ImSlate::GetImSlateDefaultFont())
-					.ColorAndOpacity(FLinearColor(0.6f, 0.6f, 0.6f))
+					.ColorAndOpacity(FLinearColor(0.7f, 0.7f, 0.7f))
+					.Justification(ETextJustify::Center)
 				]
 			];
 		}
@@ -416,6 +453,9 @@ void SImSearchBox::SetSuggestions(const TArray<FString>& InItems, int32 HistoryC
 		[
 			SAssignNew(Btn, SButton)
 			.ButtonStyle(&GetSuggestionButtonStyle())
+			.ContentPadding(FMargin(0.f))   // row fills the button so the X can sit flush in the corner
+			.HAlign(HAlign_Fill)
+			.VAlign(VAlign_Fill)
 			.ClickMethod(EButtonClickMethod::MouseDown)
 			.OnClicked_Lambda([this, ItemCopy]() {
 				OnSuggestionSelected(ItemCopy);
@@ -469,6 +509,16 @@ FReply SImSearchBox::OnPreviewKeyDown(const FGeometry& MyGeometry, const FKeyEve
 				EditText->SetText(FText::FromString(TextBeforeNavigate));
 			ClearSuggestions();
 			return FReply::Handled();
+		}
+		// Ctrl+Backspace deletes the highlighted HISTORY entry (only history rows are deletable).
+		if (InKeyEvent.GetKey() == EKeys::BackSpace && InKeyEvent.IsControlDown())
+		{
+			if (HighlightIndex >= 0 && HighlightIndex < LastHistoryCount && DeleteHistoryFn
+				&& CurrentSuggestions.IsValidIndex(HighlightIndex))
+			{
+				DeleteHistoryFn(CurrentSuggestions[HighlightIndex]);  // rebuilds the list (SetSuggestions)
+				return FReply::Handled();
+			}
 		}
 	}
 	return SCompoundWidget::OnPreviewKeyDown(MyGeometry, InKeyEvent);

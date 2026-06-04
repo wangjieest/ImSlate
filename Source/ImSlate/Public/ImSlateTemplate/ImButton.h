@@ -77,6 +77,11 @@ public:
 	FReply OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
 	FReply OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
 	FReply OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
+	// Capture-loss safety net for drag-scroll: when the pointer is dragged outside the panel/window and
+	// released there, the up may never reach this button, so OnMouseButtonUp/OnTouchEnded don't run and
+	// the drag-scroll never ends. The engine ALWAYS fires OnMouseCaptureLost when capture goes away for
+	// any reason → finish the pan here (OnDragEnd + clear state) so nothing leaks.
+	void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override;
 	void OnDropOperation();
 
 protected:

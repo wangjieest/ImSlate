@@ -1645,6 +1645,44 @@ void SImSlateVirtualList::EndInertialScrolling()
 	InertialScrollManager.ClearScrollVelocity();
 }
 
+void SImSlateVirtualList::ExternalPanMove(FVector2D PressPos, FVector2D CurPos)
+{
+	// Driven by FImSlatePanelScrollProcessor when a child holds capture. Mirrors the list's own
+	// OnMouseMove scroll path (GetOrientationAxis → ScrollBy + AddScrollSample) so vertical AND
+	// horizontal lists both work, and inertia is sampled exactly like a normal drag.
+	if (!IsPanEnabled() || !CanScroll())
+		return;
+
+	if (!bExternalPanActive)
+	{
+		EndInertialScrolling();              // a fresh drag cancels any leftover coast
+		bExternalPanActive = true;
+		ExternalPanLastScreenPos = CurPos;   // origin; first frame applies no delta (no jump)
+		return;
+	}
+
+	const FGeometry& Geo = GetCachedGeometry();
+	const float Scale = Geo.Scale > 0.f ? Geo.Scale : 1.f;
+	const FVector2D ScreenDelta = CurPos - ExternalPanLastScreenPos;
+	ExternalPanLastScreenPos = CurPos;
+
+	// Project onto the list's scroll axis (Y for vertical, X for horizontal).
+	const float AxisScreen = GetOrientationAxis(ScreenDelta);
+	if (AxisScreen != 0.f)
+	{
+		ScrollBy(Geo, -AxisScreen / Scale, EAllowOverscroll::Yes, false);
+		InertialScrollManager.AddScrollSample(-AxisScreen, FSlateApplication::Get().GetCurrentTime());
+	}
+}
+
+void SImSlateVirtualList::ExternalPanEnd(FVector2D CurPos)
+{
+	const bool bWasPanning = bExternalPanActive;
+	bExternalPanActive = false;
+	if (bWasPanning)
+		BeginInertialScrolling();  // coast with the flick velocity sampled during the forwarded drag
+}
+
 void SImSlateVirtualList::ScrollDescendantIntoView(const TSharedPtr<SWidget>& WidgetToScrollIntoView, bool InAnimateScroll, EDescendantScrollDestination InDestination, float InScrollPadding)
 {
 	ScrollIntoViewRequest = [this, WidgetToScrollIntoView, InAnimateScroll, InDestination, InScrollPadding](const FGeometry& AllottedGeometry) {
@@ -1652,6 +1690,11 @@ void SImSlateVirtualList::ScrollDescendantIntoView(const TSharedPtr<SWidget>& Wi
 	};
 
 	BeginInertialScrolling();
+}
+
+EOrientation SImSlateVirtualList::GetOrientation()
+{
+	return Orientation;
 }
 
 void SImSlateVirtualList::SetOrientation(EOrientation InOrientation)

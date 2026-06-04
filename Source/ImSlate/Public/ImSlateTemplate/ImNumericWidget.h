@@ -16,6 +16,7 @@
 #include "Templates/SharedPointer.h"
 #include "Widgets/Input/NumericTypeInterface.h"
 #include "Widgets/Input/SEditableText.h"
+#include "ImSlateTemplate/ImEditableText.h"  // SImEditableText (self-rendered virtual keyboard on focus)
 #include "Widgets/Input/SNumericEntryBox.h"
 #include "Widgets/Input/SSpinBox.h"
 #include "Widgets/SBoxPanel.h"
@@ -242,7 +243,10 @@ public:
 		}
 
 		// Always create an editable text box.  In the case of an undetermined value being passed in, we cant use the spinbox.
-		SAssignNew(EditableText, SEditableText)
+		// Use SImEditableText (not plain SEditableText) so focusing it pops the self-rendered ImSlate
+		// keyboard; VirtualKeyboardType(Number) makes that a numeric pad (this is a numeric widget).
+		SAssignNew(EditableText, SImEditableText)
+		.VirtualKeyboardType(Keyboard_Number)
 		.Text(this, &SImNumericWidget<NumericType>::OnGetValueForTextBox)
 		.Visibility(bAllowSpin ? EVisibility::Collapsed : EVisibility::Visible)
 #if ENGINE_MAJOR_VERSION < 5

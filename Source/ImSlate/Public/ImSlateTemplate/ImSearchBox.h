@@ -44,6 +44,10 @@ public:
 	TSharedPtr<SEditableText> GetEditableText() const { return EditText; }
 	void SetUseInlineSuggestions(bool bInline) { bUseInlineSuggestions = bInline; }
 	void SetKeyboardSuggestionProvider(FImSearchBoxSuggestionProvider InProvider);
+	// When set, the popped virtual keyboard uses this key for its own (persistent) input history,
+	// so history rows there get the X delete button + survive restart. Empty = no keyboard history.
+	// Forwards to the inner SImEditableText, since THAT is what pops the keyboard on focus.
+	void SetHistoryKey(const FString& InKey);
 
 protected:
 	virtual FReply OnPreviewKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
@@ -64,8 +68,11 @@ private:
 	FString CommittedText;
 	int32 HighlightIndex = -1;
 	TArray<FString> CurrentSuggestions;
+	int32 LastHistoryCount = 0;                            // how many leading CurrentSuggestions are history rows
+	TFunction<void(const FString&)> DeleteHistoryFn;      // delete-a-history-entry callback (for Ctrl+Backspace)
 	FString TextBeforeNavigate;
 	FImSearchBoxSuggestionProvider KeyboardSuggestionProvider;
+	FString HistoryKey;  // virtual-keyboard input-history key (see SetHistoryKey); empty = disabled
 
 	void OnTextChanged(const FText& NewText);
 	void OnTextCommitted(const FText& Text, ETextCommit::Type Type);

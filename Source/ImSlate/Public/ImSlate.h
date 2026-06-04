@@ -156,7 +156,7 @@ inline		bool			Text(ImStr Label, const FString& InStr, const ImVec2& InSize = Im
 IMSLATE_API bool			Image(ImStr Label, UObject* InTexture, const ImVec2& InSize = ImVec2(0, 0)); // Image
 
 // Inputs
-IMSLATE_API bool			InputText(ImStr Label, FString& InStr, const ImVec2& InSize = ImVec2(0, 0), ImSlateInputTextFlags_ Flags = ImSlateInputTextFlags_None);
+IMSLATE_API bool			InputText(ImStr Label, FString& InStr, const ImVec2& InSize = ImVec2(0, 0), ImSlateInputTextFlags_ Flags = ImSlateInputTextFlags_None, ImStr HistoryKey = "", const FImInputNumericSpec* Numeric = nullptr);
 
 // SearchBox: InputText with history and suggestion dropdown
 IMSLATE_API bool			SearchBox(ImStr Label, FString& InOutStr, const TArray<FString>* Suggestions = nullptr, TFunction<void(const FString&, TArray<FString>&)> SuggestionCallback = nullptr, const ImVec2& InSize = ImVec2(0, 0), bool bShowKeyboardButton = false);

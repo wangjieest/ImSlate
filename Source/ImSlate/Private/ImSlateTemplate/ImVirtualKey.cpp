@@ -84,18 +84,20 @@ int32 SImSlateKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeom
 
 	const FVector2D LocalSize = AllottedGeometry.GetLocalSize();
 	const bool bShift = bShiftActive.Get(false);
+	// Disabled keys (e.g. 8/9 while in OCT base): draw dimmed; press is ignored in HandlePress.
+	const float Dim = KeyDef->bDisabled ? 0.3f : 1.f;
 
 	// Background
 	FSlateDrawElement::MakeBox(OutDrawElements, LayerId,
 		AllottedGeometry.ToPaintGeometry(),
 		&GetKeyBrush(bIsPressed),
 		ESlateDrawEffect::None,
-		GetKeyBrush(bIsPressed).TintColor.GetSpecifiedColor());
+		GetKeyBrush(bIsPressed).TintColor.GetSpecifiedColor() * FLinearColor(1.f, 1.f, 1.f, Dim));
 
 	TSharedRef<FSlateFontMeasure> FontMeasure = FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
 	FVector2D Center = LocalSize * 0.5f;
-	float IconSize = FMath::Min(LocalSize.X, LocalSize.Y) * 0.35f;
-	FLinearColor IconColor = FLinearColor::White;
+	float IconSize = FMath::Min(LocalSize.X, LocalSize.Y) * 0.28f;  // self-drawn icons (⌫ ⇪ ✥ …) a bit smaller
+	FLinearColor IconColor = FLinearColor(1.f, 1.f, 1.f, Dim);
 
 	bool bDrawnIcon = false;
 	if (KeyDef->Action == EVirtualKeyAction::Backspace)
@@ -161,33 +163,47 @@ int32 SImSlateKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeom
 		bDrawnIcon = true;
 	}
 
+	// Whether a top hint will be drawn below — used to push the main label toward the LOWER half so the
+	// hint (top) and label (lower-center) don't crowd each other (matches system keyboards).
+	const bool bHasHint = !KeyDef->Swipe.Up.Label.IsEmpty() || (!KeyDef->Value.IsEmpty() && KeyDef->Value != KeyDef->GetDisplayLabel(bShift));
+
 	if (!bDrawnIcon)
 	{
 		// Main label text
 		FSlateFontInfo MainFont = GetImSlateDefaultFont(10);
 		FString DisplayLabel = KeyDef->GetDisplayLabel(bShift);
 		FVector2D TextSize = (FVector2D)FontMeasure->Measure(DisplayLabel, MainFont);
-		FVector2D TextPos = (LocalSize - TextSize) * 0.5f;
+		// Centered horizontally; vertically centered when there's no hint, else nudged into the lower
+		// half so the hint sits clearly above it.
+		FVector2D TextPos((LocalSize.X - TextSize.X) * 0.5f,
+			bHasHint ? (LocalSize.Y * 0.58f - TextSize.Y * 0.5f) : (LocalSize.Y - TextSize.Y) * 0.5f);
 		FSlateDrawElement::MakeText(OutDrawElements, LayerId + 1,
 			AllottedGeometry.ToPaintGeometry(TextSize, FSlateLayoutTransform(1.f, UE::Slate::CastToVector2f(TextPos))),
-			DisplayLabel, MainFont, ESlateDrawEffect::None, FLinearColor::White);
+			DisplayLabel, MainFont, ESlateDrawEffect::None, FLinearColor(1.f, 1.f, 1.f, Dim));
 	}
 
-	// Top-right hint: T9 keys show number (Value), T26 keys show swipe-up char
+	// Top hint: T9 keys show number (Value), T26 keys show swipe-up char. Centered along the TOP edge
+	// (was a tiny top-right corner) and a bit larger, so it's readable.
 	{
-		FString HintText;
-		if (KeyDef->WidthMultiplier >= 2.f)
-			HintText = KeyDef->Value;  // T9: show number
-		else
-			HintText = KeyDef->Swipe.Up.Label;  // T26: show swipe-up symbol
+		// Prefer the swipe-up symbol as the hint (T26 punctuation like ',' over the '.' key, etc.);
+		// fall back to Value (the T9 number) when there's no swipe-up. (Width-based detection was wrong:
+		// a WIDE punctuation key like the bottom '.' is also >=2 wide but should show its swipe-up ','.)
+		FString HintText = KeyDef->Swipe.Up.Label;
+		if (HintText.IsEmpty())
+			HintText = KeyDef->Value;
+
+		// Skip the hint when it duplicates the main label (e.g. the T9 "0" key, whose label AND number
+		// are both "0" → don't draw a second 0 stacked on top).
+		if (HintText == KeyDef->GetDisplayLabel(bShift))
+			HintText.Empty();
 
 		if (!HintText.IsEmpty())
 		{
-			FSlateFontInfo HintFont = GetImSlateDefaultFont(5);
-			FLinearColor HintColor(0.55f, 0.55f, 0.55f, 0.9f);
+			FSlateFontInfo HintFont = GetImSlateDefaultFont(7);
+			FLinearColor HintColor(0.72f, 0.72f, 0.72f, 0.95f * Dim);  // brighter so thin glyphs like ',' read
 			FVector2D HintSize = (FVector2D)FontMeasure->Measure(HintText, HintFont);
-			float Margin = 2.f;
-			FVector2D HintPos(LocalSize.X - HintSize.X - Margin, Margin);
+			float TopMargin = 1.f;
+			FVector2D HintPos((LocalSize.X - HintSize.X) * 0.5f, TopMargin);  // top-centered, hugging the top edge
 			FSlateDrawElement::MakeText(OutDrawElements, LayerId + 1,
 				AllottedGeometry.ToPaintGeometry(HintSize, FSlateLayoutTransform(1.f, UE::Slate::CastToVector2f(HintPos))),
 				HintText, HintFont, ESlateDrawEffect::None, HintColor);
@@ -201,6 +217,8 @@ int32 SImSlateKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeom
 
 FReply SImSlateKey::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
+	if (KeyDef && KeyDef->bDisabled)
+		return FReply::Unhandled();
 	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
 	{
 		HandlePress(MyGeometry, MouseEvent.GetScreenSpacePosition());
@@ -240,6 +258,8 @@ FReply SImSlateKey::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent
 
 FReply SImSlateKey::OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
 {
+	if (KeyDef && KeyDef->bDisabled)
+		return FReply::Unhandled();
 	HandlePress(MyGeometry, InTouchEvent.GetScreenSpacePosition());
 	return FReply::Handled().CaptureMouse(SharedThis(this));
 }
@@ -257,16 +277,39 @@ FReply SImSlateKey::OnTouchEnded(const FGeometry& MyGeometry, const FPointerEven
 	return FReply::Handled().ReleaseMouseCapture();
 }
 
+void SImSlateKey::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
+{
+	// Capture went away without a button-up (Alt+Tab / app deactivate / focus steal). Tear down any
+	// floating swipe/step popup and reset the gesture state so it doesn't linger or mis-fire next time.
+	if (LongPressTimer.IsValid()) { UnRegisterActiveTimer(LongPressTimer.ToSharedRef()); LongPressTimer.Reset(); }
+	if (bIsPressed || bSwipeVisualShown || bLongPressHandled || bStepDragActive)
+		OnReleaseVisual.ExecuteIfBound();  // dismiss the popup (same hook HandleRelease uses)
+	bIsPressed = false;
+	bSwipeDetected = false;
+	bSwipeActive = false;
+	bLongPressHandled = false;
+	bSwipeVisualShown = false;
+	bStepDragActive = false;
+	ActiveSwipeDir = ESwipeDirection::None;
+	// (SWidget::OnMouseCaptureLost is a no-op base; nothing to forward.)
+}
+
 // ==================== Gesture Logic ====================
 
 void SImSlateKey::HandlePress(const FGeometry& MyGeometry, const FVector2D& ScreenPos)
 {
+	// Disabled keys (e.g. 8/9 in OCT base) are inert: painted dimmed, swallow no gesture.
+	if (KeyDef && KeyDef->bDisabled)
+		return;
+
 	bIsPressed = true;
 	bSwipeDetected = false;
 	bSwipeActive = false;
 	bLongPressHandled = false;
 	bWasInOuterZone = false;
 	bSwipeVisualShown = false;
+	bStepDragActive = false;
+	StepAnchorPos = ScreenPos;
 	ActiveSwipeDir = ESwipeDirection::None;
 	LastCursorZone = 0;
 	PressStartPos = ScreenPos;
@@ -313,6 +356,23 @@ void SImSlateKey::HandleRelease(const FGeometry& MyGeometry, const FVector2D& Sc
 	OnReleaseVisual.ExecuteIfBound();
 	if (LastCursorZone != 0)
 		OnSpaceCursorZone.ExecuteIfBound(0);
+
+	// Four-way step-drag already fired its OnStep calls continuously during the move. On release we
+	// only finish: fire the single-shot Callback for the final direction IF that direction has one
+	// (orthogonal channel — most step directions don't), then stop. No FireAction fallback (which
+	// would e.g. spuriously move the cursor on the cursor key).
+	if (bStepDragActive)
+	{
+		FVector2D FinalDelta = ScreenPos - PressStartPos;
+		if (FinalDelta.Size() >= SwipeThreshold)
+		{
+			const FVirtualKeySwipeEntry& E = KeyDef->Swipe.Entry(DetectSwipe(FinalDelta));
+			if (!E.bStep && E.Callback.IsBound())  // single-shot only where step isn't owning it
+				E.Callback.Execute();
+		}
+		bStepDragActive = false;
+		return;
+	}
 
 	if (bSwipeActive)
 	{
@@ -386,21 +446,32 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 
 	FVector2D Delta = ScreenPos - PressStartPos;
 	float SwipeThreshold = 8.f * GetImSlateEffectiveScale();
-	bool bIsSpaceOrDel = (KeyDef->Action == EVirtualKeyAction::Space || KeyDef->Action == EVirtualKeyAction::Backspace);
-	// Done (Enter): horizontal drag = delete/undo step-drag (like Del); vertical = four-way swipe
-	// (up=clear / down=Esc). Decide by which axis dominates. Done's horizontal step-drag shows
-	// NO floating hint (only the function runs); the four-way popup still shows for vertical.
-	const bool bIsDone = (KeyDef->Action == EVirtualKeyAction::Enter);
+	// Keys whose horizontal drag does a repeating "step-drag" (every StepW of motion fires once):
+	// Space (cursor), Backspace (delete/undo), and the numeric spin keys StepUp/StepDown (+/- value).
+	const bool bIsStep = (KeyDef->Action == EVirtualKeyAction::StepUp || KeyDef->Action == EVirtualKeyAction::StepDown);
 	const bool bHorizontal = FMath::Abs(Delta.X) > FMath::Abs(Delta.Y);
-	const bool bDoneHorizStepDrag = bIsDone && bHorizontal;
+	// Done (Enter) AND Del (Backspace): HORIZONTAL drag = step-drag (Del=delete/undo, Done=delete/undo);
+	// VERTICAL swipe = four-way (Del up=Clr / Done up=Clr,down=Esc). So a vertical drag must NOT enter
+	// step-drag — it has to fall through to the swipe-visual path so the up/down Callback fires.
+	// (Previously Del entered step-drag on ANY direction, which swallowed its up-swipe Clr.)
+	const bool bIsDone = (KeyDef->Action == EVirtualKeyAction::Enter);
+	// Only the spin keys (StepUp/StepDown) still use the legacy any-direction step-drag. Space and Del
+	// moved to the new four-way bStep+OnStep path (in-popup scrolling ruler), so they must NOT enter the
+	// legacy path here — they're handled by the swipe-visual + step block below.
+	const bool bAnyDirStepDrag   = bIsStep;
+	// Done: HORIZONTAL drag = legacy step-drag (delete/undo bar); VERTICAL = four-way popup (Clr/Esc).
+	// Decided by the dominant axis so the two are mutually exclusive.
+	const bool bHorizOnlyStepDrag = bIsDone && bHorizontal;
 
-	// Space/Del (any direction) or Done dragged horizontally: step-drag past threshold.
-	if (!bLongPressHandled && !bSwipeVisualShown && (bIsSpaceOrDel || bDoneHorizStepDrag) && Delta.Size() >= SwipeThreshold)
+	// Step-drag past threshold (Space/spin any direction; Del/Done horizontal only).
+	if (!bLongPressHandled && !bSwipeVisualShown && (bAnyDirStepDrag || bHorizOnlyStepDrag) && Delta.Size() >= SwipeThreshold)
 	{
 		bLongPressHandled = true;
 		LongPressAnchorPos = PressStartPos;
-		if (!bIsDone)  // Done's horizontal step-drag shows no floating hint; Del/Space do.
-			OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry, /*bForceStepDrag*/ true);
+		// Show the horizontal step-drag floating hint (◀ Del | Undo ▶). Done now shows it too, so its
+		// horizontal drag has its OWN popup distinct from its vertical four-way (Clr/Esc) — and since
+		// only one of the two paths can arm per gesture (dominant axis), the two popups are mutually exclusive.
+		OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry, /*bForceStepDrag*/ true);
 	}
 
 	// Long-press check (finger near start, for keys with LongPressChars).
@@ -422,7 +493,32 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 		{
 			bSwipeVisualShown = true;
 			OnPressVisual.ExecuteIfBound(*KeyDef, MyGeometry, /*bForceStepDrag*/ false);  // four-way popup
+			if (KeyDef->Swipe.HasStep())  // arm four-way step-drag from here
+			{
+				bStepDragActive = true;
+				StepAnchorPos = PressStartPos;
+			}
 		}
+	}
+
+	// Four-way step-drag: each bStep direction fires the key-level OnStep once per StepW of travel,
+	// on BOTH axes independently (drag up/down adjusts, left/right moves cursor — they can run at
+	// once). Mirrors Del's left/right step-drag but generalized to four directions with one callback.
+	// Uses its own StepAnchorPos so it never collides with Space/Del's LongPressAnchorPos path.
+	if (bStepDragActive && KeyDef->Swipe.OnStep)
+	{
+		const float StepW = 12.f * GetImSlateEffectiveScale();
+		float XOff = ScreenPos.X - StepAnchorPos.X;
+		float YOff = ScreenPos.Y - StepAnchorPos.Y;
+		// Horizontal: right = +X, left = -X.
+		while (XOff > StepW)  { if (KeyDef->Swipe.Right.bStep) KeyDef->Swipe.OnStep(EImSwipeDir::Right); StepAnchorPos.X += StepW; XOff -= StepW; }
+		while (XOff < -StepW) { if (KeyDef->Swipe.Left.bStep)  KeyDef->Swipe.OnStep(EImSwipeDir::Left);  StepAnchorPos.X -= StepW; XOff += StepW; }
+		// Vertical: screen Y grows downward → up = -Y, down = +Y.
+		while (YOff < -StepW) { if (KeyDef->Swipe.Up.bStep)   KeyDef->Swipe.OnStep(EImSwipeDir::Up);   StepAnchorPos.Y -= StepW; YOff += StepW; }
+		while (YOff > StepW)  { if (KeyDef->Swipe.Down.bStep) KeyDef->Swipe.OnStep(EImSwipeDir::Down); StepAnchorPos.Y += StepW; YOff -= StepW; }
+		// Drive the ruler visual (absolute drag delta; the visual itself does the fmod wrap).
+		OnMoveVisual.ExecuteIfBound(FVector2D(ScreenPos.X - PressStartPos.X, ScreenPos.Y - PressStartPos.Y), true);
+		return;  // step-drag owns this move; skip the single-shot swipe-visual direction logic below
 	}
 
 	// Step-drag active: Space = cursor, Del = delete/undo, LongPress = popup
@@ -436,6 +532,15 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 			OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);
 			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Right); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
 			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Left);  LongPressAnchorPos.X -= StepW; XOffset += StepW; }
+		}
+		else if (bIsStep)
+		{
+			// Numeric spin keys: horizontal drag continuously adjusts the value (right = +, left = −),
+			// one step per StepW of travel — same step-drag feel as Space's cursor. A plain tap (no
+			// drag) still fires the key's own StepUp/StepDown once via HandleRelease.
+			OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);
+			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::StepUp);   LongPressAnchorPos.X += StepW; XOffset -= StepW; }
+			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::StepDown); LongPressAnchorPos.X -= StepW; XOffset += StepW; }
 		}
 		else if (KeyDef->Action == EVirtualKeyAction::Backspace)
 		{
@@ -617,6 +722,84 @@ void SImSlateKeyPopup::SetHighlightIndex(int32 Index)
 	HighlightIndex = Index;
 	if (CellBorders.IsValidIndex(HighlightIndex))
 		CellBorders[HighlightIndex]->SetBorderImage(&GetKeyBrush(true));
+}
+
+// ==================== SImStepRuler ====================
+
+void SImStepRuler::Construct(const FArguments& InArgs)
+{
+	Axis  = InArgs._Axis;
+	StepW = FMath::Max(1.f, InArgs._StepW);
+}
+
+FVector2D SImStepRuler::ComputeDesiredSize(float) const
+{
+	// Transparent overlay: contributes NO desired size, so it never enlarges the popup. It simply
+	// fills (HAlign/VAlign_Fill) whatever area the popup's Grid defines and paints ticks over it.
+	return FVector2D::ZeroVector;
+}
+
+int32 SImStepRuler::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect,
+	FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
+{
+	const FVector2D Size = AllottedGeometry.GetLocalSize();
+	// NO background, NO center baseline — just tick lines over the popup. Grey ticks vanished against
+	// the grey popup, so use the popup's accent blue (long brighter, short dimmer) for contrast.
+	const FLinearColor LongTick (0.30f, 0.80f, 1.00f, 0.95f);
+	const FLinearColor ShortTick(0.30f, 0.80f, 1.00f, 0.45f);
+
+	const FPaintGeometry PG = AllottedGeometry.ToPaintGeometry();
+	const int32 SubDiv = 5;                 // 1 long + 4 short per StepW
+	const float SubW = StepW / SubDiv;      // spacing of the fine (short) ticks
+
+	// Ticks GROW FROM THE EDGE (not centered). Length & thickness scale by proportion: long ticks
+	// (step points) reach deeper and are thicker; short ticks (subdivisions) are shallow and thin.
+	// Vertical ticks (cursor axis) grow DOWN from the TOP edge; horizontal ticks (value axis) grow
+	// LEFT from the RIGHT edge.
+	const float LongFrac  = 0.31f;   // long tick depth as fraction of the cross-axis extent (halved)
+	const float ShortFrac = 0.15f;   // short tick depth (halved)
+	const float LongThick = 1.8f;
+	const float ShortThick = 1.0f;
+	auto DrawTick = [&](float P, bool bLong)
+	{
+		const FLinearColor C = bLong ? LongTick : ShortTick;
+		const float Thick = bLong ? LongThick : ShortThick;
+		const float Frac  = bLong ? LongFrac : ShortFrac;
+		if (Axis == EOrientation::Orient_Vertical)
+		{
+			// vertical tick at X=P, grows down from the top edge (y=0).
+			const float Len = Frac * Size.Y;
+			TArray<FVector2D> L = { FVector2D(P, 0.f), FVector2D(P, Len) };
+			FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, PG, L, ESlateDrawEffect::None, C, true, Thick);
+		}
+		else
+		{
+			// horizontal tick at Y=P, grows left from the right edge (x=Size.X).
+			const float Len = Frac * Size.X;
+			TArray<FVector2D> L = { FVector2D(Size.X, P), FVector2D(Size.X - Len, P) };
+			FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, PG, L, ESlateDrawEffect::None, C, true, Thick);
+		}
+	};
+
+	const float AxisLen = (Axis == EOrientation::Orient_Vertical) ? Size.X : Size.Y;
+	const float Center  = AxisLen * 0.5f;
+	// Long ticks sit at Center + (Offset mod StepW) + n*StepW (track the finger). Between each pair of
+	// long ticks are 4 evenly-spaced short ticks. We iterate sub-tick units across the whole axis and
+	// flag every SubDiv-th one (aligned to the long-tick phase) as long.
+	float LongPhase = FMath::Fmod(Offset, StepW);
+	if (LongPhase < 0.f) LongPhase += StepW;
+	// j counts sub-tick steps from the long-tick phase; j%SubDiv==0 → long tick.
+	// Start j at the most-negative index whose position is still >= 0, then sweep up to AxisLen.
+	const int32 jStart = (int32)FMath::CeilToFloat((0.f - (Center + LongPhase)) / SubW);
+	const int32 jEnd   = (int32)FMath::FloorToFloat((AxisLen - (Center + LongPhase)) / SubW);
+	for (int32 j = jStart; j <= jEnd; ++j)
+	{
+		const float P = Center + LongPhase + j * SubW;
+		const bool bLong = (((j % SubDiv) + SubDiv) % SubDiv) == 0;
+		DrawTick(P, bLong);
+	}
+
+	return LayerId + 1;
 }
 
 // ==================== SImSlateCursorSlider ====================

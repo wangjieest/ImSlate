@@ -248,7 +248,11 @@ FReply SImButton::OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent&
 				if (R.IsEventHandled())
 					return R;
 			}
-			return FReply::Handled();
+			// Behaviour declined — release capture so an ancestor can take over (mirror the mouse
+			// path L194-196). Without this the touch capture leaked: the button kept eating moves
+			// it had nothing to do with, so the panel never got to scroll.
+			bPressActive = false;
+			return FReply::Handled().ReleaseMouseCapture();
 		}
 	}
 	return SButton::OnTouchMoved(MyGeometry, InTouchEvent);
@@ -272,6 +276,23 @@ FReply SImButton::OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent&
 		return ExecuteOnClick().ReleaseMouseCapture();
 	}
 	return SButton::OnTouchEnded(MyGeometry, InTouchEvent);
+}
+
+void SImButton::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
+{
+	// Drag-scroll capture went away (typically: dragged outside the panel/window and released there, so
+	// the up never reached us). Without this the drag-scroll state would linger — capture lost but
+	// bDragScrolling/bPressActive still true — and moving the pointer back over the button would resume
+	// scrolling (OnMouseMove sees bPressActive && ... ). End the pan and clear all press/drag state.
+	if (bDragScrolling)
+	{
+		bDragScrolling = false;
+		if (PressBehavior.OnDragEnd)
+			PressBehavior.OnDragEnd(LastDragPos);  // best-effort end pos (last seen during the drag)
+	}
+	bPressActive = false;
+	Release();  // clear pressed visual if any
+	SButton::OnMouseCaptureLost(CaptureLostEvent);
 }
 
 void SImButton::OnFocusLost(const FFocusEvent& InFocusEvent)

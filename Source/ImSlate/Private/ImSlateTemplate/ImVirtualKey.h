@@ -1,6 +1,7 @@
 // Copyright ImSlate, Inc. All Rights Reserved.
 #pragma once
 #include "CoreMinimal.h"
+#include "Types/SlateEnums.h"  // EOrientation (SImStepRuler axis)
 #include "Widgets/SLeafWidget.h"
 #include "Widgets/SCompoundWidget.h"
 #include "ImSlateFactory.h"
@@ -59,6 +60,10 @@ public:
 	virtual FReply OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
 	virtual FReply OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
 	virtual FReply OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
+	// Capture-loss safety net: if capture is yanked away mid-gesture (Alt+Tab, app deactivate, focus
+	// steal) no button-up reaches us, so the swipe/step popup would linger. End the gesture + clear the
+	// floating popup here (the engine always fires this when capture goes away).
+	virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override;
 
 private:
 	const FVirtualKeyDef* KeyDef = nullptr;
@@ -82,7 +87,12 @@ private:
 	int32 LongPressCharCount = 0;
 	int32 LongPressSelIndex = 0;  // current selection, advanced by step-drag (not absolute mapping)
 
-	enum class ESwipeDirection { None, Up, Down, Left, Right };
+	// Four-way step-drag anchors (continuous OnStep). Independent per axis, separate from
+	// LongPressAnchorPos (Space/Del's single-axis step-drag) so the two never interfere.
+	FVector2D StepAnchorPos = FVector2D::ZeroVector;
+	bool bStepDragActive = false;
+
+	using ESwipeDirection = EImSwipeDir;  // public enum; alias keeps existing references compiling
 
 	bool bIsPressed = false;
 	bool bSwipeDetected = false;
@@ -127,6 +137,34 @@ private:
 	int32 HighlightIndex = -1;
 	float CellWidth = 0.f;
 	TArray<TSharedPtr<SBorder>> CellBorders;
+};
+
+// Scrolling ruler shown during a four-way step-drag. Evenly-spaced tick lines that slide with the
+// finger and wrap (looks like an infinite ruler), with a bright-blue baseline fixed at the center;
+// each tick crossing the baseline corresponds to one step trigger. Orientation::Vertical draws
+// VERTICAL ticks that move left/right (cursor axis); Horizontal draws HORIZONTAL ticks that move
+// up/down (value axis). Self-drawn leaf; the keyboard feeds it the live drag offset.
+class SImStepRuler : public SLeafWidget
+{
+public:
+	SLATE_BEGIN_ARGS(SImStepRuler)
+		: _Axis(EOrientation::Orient_Vertical)
+		, _StepW(12.f)
+	{}
+		SLATE_ARGUMENT(EOrientation, Axis)   // Vertical ticks (cursor/horizontal drag) vs Horizontal ticks (value/vertical drag)
+		SLATE_ARGUMENT(float, StepW)         // distance between adjacent tick lines (= one step)
+	SLATE_END_ARGS()
+
+	void Construct(const FArguments& InArgs);
+	void SetOffset(float InOffset) { Offset = InOffset; Invalidate(EInvalidateWidgetReason::Paint); }
+
+	virtual FVector2D ComputeDesiredSize(float) const override;
+	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override;
+
+private:
+	EOrientation Axis = EOrientation::Orient_Vertical;
+	float StepW = 12.f;     // tick spacing in local px
+	float Offset = 0.f;     // current drag offset along the axis (wrapped by StepW at paint time)
 };
 
 // Draggable cursor slider — hold and drag left/right to move text cursor

@@ -16,6 +16,9 @@
 #include "SImViewportHost.h"
 #include "UnrealEngine.h"
 #include "WorldLocalStorages.h"
+#include "ImSlateTemplate/ImVirtualKeyboard.h"
+#include "ImSlatePanelScrollProcessor.h"
+#include "Framework/Application/SlateApplication.h"
 
 #if WITH_EDITOR
 #include "Editor/LevelEditor/Public/SLevelViewport.h"
@@ -193,13 +196,52 @@ public:
 			FCoreUObjectDelegates::PostLoadMapWithWorld.AddRaw(this, &FImSlateModule::OnGameInstanceStart);
 		}));
 		FWorldDelegates::OnWorldCleanup.AddRaw(this, &FImSlateModule::OnWorldCleanup);
+
+		// App-lifecycle: proactively close any open virtual keyboard when the app deactivates or
+		// enters background. A keyboard that survives into resume is the source of a known
+		// suspend/resume crash, so closing it beforehand avoids that path entirely (workaround, not
+		// a root-cause fix — see issue-imslate-suspend-resume-bug). Both events are covered: a
+		// transient deactivate (call/notification shade) and a real backgrounding (lock/Home).
+		AppDeactivateHandle = FCoreDelegates::ApplicationWillDeactivateDelegate.AddStatic(&FImSlateModule::OnAppWillBackground);
+		AppBackgroundHandle = FCoreDelegates::ApplicationWillEnterBackgroundDelegate.AddStatic(&FImSlateModule::OnAppWillBackground);
+
+		// App-level input preprocessor: lets a vertical drag started ON A CHILD widget (checkbox /
+		// button / text box inside a scrollable panel) scroll the panel, even though the child
+		// captured the pointer. See FImSlatePanelScrollProcessor. Registered at index 0 (highest
+		// priority) so it sees moves before anything else; it only consumes once it confirms a scroll.
+		if (FSlateApplication::IsInitialized())
+		{
+			ScrollProcessor = MakeShared<ImSlate::FImSlatePanelScrollProcessor>();
+			FSlateApplication::Get().RegisterInputPreProcessor(ScrollProcessor, 0);
+		}
 	}
 
 	virtual void ShutdownModule() override
 	{
 		FCoreUObjectDelegates::PostLoadMapWithWorld.RemoveAll(this);
 		FWorldDelegates::OnWorldCleanup.RemoveAll(this);
+		if (AppDeactivateHandle.IsValid())
+			FCoreDelegates::ApplicationWillDeactivateDelegate.Remove(AppDeactivateHandle);
+		if (AppBackgroundHandle.IsValid())
+			FCoreDelegates::ApplicationWillEnterBackgroundDelegate.Remove(AppBackgroundHandle);
+
+		if (FSlateApplication::IsInitialized() && ScrollProcessor.IsValid())
+			FSlateApplication::Get().UnregisterInputPreProcessor(ScrollProcessor);
+		ScrollProcessor.Reset();
 	}
+
+	// Both lifecycle events route here; the keyboard hide is idempotent and non-creating.
+	static void OnAppWillBackground()
+	{
+		ImSlate::SImSlateVirtualKeyboard::HideOpenKeyboardForAppLifecycle();
+	}
+
+private:
+	FDelegateHandle AppDeactivateHandle;
+	FDelegateHandle AppBackgroundHandle;
+	TSharedPtr<ImSlate::FImSlatePanelScrollProcessor> ScrollProcessor;
+
+public:
 
 	void OnWorldCleanup(UWorld* InWorld, bool bSessionEnded, bool bCleanupResources)
 	{
@@ -312,6 +354,14 @@ FWorldContextRoot* GetGImSlate(const UObject* InObj)
 ImSlateContext* GetGImSlate()
 {
 	return GetGImSlate(nullptr);
+}
+
+// Exported per-world accessor: returns the ImSlate context bound to InObj's world (PIE-safe),
+// upcast to the public base type so callers outside this TU can use it (e.g. to find the game
+// viewport / virtual keyboard for the correct client world under "Play As Client").
+IMSLATE_API ImSlateContext* GetGImSlateForWorld(const UObject* InObj)
+{
+	return GetGImSlate(InObj);
 }
 
 TSharedPtr<void> ImSlateTicker::BindDelegate(ImSlateTicker::FOnTickWithWorld Delegate, UWorld* InWorld)

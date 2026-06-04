@@ -13,6 +13,8 @@
 #include "EnhancedPlayerInput.h"
 #include "UObject/UObjectIterator.h"
 #include "UObject/UObjectGlobals.h"  // FCoreUObjectDelegates::PostLoadMapWithWorld
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/Application/SlateUser.h"
 
 #if GMP_EXTEND_CONSOLE
 
@@ -42,6 +44,52 @@ static FXConsoleCommandLambdaFull XVar_ImSlateXConsole(
 	[](TOptional<bool> bOpen, UWorld* InWorld, FOutputDevice& Ar) {
 		ToggleXConsolePanel(bOpen, InWorld);
 	});
+
+//////////////////////////////////////////////////////////////////////////
+// Diagnostic: simulate a suspend→resume lifecycle and dump Slate pointer-capture state before/after.
+// PURPOSE: the "xconsole clicks stop responding after resume" bug is suspected (not yet proven) to be a
+// stale pointer capture left over from suspending mid-press. This command lets us GET EVIDENCE in PIE:
+//   1) open the panel, press-hold a control (to create a capture),
+//   2) run `imslate.DiagResume`,
+//   3) read the log: does a captor widget survive the simulated resume? then try clicking.
+// It only DUMPS (and broadcasts the engine lifecycle delegates) — it does NOT release capture, so we can
+// observe the natural post-resume state first. Once the cause is confirmed, the fix goes in a resume hook.
+//////////////////////////////////////////////////////////////////////////
+static void DumpSlateCaptureState(const TCHAR* When)
+{
+	if (!FSlateApplication::IsInitialized())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[ImSlate.DiagResume] %s: SlateApplication not initialized"), When);
+		return;
+	}
+	FSlateApplication& App = FSlateApplication::Get();
+	int32 UserCount = 0;
+	App.ForEachUser([&](FSlateUser& User) {
+		++UserCount;
+		const bool bHasCapture = User.HasAnyCapture();
+		FString Captors;
+		for (const TSharedRef<SWidget>& W : User.GetCaptorWidgets())
+			Captors += FString::Printf(TEXT("%s "), *W->GetTypeAsString());
+		UE_LOG(LogTemp, Warning, TEXT("[ImSlate.DiagResume] %s: User[%d] HasAnyCapture=%d Captors=[%s]"),
+			When, User.GetUserIndex(), bHasCapture ? 1 : 0, *Captors);
+	});
+	UE_LOG(LogTemp, Warning, TEXT("[ImSlate.DiagResume] %s: %d user(s); FocusedWidget=%s"),
+		When, UserCount,
+		App.GetUserFocusedWidget(0).IsValid() ? *App.GetUserFocusedWidget(0)->GetTypeAsString() : TEXT("<none>"));
+}
+
+static FAutoConsoleCommand GCmd_ImSlateDiagResume(
+	TEXT("imslate.DiagResume"),
+	TEXT("Diagnostic: dump Slate pointer-capture state, simulate suspend→resume lifecycle, dump again. "
+		 "Use to investigate post-resume unresponsive clicks (does a captor survive?). Dumps only; no fix."),
+	FConsoleCommandDelegate::CreateLambda([] {
+		DumpSlateCaptureState(TEXT("BEFORE"));
+		UE_LOG(LogTemp, Warning, TEXT("[ImSlate.DiagResume] broadcasting WillEnterBackground → HasReactivated → HasEnteredForeground"));
+		FCoreDelegates::ApplicationWillEnterBackgroundDelegate.Broadcast();
+		FCoreDelegates::ApplicationHasReactivatedDelegate.Broadcast();
+		FCoreDelegates::ApplicationHasEnteredForegroundDelegate.Broadcast();
+		DumpSlateCaptureState(TEXT("AFTER "));
+	}));
 
 //////////////////////////////////////////////////////////////////////////
 // Desktop hotkey: Alt+~ or Ctrl+~ toggles the panel (game/PIE runtime only)
@@ -385,10 +433,10 @@ void UImXConsolePanel::DrawParamWidget(const FName& TypeName, FString& Value, bo
 	if (bGroupWrap)
 	{
 		FString GroupId = FString::Printf(TEXT("%s_grp%d"), *CmdName, Index);
-		// Colour the group by enable state: green = enabled (arg will be passed), grey = disabled (skipped).
+		// Colour the group by enable state: green = enabled (arg will be passed), blue = disabled (skipped).
 		const FLinearColor GroupCol = bEnabled
 			? FLinearColor(0.20f, 0.80f, 0.30f, 0.30f)
-			: FLinearColor(0.28f, 0.28f, 0.30f, 0.45f);  // disabled: darker, more opaque grey so it clearly reads as off
+			: FLinearColor(0.15f, 0.20f, 0.30f, 0.25f);  // disabled: low-alpha cool blue — distinct from the green "on" tint and doesn't blend with the neutral-grey text/input
 		ImSlate::BeginGroup(FStringView(GroupId), GroupCol);
 	}
 
@@ -504,10 +552,20 @@ void UImXConsolePanel::DrawParamWidget(const FName& TypeName, FString& Value, bo
 		}
 		else
 		{
-			// InputText with clamp
+			// InputText: integer numeric keypad (no '.'; unsigned types hide '-'), with optional
+			// clamp + step from meta, and per-key input history (WidgetId is stable: CmdName_pIndex).
 			FString IntStr = Value;
+			ImSlate::FImInputNumericSpec Spec;
+			Spec.bInteger = true;
+			Spec.bUnsigned = InnerType.StartsWith(TEXT("uint"));
+			if (PMeta)
+			{
+				if (PMeta->HasMeta(TEXT("ClampMin"))) Spec.Min = (double)PMeta->GetMetaInt(TEXT("ClampMin"));
+				if (PMeta->HasMeta(TEXT("ClampMax"))) Spec.Max = (double)PMeta->GetMetaInt(TEXT("ClampMax"));
+				if (PMeta->HasMeta(TEXT("Delta")))    Spec.Step = (double)PMeta->GetMetaInt(TEXT("Delta"));
+			}
 			ImSlate::SetNextItemMinWidth(80.f);
-			if (ImSlate::InputText(FStringView(WidgetId), IntStr))
+			if (ImSlate::InputText(FStringView(WidgetId), IntStr, ImVec2(0, 0), ImSlate::ImSlateInputTextFlags_None, FStringView(WidgetId), &Spec))
 			{
 				int32 IntVal = FCString::Atoi(*IntStr);
 				if (PMeta)
@@ -566,7 +624,8 @@ void UImXConsolePanel::DrawParamWidget(const FName& TypeName, FString& Value, bo
 		else
 		{
 			ImSlate::SetNextItemMinWidth(100.f);
-			ImSlate::InputText(FStringView(WidgetId), Value);
+			// String param: plain text keyboard + per-key history (WidgetId is stable: CmdName_pIndex).
+			ImSlate::InputText(FStringView(WidgetId), Value, ImVec2(0, 0), ImSlate::ImSlateInputTextFlags_None, FStringView(WidgetId));
 		}
 	}
 	// === Object / SoftObject ===
@@ -628,7 +687,8 @@ void UImXConsolePanel::DrawParamWidget(const FName& TypeName, FString& Value, bo
 	else
 	{
 		ImSlate::SetNextItemFillWidth(1.f);
-		ImSlate::InputText(FStringView(WidgetId), Value);
+		// Plain text + per-key history (WidgetId stable: CmdName_pIndex).
+		ImSlate::InputText(FStringView(WidgetId), Value, ImVec2(0, 0), ImSlate::ImSlateInputTextFlags_None, FStringView(WidgetId));
 	}
 
 	if (bGroupWrap)
@@ -879,8 +939,15 @@ void UImXConsolePanel::DrawVariableEntry(FImXConsoleVariableInfo& Info)
 	else if (Info.CVar->IsVariableInt())
 	{
 		FString ValStr = Info.CVar->GetString();
+		ImSlate::FImInputNumericSpec Spec;
+		Spec.bInteger = true;  // integer CVar → keypad hides '.'
+		if (SelfMeta)
+		{
+			if (SelfMeta->HasMeta(TEXT("ClampMin"))) Spec.Min = (double)SelfMeta->GetMetaInt(TEXT("ClampMin"));
+			if (SelfMeta->HasMeta(TEXT("ClampMax"))) Spec.Max = (double)SelfMeta->GetMetaInt(TEXT("ClampMax"));
+		}
 		ImSlate::SetNextItemMinWidth(100.f);
-		if (ImSlate::InputText(FStringView(WidgetId), ValStr))
+		if (ImSlate::InputText(FStringView(WidgetId), ValStr, ImVec2(0, 0), ImSlate::ImSlateInputTextFlags_None, FStringView(WidgetId), &Spec))
 		{
 			int32 IntVal = FCString::Atoi(*ValStr);
 			if (SelfMeta)
@@ -895,7 +962,8 @@ void UImXConsolePanel::DrawVariableEntry(FImXConsoleVariableInfo& Info)
 	{
 		FString ValStr = Info.CVar->GetString();
 		ImSlate::SetNextItemMinWidth(150.f);
-		if (ImSlate::InputText(FStringView(WidgetId), ValStr))
+		// String CVar: plain text + per-key history.
+		if (ImSlate::InputText(FStringView(WidgetId), ValStr, ImVec2(0, 0), ImSlate::ImSlateInputTextFlags_None, FStringView(WidgetId)))
 			Info.CVar->Set(*ValStr);
 	}
 

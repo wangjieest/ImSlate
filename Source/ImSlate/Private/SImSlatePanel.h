@@ -294,6 +294,16 @@ public:
 	void ScrollByDelta(float DeltaY) { OnScrollOffset(ScrollOffset + DeltaY); }
 	// True when content exceeds the visible height (there is room to scroll).
 	bool CanScroll() const { return TotalActualSize.Y > GetCachedGeometry().GetLocalSize().Y; }
+
+	// External pan: a child that holds capture (fold-header SButton) OR an app-level input
+	// preprocessor (FImSlatePanelScrollProcessor) forwards its drag here so the SAME scroll logic
+	// runs without the panel itself holding capture. Pass press + current screen positions; the
+	// caller is responsible for its own drag threshold before calling. Public so the preprocessor
+	// can drive it. IsPanEnabled() so callers can pre-check.
+	void ExternalPanMove(FVector2D PressPos, FVector2D CurPos);
+	void ExternalPanEnd(FVector2D CurPos);
+	bool IsPanEnabled() const;
+
 	void SetItemParent(ImSlateId ItemId);               // assign current fold context as parent
 	void PushFoldContext(ImSlateId FoldId);
 	void PopFoldContext();
@@ -336,14 +346,6 @@ protected:
 	EPanMode PanMode = EPanMode::None;                   // locked once at the threshold (no mid-drag switch)
 	FVector2D AbsGrabOffset = FVector2D::ZeroVector;     // MoveWindow only: press pos - window abs pos
 
-	// External pan: a child that holds mouse capture (e.g. fold-header SButton, which captures on down and
-	// thus swallows the panel's own move) forwards its drag here so the SAME scroll/move-window(+viewport
-	// switch) logic runs without the panel needing capture. Pass press + current screen positions; the
-	// child is responsible for its own drag threshold before calling.
-	void ExternalPanMove(FVector2D PressPos, FVector2D CurPos);
-	void ExternalPanEnd(FVector2D CurPos);
-
-	bool IsPanEnabled() const;
 	void BeginPanCandidate(const FPointerEvent& PointerEvent);
 	// Returns true (with OutReply set) when a pan starts this move; false to keep bubbling.
 	bool TryStartPan(const FGeometry& MyGeometry, const FPointerEvent& PointerEvent, FReply& OutReply);

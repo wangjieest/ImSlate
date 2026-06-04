@@ -1,8 +1,72 @@
 // Copyright ImSlate, Inc. All Rights Reserved.
 #include "ImSlateTemplate/ImSpinBox.h"
 
+#include <limits>
 #include "PrivateFieldAccessor.h"
 #include "Widgets/Text/SlateEditableTextLayout.h"
+#include "ImSlateTemplate/ImVirtualKeyboard.h"
+#include "Framework/Application/SlateApplication.h"
+
+namespace ImSlate
+{
+// SSpinBox<float> that pops the self-rendered ImSlate numeric keypad instead of the OS/IME keyboard
+// when you click into its text field — while keeping all native SSpinBox behaviour (slider drag,
+// arrows, delta). A click (not a drag) makes the base SSpinBox EnterTextMode() + focus its internal
+// SEditableText (SSpinBox.cpp:351-354); we detect that, immediately exit the base text mode (so the
+// engine edit doesn't also take input), and drive editing through our keyboard. Commit writes the
+// parsed value back via SetValue. The keypad is shaped from the spinbox's own Min/Max/Delta.
+class SImSlateSpinBox : public SSpinBox<float>
+{
+public:
+	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
+	{
+		FReply Reply = SSpinBox<float>::OnMouseButtonUp(MyGeometry, MouseEvent);
+
+		// IsInTextMode() (protected base helper) is true when the click just entered text-editing mode.
+		// Only redirect to our keyboard when it's the in-viewport (overlay) input path.
+		if (IsInTextMode() && SImSlateVirtualKeyboard::ShouldUseVirtualKeyboard(this))
+		{
+			if (auto Keyboard = SImSlateVirtualKeyboard::Get())
+			{
+				// Back out of the base text mode — our keyboard owns the edit now (avoids dual input
+				// and the engine edit grabbing focus / popping the OS keyboard).
+				ExitTextMode();
+
+				TWeakPtr<SImSlateSpinBox> WeakSelf = StaticCastSharedRef<SImSlateSpinBox>(AsShared());
+				FVirtualKeyboardShowParams Params;
+				Params.InitialText = GetValueAsString();
+				Params.Owner = AsShared();
+				Params.InitialKeyboardType = EImKeyboardType::Number;
+				Params.Numeric.bAllowDecimal = true;      // float
+				// Only forward a clamp when the spinbox actually HAS one. SSpinBox::GetMinValue/GetMaxValue
+				// return numeric_limits lowest()/max() when unset (SSpinBox.cpp:711/722), NOT TOptional —
+				// forwarding those as Min/Max would (a) wrongly mark the field as range-limited and (b)
+				// e.g. make the keypad think it can't go negative. Treat the sentinel extremes as "unset".
+				const float SpinMin = GetMinValue();
+				const float SpinMax = GetMaxValue();
+				if (SpinMin > std::numeric_limits<float>::lowest())
+					Params.Numeric.Min = (double)SpinMin;
+				if (SpinMax < std::numeric_limits<float>::max())
+					Params.Numeric.Max = (double)SpinMax;
+				// Allow negatives unless an explicit min clamps the range to >= 0.
+				Params.Numeric.bAllowNegative = !(Params.Numeric.Min.IsSet() && Params.Numeric.Min.GetValue() >= 0.0);
+				if (GetDelta() != 0.f)
+					Params.Numeric.Step = (double)GetDelta();
+				Params.CommitCallback = [WeakSelf](const FString& Text, ETextCommit::Type Type)
+				{
+					if (auto Self = WeakSelf.Pin())
+					{
+						if (Type != ETextCommit::OnCleared)
+							Self->SetValue(FCString::Atof(*Text), /*bShouldCommit=*/ true);
+					}
+				};
+				Keyboard->Show(Params);
+			}
+		}
+		return Reply;
+	}
+};
+}  // namespace ImSlate
 
 //
 namespace ImSlateSpinBox
@@ -25,7 +89,7 @@ void ApplyMargin(TSharedRef<SSpinBox<float>>& MyStealSpinBox)
 
 TSharedRef<SSpinBox<float>> UImSpinBox::ConstructImWidget() const
 {
-	auto MyStealSpinBox = SNew(SSpinBox<float>)
+	auto MyStealSpinBox = SNew(ImSlate::SImSlateSpinBox)  // SSpinBox<float> that pops the ImSlate numeric keypad
 							.Style(&GetWidgetStyle())
 							.Font(ImSlate::ScaleImSlateFont(GetFont()))
 							.ClearKeyboardFocusOnCommit(GetClearKeyboardFocusOnCommit())
