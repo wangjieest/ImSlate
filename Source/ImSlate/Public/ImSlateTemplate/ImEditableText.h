@@ -36,9 +36,9 @@ public:
 	// plain fields (not FImNumericKeyboardParams) to avoid pulling the virtual-keyboard UObject header
 	// into this one. Only consumed when VirtualKeyboardType == Keyboard_Number.
 	void SetNumericParams(bool bAllowDecimal, bool bAllowNegative, bool bHex,
-		TOptional<double> Min, TOptional<double> Max, TOptional<double> Step)
+		TOptional<double> Min, TOptional<double> Max, TOptional<double> Step, int32 BitWidth = 0)
 	{
-		bNumAllowDecimal = bAllowDecimal; bNumHex = bHex;
+		bNumAllowDecimal = bAllowDecimal; bNumHex = bHex; NumBitWidth = BitWidth;
 		// The ImSlate numeric APIs use FLT_MIN / FLT_MAX as "no lower / no upper bound" sentinels
 		// (see InputFloat/NumericFloat defaults). FLT_MIN is the smallest POSITIVE float (~1.17e-38),
 		// NOT the lowest — if it leaks through as a real clamp the value can't go at/below ~0 (e.g. a
@@ -66,16 +66,34 @@ public:
 	// Caret blink toggle, driven by the keyboard's blink timer (OnPaint is const, only reads it).
 	void SetPreviewCaretVisible(bool bVisible) { bPreviewCaretVisible = bVisible; }
 
+	// ---- Preview digit-scrubbing support (numeric keypad's drag-to-edit on the preview row) ----
+	// Map an absolute screen position to the index of the DIGIT char under it (skips '-' '.'), choosing
+	// the nearest digit cell when between/outside. Returns INDEX_NONE if there is no digit. Used to pick
+	// the initially-selected digit on press.
+	int32 HitTestDigitIndex(const FVector2D& AbsScreenPos) const;
+	// Local-space X bounds [OutL,OutR] of the char at CharIndex (already /Scale). false if unavailable.
+	bool  GetDigitCellBounds(int32 CharIndex, float& OutL, float& OutR) const;
+	// Local-space X of the SELF-DRAWN caret (same source as the blinking caret: GetCursorLocation +
+	// GetLocationAt / Scale). false if unavailable. Lets overlays (the scrub ruler) align exactly to the caret.
+	bool  GetCaretLocalX(float& OutX) const;
+	// Local-space X of the caret at an ARBITRARY text index (not necessarily the live cursor). Used to bound
+	// the ruler to a digit cell with the EXACT same coordinate path as the caret. false if unavailable.
+	bool  GetLocalXAt(int32 CharIndex, float& OutX) const;
+	// Highlight the digit char at this index (INDEX_NONE = none). Repaints when it changes.
+	void  SetHighlightDigit(int32 InCharIndex);
+
 private:
 	FInvalidatableBrushAttribute BorderImage;
 	TFunction<void(const FString&, ETextCommit::Type)> VKCommitCallback;
 	TFunction<void(const FString&, TArray<FString>&)> VKSuggestionProvider;
 	bool bPreviewDisplayMode = false;
 	bool bPreviewCaretVisible = true;
+	int32 HighlightDigitIndex = INDEX_NONE;  // preview: digit char to highlight (drag-to-edit selection)
 	// Numeric-keypad shaping (see SetNumericParams).
 	bool bNumAllowDecimal = true;
 	bool bNumAllowNegative = true;
 	bool bNumHex = false;
+	int32 NumBitWidth = 0;   // integer bit width 8/16/32/64 (0 = float/unknown); → ShowParams.Numeric.BitWidth
 	TOptional<double> NumMin, NumMax, NumStep;
 	// Input history (see SetHistoryKey/SetHistoryFilter), forwarded into ShowParams on focus.
 	FString HistoryKey;

@@ -31,6 +31,27 @@ int32 SImEditableText::OnPaint(const FPaintArgs& Args, const FGeometry& Allotted
 								   BrushResource->GetTint(InWidgetStyle) * InWidgetStyle.GetColorAndOpacityTint() /* * BorderBackgroundColor.Get().GetColor(InWidgetStyle)*/);
 	}
 
+	// Preview digit-scrub highlight: draw the selected digit's background BELOW the text (on LayerId, so
+	// the glyph stays readable on top). Bounds come from the engine text layout (DPI-safe, same path as
+	// the caret self-draw below).
+	if (bPreviewDisplayMode && HighlightDigitIndex != INDEX_NONE && EditableTextLayout)
+	{
+		float HL = 0.f, HR = 0.f;
+		if (GetDigitCellBounds(HighlightDigitIndex, HL, HR) && HR > HL)
+		{
+			const float LocalSizeY = (float)AllottedGeometry.GetLocalSize().Y;
+			static FSlateBrush HighlightBrush;
+			HighlightBrush.DrawAs = ESlateBrushDrawType::RoundedBox;
+			HighlightBrush.OutlineSettings.RoundingType = ESlateBrushRoundingType::FixedRadius;
+			HighlightBrush.OutlineSettings.CornerRadii = FVector4(3, 3, 3, 3);
+			FSlateDrawElement::MakeBox(
+				OutDrawElements, LayerId,
+				AllottedGeometry.ToPaintGeometry(FVector2D(HR - HL, LocalSizeY),
+					FSlateLayoutTransform(1.f, UE::Slate::CastToVector2f(FVector2D(HL, 0.f)))),
+				&HighlightBrush, ESlateDrawEffect::None, FLinearColor(0.30f, 0.80f, 1.00f, 0.35f));
+		}
+	}
+
 	int32 MaxLayerId = SEditableText::OnPaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
 
 	// Preview display mode: the engine only draws the native caret when focused
@@ -86,6 +107,87 @@ int32 SImEditableText::OnPaint(const FPaintArgs& Args, const FGeometry& Allotted
 void SImEditableText::SetBorderImage(const TAttribute<const FSlateBrush*>& InBrushAttribute)
 {
 	BorderImage.SetImage(*this, InBrushAttribute);
+}
+
+// Local-space X bounds of the char at CharIndex: [GetLocationAt(i), GetLocationAt(i+1)] / Scale.
+// GetLocationAt already includes scale/scroll/justify; dividing by Scale yields widget-local X.
+bool SImEditableText::GetDigitCellBounds(int32 CharIndex, float& OutL, float& OutR) const
+{
+	if (!EditableTextLayout || CharIndex < 0)
+		return false;
+	const TSharedPtr<FSlateTextLayout>& TextLayout = PrivateAccess::TextLayout(*EditableTextLayout);
+	if (!TextLayout.IsValid())
+		return false;
+	const FString Text = GetText().ToString();
+	if (CharIndex >= Text.Len())
+		return false;
+	const float Scale = TextLayout->GetScale();
+	if (Scale <= 0.f)
+		return false;
+	const float LX = (float)TextLayout->GetLocationAt(FTextLocation(0, CharIndex), false).X / Scale;
+	const float RX = (float)TextLayout->GetLocationAt(FTextLocation(0, CharIndex + 1), false).X / Scale;
+	OutL = FMath::Min(LX, RX);
+	OutR = FMath::Max(LX, RX);
+	return true;
+}
+
+// Local X of the caret at an arbitrary index — the EXACT same path the self-drawn caret uses
+// (GetLocationAt / Scale), so overlays align pixel-perfectly to where the caret renders.
+bool SImEditableText::GetLocalXAt(int32 CharIndex, float& OutX) const
+{
+	if (!EditableTextLayout || CharIndex < 0)
+		return false;
+	const TSharedPtr<FSlateTextLayout>& TextLayout = PrivateAccess::TextLayout(*EditableTextLayout);
+	if (!TextLayout.IsValid())
+		return false;
+	const float Scale = TextLayout->GetScale();
+	if (Scale <= 0.f)
+		return false;
+	OutX = (float)TextLayout->GetLocationAt(FTextLocation(0, CharIndex), false).X / Scale;
+	return true;
+}
+
+// Local X of the LIVE caret (blinking caret position) — same source as the caret self-draw.
+bool SImEditableText::GetCaretLocalX(float& OutX) const
+{
+	if (!EditableTextLayout)
+		return false;
+	return GetLocalXAt(EditableTextLayout->GetCursorLocation().GetOffset(), OutX);
+}
+
+// Map an absolute screen position to the nearest DIGIT char index (skips '-' '.' and any non-hex-digit).
+// Returns INDEX_NONE when the text holds no digit.
+int32 SImEditableText::HitTestDigitIndex(const FVector2D& AbsScreenPos) const
+{
+	if (!EditableTextLayout)
+		return INDEX_NONE;
+	const FVector2D Local = GetCachedGeometry().AbsoluteToLocal(AbsScreenPos);
+	const FString Text = GetText().ToString();
+	int32 Best = INDEX_NONE;
+	float BestDist = TNumericLimits<float>::Max();
+	for (int32 i = 0; i < Text.Len(); ++i)
+	{
+		if (!FChar::IsHexDigit(Text[i]))
+			continue;  // skip '-', '.', etc.
+		float L = 0.f, R = 0.f;
+		if (!GetDigitCellBounds(i, L, R))
+			continue;
+		if ((float)Local.X >= L && (float)Local.X <= R)
+			return i;  // direct hit
+		const float Center = (L + R) * 0.5f;
+		const float Dist = FMath::Abs((float)Local.X - Center);
+		if (Dist < BestDist) { BestDist = Dist; Best = i; }
+	}
+	return Best;
+}
+
+void SImEditableText::SetHighlightDigit(int32 InCharIndex)
+{
+	if (HighlightDigitIndex != InCharIndex)
+	{
+		HighlightDigitIndex = InCharIndex;
+		Invalidate(EInvalidateWidgetReason::Paint);  // self-drawn highlight; repaint on change
+	}
 }
 
 FReply SImEditableText::OnKeyChar(const FGeometry& MyGeometry, const FCharacterEvent& InCharacterEvent)
@@ -253,6 +355,7 @@ void SImEditableText::ShowVirtualKeyboardForSelf()
 				Params.Numeric.bAllowDecimal  = bNumAllowDecimal;
 				Params.Numeric.bAllowNegative = bNumAllowNegative;
 				Params.Numeric.bHex           = bNumHex;
+				Params.Numeric.BitWidth       = NumBitWidth;
 				Params.Numeric.Min            = NumMin;
 				Params.Numeric.Max            = NumMax;
 				Params.Numeric.Step           = NumStep;

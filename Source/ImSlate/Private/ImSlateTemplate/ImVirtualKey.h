@@ -118,6 +118,36 @@ private:
 	ESwipeDirection DetectSwipe(const FVector2D& Delta) const;
 };
 
+// A two-state "switch" key, like the system 中/英 key: the CURRENT state is drawn big in the top-left,
+// the state a tap switches TO is drawn small in the bottom-right, with a diagonal slash between them. A
+// plain tap fires OnClicked. Self-drawn leaf — independent of SImSlateKey (no swipe/long-press), used for
+// the keyboard's radix (DEC/HEX) and type (T26/T9) toggles.
+class SImSwitchKey : public SLeafWidget
+{
+public:
+	SLATE_BEGIN_ARGS(SImSwitchKey) {}
+		SLATE_ATTRIBUTE(FText, CurrentLabel)   // current state, big, top-left
+		SLATE_ATTRIBUTE(FText, TargetLabel)    // switch target, small, bottom-right
+		SLATE_EVENT(FSimpleDelegate, OnClicked)
+	SLATE_END_ARGS()
+
+	void Construct(const FArguments& InArgs);
+
+	virtual FVector2D ComputeDesiredSize(float LayoutScaleMultiplier) const override;
+	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override;
+	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	virtual FReply OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
+	virtual FReply OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
+	virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override { bIsPressed = false; }
+
+private:
+	TAttribute<FText> CurrentLabel;
+	TAttribute<FText> TargetLabel;
+	FSimpleDelegate OnClicked;
+	bool bIsPressed = false;
+};
+
 class SImSlateKeyPopup : public SCompoundWidget
 {
 public:
@@ -157,6 +187,14 @@ public:
 
 	void Construct(const FArguments& InArgs);
 	void SetOffset(float InOffset) { Offset = InOffset; Invalidate(EInvalidateWidgetReason::Paint); }
+	float GetOffset() const { return Offset; }
+	// Reconfigure for reuse (pooled): switch axis / step spacing without recreating the widget.
+	void SetAxis(EOrientation InAxis) { Axis = InAxis; Invalidate(EInvalidateWidgetReason::Paint); }
+	void SetStepW(float InStepW) { StepW = FMath::Max(1.f, InStepW); Invalidate(EInvalidateWidgetReason::Paint); }
+	// Tick LENGTH as a fraction of the cross-axis extent (long = step ticks, short = subdivisions). Default
+	// matches the four-way step popups; the preview ruler overrides them (long = full width = 1 char, short
+	// = half).
+	void SetTickFractions(float InLong, float InShort) { LongFrac = InLong; ShortFrac = InShort; Invalidate(EInvalidateWidgetReason::Paint); }
 
 	virtual FVector2D ComputeDesiredSize(float) const override;
 	virtual int32 OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect, FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override;
@@ -165,6 +203,8 @@ private:
 	EOrientation Axis = EOrientation::Orient_Vertical;
 	float StepW = 12.f;     // tick spacing in local px
 	float Offset = 0.f;     // current drag offset along the axis (wrapped by StepW at paint time)
+	float LongFrac = 0.31f; // long-tick length as fraction of cross-axis extent (default = four-way popups)
+	float ShortFrac = 0.15f;// short-tick length fraction
 };
 
 // Draggable cursor slider — hold and drag left/right to move text cursor

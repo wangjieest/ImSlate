@@ -11,6 +11,7 @@
 #include "Engine/GameViewportClient.h"
 #include "UnrealClient.h"
 #include "Framework/Application/SlateApplication.h"
+#include "GenericPlatform/GenericWindow.h"  // FGenericWindow::IsForegroundWindow ([HPDbg] lock gate, SlateUser.cpp:982)
 #include "HAL/PlatformApplicationMisc.h"  // FPlatformApplicationMisc::ClipboardPaste
 #include "Framework/Text/TextLayout.h"
 #include "Widgets/Input/SEditableText.h"
@@ -70,18 +71,44 @@ static FAutoConsoleVariableRef CVar_KeyboardMaxHeightFraction(
 // ImSlateFactory.h as GetImSlateKeyboardScale; GetKbScale is the file-local short alias.
 static float GetKbScale()
 {
-	float Scale = GetImSlateEffectiveScale() * FMath::Max(GImSlateKeyboardScale, 0.1f);
+	const float BaseScale = GetImSlateEffectiveScale() * FMath::Max(GImSlateKeyboardScale, 0.1f);
+	float Scale = BaseScale;
 
 	// Cap the keyboard to a fraction of the viewport height by clamping the scale. We need both the
 	// viewport height and the keyboard's natural per-unit-scale height; both are measured at runtime
 	// (see Tick). Until measured, no cap is applied.
+	float MaxScaleDbg = -1.f;  // [KbSizeDbg]
 	if (GKeyboardMaxHeightFraction > 0.f && GCachedViewportHeight > 0.f && GCachedKeyboardUnitHeight > 0.f)
 	{
 		const float MaxH = GCachedViewportHeight * GKeyboardMaxHeightFraction;
 		const float MaxScale = MaxH / GCachedKeyboardUnitHeight;
+		MaxScaleDbg = MaxScale;  // [KbSizeDbg]
 		Scale = FMath::Min(Scale, MaxScale);
 	}
-	return FMath::Max(Scale, 0.1f);
+	Scale = FMath::Max(Scale, 0.1f);
+
+	// [KbSizeDbg] TEMP — diagnose PIE vs non-PIE keyboard size mismatch. The final scale is clamped
+	// by the viewport height (Plan A). Log only when an input changes (GetKbScale runs every frame).
+	// EffScale = GetImSlateEffectiveScale() (= DPIScaleAtPoint × LayoutScale on desktop); ViewportH =
+	// cached AllottedGeometry.Y; UnitH = content height at scale 1; MaxScale = ViewportH×Frac/UnitH;
+	// Capped = whether the height-cap won over BaseScale. If PIE shows a smaller ViewportH → smaller
+	// MaxScale → smaller final Scale, the size difference is the cap, not the DPI.
+	{
+		static float LastEff = -1.f, LastVpH = -1.f, LastUnitH = -1.f, LastFinal = -1.f;
+		const float EffScale = GetImSlateEffectiveScale();
+		if (!FMath::IsNearlyEqual(EffScale, LastEff, 0.001f) ||
+			!FMath::IsNearlyEqual(GCachedViewportHeight, LastVpH, 0.1f) ||
+			!FMath::IsNearlyEqual(GCachedKeyboardUnitHeight, LastUnitH, 0.1f) ||
+			!FMath::IsNearlyEqual(Scale, LastFinal, 0.001f))
+		{
+			LastEff = EffScale; LastVpH = GCachedViewportHeight; LastUnitH = GCachedKeyboardUnitHeight; LastFinal = Scale;
+			UE_LOG(LogTemp, Warning, TEXT("[KbSizeDbg] GIsEditor=%d EffScale=%.3f KbMult=%.2f BaseScale=%.3f ViewportH=%.1f UnitH=%.1f Frac=%.2f MaxScale=%.3f Capped=%d FinalScale=%.3f"),
+				GIsEditor ? 1 : 0, EffScale, GImSlateKeyboardScale, BaseScale,
+				GCachedViewportHeight, GCachedKeyboardUnitHeight, GKeyboardMaxHeightFraction,
+				MaxScaleDbg, (MaxScaleDbg >= 0.f && MaxScaleDbg < BaseScale) ? 1 : 0, Scale);
+		}
+	}
+	return Scale;
 }
 
 // Exported alias (declared in ImSlateFactory.h) so the key widgets in ImVirtualKey.cpp can use the
@@ -282,9 +309,11 @@ FVirtualKeyDef SImSlateVirtualKeyboard::MakeBackspaceKey(float Width)
 			ClearNumericValue();
 			return;
 		}
-		BackspaceUndoBuffer = CurrentText.Left(CursorPosition);
+		// Clr removes the whole run left of the caret — record it as ONE undo entry (the run, at index 0).
+		PushBackspaceUndo(CurrentText.Left(CursorPosition), 0);
 		CurrentText.RemoveAt(0, CursorPosition);
 		CursorPosition = 0;
+		ClearDigitHighlight();
 		UpdatePreview(); UpdateSuggestions();
 	});
 	Def.Swipe.Down.Label = TEXT("Hide");
@@ -298,16 +327,11 @@ FVirtualKeyDef SImSlateVirtualKeyboard::MakeBackspaceKey(float Width)
 	{
 		if (D == EImSwipeDir::Left)
 		{
-			if (CursorPosition > 0) { BackspaceUndoBuffer += CurrentText[CursorPosition - 1]; DeleteBackward(); UpdatePreview(); UpdateSuggestions(); }
+			if (DeleteBackwardWithUndo()) { UpdatePreview(); UpdateSuggestions(); }
 		}
 		else if (D == EImSwipeDir::Right)
 		{
-			if (BackspaceUndoBuffer.Len() > 0)
-			{
-				FString Ch = BackspaceUndoBuffer.Right(1);
-				BackspaceUndoBuffer.RemoveAt(BackspaceUndoBuffer.Len() - 1);
-				InsertText(Ch); UpdatePreview(); UpdateSuggestions();
-			}
+			if (BackspaceUndoStack.Num() > 0) { UndoBackspaceFromStack(); UpdatePreview(); UpdateSuggestions(); }
 		}
 	};
 	return Def;
@@ -504,143 +528,147 @@ TArray<FVirtualKeyDef> SImSlateVirtualKeyboard::GetT9BottomRow()
 
 TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetNumberLayout()
 {
-	// Type-aware numeric keypad. Reuses the SAME input pipeline as the other layouts (Char keys feed
-	// OnKeyInput; Backspace/cursor/step are actions) — only the layout differs, shaped by NumericParams:
-	//   bAllowDecimal=false → hide '.'   bAllowNegative=false → hide '-'   bHex=true → add A-F
-	//   Step set → add +/- step keys (SpinBox-like).
-	// Layout: 3-digit grid (7-9 / 4-6 / 1-3) + right function column; bottom row [. 0 -]/space; optional
-	// hex row (A-F) and optional step row.
+	// Type-aware numeric keypad / calculator, a uniform 4×4 grid whose RIGHT column + bottom-row tail are
+	// swapped by radix: DEC shows the calculator operators (+ − * . / =), HEX shows the hex letters
+	// (A B C D E F). Same skeleton, two faces:
+	//   DEC:                 HEX:
+	//     1 2 3 +              1 2 3 A
+	//     4 5 6 −              4 5 6 B
+	//     7 8 9 *              7 8 9 C
+	//     0 . / =              0 D E F
+	// Digit keys feed OnKeyInput→InsertText (hex letters too). Operator chars (+ − * /) also go through the
+	// Char pipeline but OnKeyInput routes them to the calculator (CalcPressOperator) on the DEC pad. '=' is
+	// an action (Equals). There is NO backspace / Clr / cursor key — value editing is via the preview drag.
 	TArray<TArray<FVirtualKeyDef>> Rows;
 
-	// Digit key; grayed out + non-interactive when the digit isn't valid in the current base
-	// (e.g. 8 and 9 while in OCT). Letters A-F (hex) are only built in the HEX branch, so 0-9 here.
-	auto Digit = [this](const TCHAR* D) {
-		FVirtualKeyDef Key = MakeCharKey(D, D);
-		const TCHAR C = D[0];
-		if (C >= '0' && C <= '9' && (C - '0') >= NumericRadix)
-			Key.bDisabled = true;
+	// Digit key (0-9). In HEX every digit is valid; in DEC every digit is valid too (base 10). (8/9 are
+	// never disabled now that OCT is gone.)
+	auto Digit = [this](const TCHAR* D) { return MakeCharKey(D, D); };
+	// Hex letter key (A-F): plain Char input.
+	auto HexLetter = [this](const TCHAR* L) { return MakeCharKey(L, L); };
+	// Operator key (+ − * /): Char pipeline with Value = the ASCII operator; OnKeyInput detects an operator
+	// char on the DEC pad and routes it to CalcPressOperator instead of inserting text. Display label may
+	// be a prettier glyph (− U+2212, × , ÷) while the value stays ASCII for simple comparison.
+	auto OpKey = [this](const TCHAR* Label, const TCHAR* Value) {
+		FVirtualKeyDef Key = MakeCharKey(Value, Value);
+		Key.Label = Label;
+		Key.ShiftLabel = Label;
 		return Key;
 	};
-	auto MakeCursorKey = [this]() {
-		// Center shows a single 4-way glyph. ◀▶ move the caret; ▲(=+) / ▼(=−) bump the digit at the
-		// caret by ±1 with carry, clamped. Swipe hint labels: left/right arrows, up '+', down '−'.
-		auto CursorKey = MakeActionKey(EVirtualKeyAction::Left, TEXT("\x2725"), 1.f);  // ✥ four-way
-		// All four directions are CONTINUOUS (step-drag): ◀▶ move the caret, ▲(+)/▼(−) bump the digit
-		// at the caret with carry+clamp — each fires once per StepW of travel via the shared OnStep.
-		CursorKey.Swipe.Left.Label  = TEXT("\x25C0"); CursorKey.Swipe.Left.bStep  = true;
-		CursorKey.Swipe.Right.Label = TEXT("\x25B6"); CursorKey.Swipe.Right.bStep = true;
-		CursorKey.Swipe.Up.Label    = TEXT("+");      CursorKey.Swipe.Up.bStep    = true;
-		CursorKey.Swipe.Down.Label  = TEXT("\x2212"); CursorKey.Swipe.Down.bStep  = true;  // −
-		CursorKey.Swipe.OnStep = [this](EImSwipeDir D) {
-			switch (D)
-			{
-			case EImSwipeDir::Left:  MoveCursor(-1); UpdatePreview(); break;
-			case EImSwipeDir::Right: MoveCursor(+1); UpdatePreview(); break;
-			case EImSwipeDir::Up:    AdjustDigitAtCursor(+1); break;
-			case EImSwipeDir::Down:  AdjustDigitAtCursor(-1); break;
-			default: break;
-			}
-		};
-		return CursorKey;
-	};
+	auto DotKey = [this]() { return MakeCharKey(TEXT("."), TEXT(".")); };
+	auto EqualsKey = [this]() { return MakeActionKey(EVirtualKeyAction::Equals, TEXT("=")); };
 
-	const bool bInteger = !NumericParams.bAllowDecimal;
-	// NOTE: the radix switcher (DEC/HEX/OCT) is NOT built into the grid anymore — it's the preview-row
-	// ToggleType key (fixed position, see UpdateToggleTypeLabel/Visibility), so changing base never
-	// reshuffles the keypad.
+	const bool bHex = (NumericRadix == 16);
 
-	if (NumericRadix == 16)
-	{
-		// HEX: keep the 3×3 digit block in its usual positions; append A-F as two columns to the right,
-		// then the function column (⌫ / ✥ / ✥). No sign / spin / dot in hex. The radix switcher is NOT
-		// in the grid — it lives on the preview row (fixed position) so toggling base never shifts keys.
-		//   7 8 9  A B  [⌫]
-		//   4 5 6  C D  [✥]
-		//   1 2 3  E F  [✥]
-		//        0
-		{
-			TArray<FVirtualKeyDef> Row;
-			Row.Add(Digit(TEXT("7"))); Row.Add(Digit(TEXT("8"))); Row.Add(Digit(TEXT("9")));
-			Row.Add(MakeCharKey(TEXT("A"), TEXT("A"))); Row.Add(MakeCharKey(TEXT("B"), TEXT("B")));
-			Row.Add(MakeBackspaceKey(1.f));
-			Rows.Add(MoveTemp(Row));
-		}
-		{
-			TArray<FVirtualKeyDef> Row;
-			Row.Add(Digit(TEXT("4"))); Row.Add(Digit(TEXT("5"))); Row.Add(Digit(TEXT("6")));
-			Row.Add(MakeCharKey(TEXT("C"), TEXT("C"))); Row.Add(MakeCharKey(TEXT("D"), TEXT("D")));
-			Row.Add(MakeCursorKey());
-			Rows.Add(MoveTemp(Row));
-		}
-		{
-			TArray<FVirtualKeyDef> Row;
-			Row.Add(Digit(TEXT("1"))); Row.Add(Digit(TEXT("2"))); Row.Add(Digit(TEXT("3")));
-			Row.Add(MakeCharKey(TEXT("E"), TEXT("E"))); Row.Add(MakeCharKey(TEXT("F"), TEXT("F")));
-			Row.Add(MakeCursorKey());
-			Rows.Add(MoveTemp(Row));
-		}
-		{
-			// Bottom row: 0 spans the whole width (single key → fills the row). Keeps the keypad at the
-			// SAME 4-row height as DEC (only the width grows for the A-F columns), so toggling base
-			// never changes height.
-			TArray<FVirtualKeyDef> Row;
-			Row.Add(Digit(TEXT("0")));
-			Rows.Add(MoveTemp(Row));
-		}
-		return Rows;
-	}
-
-	// DEC / OCT (and float): 3×3 grid + a single function column. Value stepping is done by the cursor
-	// key's 4-way (▲=+ / ▼=− on the digit at the caret, with carry) — no separate spin keys.
-	// Row 1: 7 8 9 [⌫]
-	{
-		TArray<FVirtualKeyDef> Row;
-		Row.Add(Digit(TEXT("7"))); Row.Add(Digit(TEXT("8"))); Row.Add(Digit(TEXT("9")));
-		Row.Add(MakeBackspaceKey(1.f));
-		Rows.Add(MoveTemp(Row));
-	}
-	// Row 2: 4 5 6 [✥ cursor]   (4-way: ◀▶ move caret, ▲+/▼− bump digit with carry)
-	{
-		TArray<FVirtualKeyDef> Row;
-		Row.Add(Digit(TEXT("4"))); Row.Add(Digit(TEXT("5"))); Row.Add(Digit(TEXT("6")));
-		Row.Add(MakeCursorKey());
-		Rows.Add(MoveTemp(Row));
-	}
-	// Row 3: 1 2 3 [− sign]   (typed minus when negatives allowed; else a second cursor key)
+	// Row 1: 1 2 3 | (+ / A)
 	{
 		TArray<FVirtualKeyDef> Row;
 		Row.Add(Digit(TEXT("1"))); Row.Add(Digit(TEXT("2"))); Row.Add(Digit(TEXT("3")));
-		if (NumericParams.bAllowNegative)
-		{
-			// The minus key. Gray it out (disabled, non-interactive) when the clamp range can't hold a
-			// negative value (Min is set and >= 0) — the type allows a sign but the range forbids it.
-			FVirtualKeyDef Minus = MakeCharKey(TEXT("-"), TEXT("-"));
-			const bool bRangeForbidsNegative = NumericParams.Min.IsSet() && NumericParams.Min.GetValue() >= 0.0;
-			if (bRangeForbidsNegative)
-				Minus.bDisabled = true;
-			Row.Add(MoveTemp(Minus));
-		}
-		else
-		{
-			Row.Add(MakeCursorKey());  // unsigned type: no sign key, give a cursor key instead
-		}
+		Row.Add(bHex ? HexLetter(TEXT("A")) : OpKey(TEXT("+"), TEXT("+")));
 		Rows.Add(MoveTemp(Row));
 	}
-	// Row 4: [. or ✥] 0 [✥ cursor]. Floats get the decimal point here; integers get a second cursor
-	// key (the radix switcher is NOT in the grid — it's pinned on the preview row's left, so switching
-	// DEC/OCT/HEX never shifts any key).
+	// Row 2: 4 5 6 | (− / B)
 	{
 		TArray<FVirtualKeyDef> Row;
-		if (bInteger)
-			Row.Add(MakeCursorKey());                    // integers: a cursor key (no dot, no radix here)
-		else
-			Row.Add(MakeCharKey(TEXT("."), TEXT(".")));  // decimal point (floats)
+		Row.Add(Digit(TEXT("4"))); Row.Add(Digit(TEXT("5"))); Row.Add(Digit(TEXT("6")));
+		Row.Add(bHex ? HexLetter(TEXT("B")) : OpKey(TEXT("\x2212"), TEXT("-")));
+		Rows.Add(MoveTemp(Row));
+	}
+	// Row 3: 7 8 9 | (* / C)
+	{
+		TArray<FVirtualKeyDef> Row;
+		Row.Add(Digit(TEXT("7"))); Row.Add(Digit(TEXT("8"))); Row.Add(Digit(TEXT("9")));
+		Row.Add(bHex ? HexLetter(TEXT("C")) : OpKey(TEXT("\xD7"), TEXT("*")));
+		Rows.Add(MoveTemp(Row));
+	}
+	// Row 4 DEC: 0 . / =     |  Row 4 HEX: 0 D E F
+	{
+		TArray<FVirtualKeyDef> Row;
 		Row.Add(Digit(TEXT("0")));
-		Row.Add(MakeCursorKey());                        // a second cursor key (move + per-digit ±)
+		if (bHex)
+		{
+			Row.Add(HexLetter(TEXT("D"))); Row.Add(HexLetter(TEXT("E"))); Row.Add(HexLetter(TEXT("F")));
+		}
+		else
+		{
+			// DEC bottom row tail: [. or ±] / =.
+			//  - float fields: '.' (decimal point)
+			//  - integer fields: a sign (±) key IF the range can actually hold a negative; otherwise a blank
+			//    spacer. The sign key's label shows the sign a tap switches TO (value<0 → '+', else '−').
+			if (NumericParams.bAllowDecimal)
+			{
+				Row.Add(DotKey());
+			}
+			else
+			{
+				const bool bRangeForbidsNeg = NumericParams.Min.IsSet() && NumericParams.Min.GetValue() >= 0.0;
+				if (NumericParams.bAllowNegative && !bRangeForbidsNeg)
+				{
+					// Sign toggle (clamped). A fixed "±" glyph (+ over −) — the action flips the value's sign.
+					// Hidden entirely when flipping is impossible (range can't go negative → blank spacer below).
+					Row.Add(MakeActionKey(EVirtualKeyAction::SignToggle, TEXT("\xB1")));
+				}
+				else
+				{
+					FVirtualKeyDef Spacer; Spacer.Label = TEXT(""); Spacer.bDisabled = true;  // no sign possible
+					Row.Add(MoveTemp(Spacer));
+				}
+			}
+			Row.Add(OpKey(TEXT("\xF7"), TEXT("/")));   // ÷
+			Row.Add(EqualsKey());
+		}
 		Rows.Add(MoveTemp(Row));
 	}
 
 	return Rows;
+}
+
+// ==================== Numeric helpers (file-local) ====================
+
+// Unsigned mask for a given bit width. 0 or >=64 → all-ones (avoids the 1<<64 UB).
+static uint64 NumericWidthMask(int32 BitWidth)
+{
+	return (BitWidth <= 0 || BitWidth >= 64) ? ~0ull : ((1ull << BitWidth) - 1);
+}
+
+// Number of decimal digits in a positive integer (1000→4, 9→1, 0→1).
+static int32 NumDecimalDigits(int64 V)
+{
+	if (V == 0) return 1;
+	int32 d = 0; while (V) { V /= 10; ++d; }
+	return d;
+}
+
+// DEC "highest digit" scrub-down: decrement the LEADING digit.
+//  - leading digit > 1: subtract its place value (5000001→4000001→…→1000001; 900→800; 55→45).
+//  - leading digit == 1: dropping it to 0 erases the column. Two cases by the SECOND digit:
+//      · second digit == 0 (would expose a leading zero) → DEMOTE: leading 1 becomes a new leading 9 one
+//        column down, i.e. subtract LP/10 (1000001→900001, 1000→900, 10→9; single digit 1→0).
+//      · second digit != 0 → just zero the leading column, the second digit becomes the new lead, i.e.
+//        subtract LP (1500001→500001, 1234→234). The new lead then keeps using this same logic.
+// Only for the most-significant digit (Val>0).
+static int64 TopDigitStepDown(int64 Val /*>0*/)
+{
+	const int32 d = NumDecimalDigits(Val);
+	int64 LP = 1; for (int32 i = 1; i < d; ++i) LP *= 10;  // place value of the leading digit
+	const int64 lead = Val / LP;                            // 1..9
+	if (lead > 1)
+		return Val - LP;                                    // leading digit −1
+	if (LP == 1)
+		return Val - 1;                                     // single digit "1" → 0
+	const int64 secondDigit = (Val / (LP / 10)) % 10;       // the next column's digit
+	return (secondDigit == 0) ? (Val - LP / 10)             // 1000001→900001 (demote: 1→9 one column down)
+	                          : (Val - LP);                 // 1500001→500001 (zero the lead, 2nd digit leads)
+}
+
+// DEC "highest digit" scrub-up: inverse on the pure-power chain (always +leading place value).
+// 0→1, 9→10, 800→900, 900→1000.
+static int64 TopDigitStepUp(int64 Val /*>=0*/)
+{
+	if (Val == 0) return 1;
+	const int32 d = NumDecimalDigits(Val);
+	int64 LP = 1; for (int32 i = 1; i < d; ++i) LP *= 10;
+	return Val + LP;
 }
 
 void SImSlateVirtualKeyboard::ApplyNumericStep(int32 Direction)
@@ -657,14 +685,24 @@ void SImSlateVirtualKeyboard::ApplyNumericStep(int32 Direction)
 		if (NumericParams.Max.IsSet()) Val = FMath::Min(Val, NumericParams.Max.GetValue());
 		CurrentText = FString::SanitizeFloat(Val);
 	}
+	else if (NumericRadix == 16)
+	{
+		// HEX: two's-complement ring at BitWidth — step on the unsigned view, wrap with the mask, no clamp
+		// (consistent with the per-digit HEX scrub in AdjustDigitAtCursor).
+		const uint64 Mask = NumericWidthMask(NumericParams.BitWidth);
+		uint64 U = FCString::Strtoui64(*CurrentText, nullptr, 16) & Mask;
+		U = (Direction > 0) ? (U + (uint64)StepAmt) : (U - (uint64)StepAmt);
+		U &= Mask;
+		CurrentText = FormatIntInRadix((int64)U, 16, NumericParams.BitWidth);
+	}
 	else
 	{
-		// Integer (any radix): parse in the current base, step, clamp, re-format in the same base.
-		int64 IVal = FCString::Strtoi64(*CurrentText, nullptr, NumericRadix);
+		// DEC integer: parse, step, clamp, re-format.
+		int64 IVal = FCString::Strtoi64(*CurrentText, nullptr, 10);
 		IVal += (int64)(Direction * StepAmt);
 		if (NumericParams.Min.IsSet()) IVal = FMath::Max(IVal, (int64)NumericParams.Min.GetValue());
 		if (NumericParams.Max.IsSet()) IVal = FMath::Min(IVal, (int64)NumericParams.Max.GetValue());
-		CurrentText = FormatIntInRadix(IVal, NumericRadix);
+		CurrentText = FormatIntInRadix(IVal, 10, NumericParams.BitWidth);
 	}
 	CursorPosition = CurrentText.Len();
 	UpdatePreview();
@@ -690,49 +728,255 @@ void SImSlateVirtualKeyboard::ClearNumericValue()
 	if (NumericParams.bAllowDecimal && NumericRadix == 10)
 		CurrentText = FString::SanitizeFloat(Target);
 	else
-		CurrentText = FormatIntInRadix((int64)Target, NumericRadix);
+		CurrentText = FormatIntInRadix((int64)Target, NumericRadix, NumericParams.BitWidth);
 
 	CursorPosition = CurrentText.Len();
+	CalcReset();  // clearing the value also clears any in-progress calculator expression / memory
+	ClearDigitHighlight();  // value reset → drop preview digit selection
 	UpdatePreview();
 	UpdateSuggestions();
 	if (OnTextChanged)
 		OnTextChanged(CurrentText);
 }
 
-// Format an integer in the given base (10/16/8). Hex uppercase, no 0x prefix (the radix toggle
-// label shows the base). Negative → leading '-'.
-FString SImSlateVirtualKeyboard::FormatIntInRadix(int64 Value, int32 Radix)
+// Format an integer in the given base. DEC: signed decimal (keeps '-'). HEX: two's-complement unsigned
+// view at BitWidth — negatives wrap (e.g. 8-bit -1 → FF, 32-bit -1 → FFFFFFFF), zero-padded to BitWidth/4
+// nibbles, NEVER a '-' sign. BitWidth 0 → 64-bit mask, no padding.
+FString SImSlateVirtualKeyboard::FormatIntInRadix(int64 Value, int32 Radix, int32 BitWidth)
 {
 	if (Radix == 10)
 		return FString::Printf(TEXT("%lld"), Value);
-	const bool bNeg = Value < 0;
-	uint64 U = bNeg ? (uint64)(-Value) : (uint64)Value;
-	if (U == 0)
-		return TEXT("0");
+
+	// HEX (and any non-decimal): two's-complement unsigned view.
+	const uint64 Mask = NumericWidthMask(BitWidth);
+	uint64 U = (uint64)Value & Mask;
 	const TCHAR* Digits = TEXT("0123456789ABCDEF");
 	FString Out;
-	while (U > 0)
+	do
 	{
-		Out = FString::Chr(Digits[U % Radix]) + Out;
-		U /= Radix;
+		Out = FString::Chr(Digits[U & 0xF]) + Out;
+		U >>= 4;
+	} while (U > 0);
+	// Zero-pad to the type's nibble count so a negative shows its full-width complement (FF / FFFFFFFF).
+	if (BitWidth > 0)
+	{
+		const int32 Nibbles = BitWidth / 4;
+		while (Out.Len() < Nibbles)
+			Out = TEXT("0") + Out;
 	}
-	return bNeg ? (TEXT("-") + Out) : Out;
+	return Out;  // HEX never carries a sign
 }
 
 void SImSlateVirtualKeyboard::CycleNumericRadix()
 {
-	// Only integers switch base. Cycle DEC(10) → HEX(16) → BIN(2) → DEC, converting the current value
-	// so the displayed digits change base but the number stays the same.
+	// Only integers switch base. Toggle DEC(10) ↔ HEX(16). HEX is a two's-complement unsigned ring view;
+	// it conflicts with Min/Max clamping, so a clamped field stays DEC-only (the radix key is hidden too —
+	// see UpdateToggleTypeKeyVisibility). Guard here in case the key is somehow triggered.
 	if (NumericParams.bAllowDecimal)
 		return;  // floats have no base switch
-	const int64 Val = FCString::Strtoi64(*CurrentText, nullptr, NumericRadix);  // parse in old base
-	// Cycle DEC(10) → HEX(16) → OCT(8) → DEC.
-	NumericRadix = (NumericRadix == 10) ? 16 : (NumericRadix == 16 ? 8 : 10);
-	CurrentText = FormatIntInRadix(Val, NumericRadix);                          // re-emit in new base
+	if (NumericParams.Min.IsSet() || NumericParams.Max.IsSet())
+		return;  // clamped → no HEX (two's-complement ring would ignore the clamp)
+
+	const int32 BitWidth = NumericParams.BitWidth;
+	if (NumericRadix == 10)
+	{
+		// DEC → HEX: show the two's-complement at BitWidth (negative → FF.. via FormatIntInRadix).
+		int64 Val = FCString::Strtoi64(*CurrentText, nullptr, 10);
+		NumericRadix = 16;
+		CurrentText = FormatIntInRadix(Val, 16, BitWidth);
+	}
+	else
+	{
+		// HEX → DEC: read the unsigned width view, then sign-extend back to a signed value when the type is
+		// signed and the top bit is set (so FFFFFFFF → -1). Unsigned types keep the magnitude.
+		const uint64 Mask = NumericWidthMask(BitWidth);
+		uint64 U = FCString::Strtoui64(*CurrentText, nullptr, 16) & Mask;
+		int64 Val;
+		if (NumericParams.bAllowNegative && BitWidth > 0 && BitWidth < 64 && (U & (1ull << (BitWidth - 1))))
+			Val = (int64)(U | ~Mask);   // sign-extend negative
+		else
+			Val = (int64)U;
+		NumericRadix = 10;
+		CurrentText = FormatIntInRadix(Val, 10, BitWidth);
+	}
 	CursorPosition = CurrentText.Len();
-	UpdateToggleTypeLabel();  // refresh the DEC/HEX/BIN label
-	BuildKeyboard();          // hex row appears/disappears
+	UpdateToggleTypeLabel();  // refresh the DEC/HEX label
+	CalcReset();              // operators are meaningless in HEX; entering/leaving DEC clears calc memory
+	ClearDigitHighlight();    // base change re-maps digit positions → drop preview selection
+	BuildKeyboard();          // operator column ↔ hex letters
+	UpdateSignKey();          // ± visibility depends on radix (hidden in HEX)
 	UpdatePreview();
+}
+
+// ==================== Numeric Calculator ====================
+
+// Calculator is DEC-only. HEX entry has no operators (the layout shows hex letters instead of +−*/=), so
+// even if an operator somehow arrives it's a no-op there.
+bool SImSlateVirtualKeyboard::IsCalcEnabled() const
+{
+	return KeyboardType == EKeyboardType::Number && NumericRadix == 10;
+}
+
+// Clear ALL calculator memory: the displayed expression, the pending operation, and the repeat (=) state.
+void SImSlateVirtualKeyboard::CalcReset()
+{
+	CalcExpr.Reset();
+	CalcCursorPos = 0;
+	PendingOperator.Reset();
+	StoredOperand = 0.0;
+	bCalcFreshOperand = true;
+	RepeatOperator.Reset();
+	RepeatOperand = 0.0;
+	bJustEvaluated = false;
+}
+
+// Format a value per the bound field's type (int → no decimals, float → SanitizeFloat). Calculator is
+// DEC-only so no radix formatting is needed here.
+FString SImSlateVirtualKeyboard::CalcFormatNumber(double Value) const
+{
+	if (NumericParams.bAllowDecimal)
+		return FString::SanitizeFloat(Value);
+	return FString::Printf(TEXT("%lld"), (int64)Value);
+}
+
+// Compute "A op B" honouring the field's type. Integer fields round to nearest (per design: 7/2 → 4);
+// float fields keep full precision. Division by zero sets bOutDivZero and returns A unchanged.
+double SImSlateVirtualKeyboard::CalcCompute(double A, double B, const FString& Op, bool& bOutDivZero) const
+{
+	bOutDivZero = false;
+	double R = A;
+	if (Op == TEXT("+"))      R = A + B;
+	else if (Op == TEXT("-")) R = A - B;
+	else if (Op == TEXT("*")) R = A * B;
+	else if (Op == TEXT("/"))
+	{
+		if (B == 0.0) { bOutDivZero = true; return A; }
+		R = A / B;
+	}
+	// Integer field: round to nearest (design choice — 7/2 → 4, 5/2 → 3).
+	if (!NumericParams.bAllowDecimal)
+		R = FMath::RoundToDouble(R);
+	return R;
+}
+
+// Clamp Value to [Min,Max], format per type, write to CurrentText, sync the bound field, and leave
+// calculator "result" display state: the expression string is cleared (preview now shows the number).
+void SImSlateVirtualKeyboard::CalcWriteResult(double Value)
+{
+	if (NumericParams.Min.IsSet()) Value = FMath::Max(Value, NumericParams.Min.GetValue());
+	if (NumericParams.Max.IsSet()) Value = FMath::Min(Value, NumericParams.Max.GetValue());
+	CurrentText = CalcFormatNumber(Value);
+	CursorPosition = CurrentText.Len();
+	CalcExpr.Reset();              // result shown as a plain number, not an expression
+	CalcCursorPos = 0;
+	UpdatePreview();               // syncs CurrentText to the bound field (CalcExpr empty → numeric mode)
+	UpdateSuggestions();
+	UpdateSignKey();
+}
+
+// Operator key (+ − * /). Captures the current operand, chains any already-pending op, records the
+// operator, and begins/extends the displayed expression string. The bound field is NOT touched (it keeps
+// the last confirmed value until '=').
+void SImSlateVirtualKeyboard::CalcPressOperator(const FString& Op)
+{
+	if (!IsCalcEnabled())
+		return;
+
+	const double Current = FCString::Atod(*CurrentText);
+
+	if (!PendingOperator.IsEmpty() && !bCalcFreshOperand)
+	{
+		// Chained: a previous op is pending AND a second operand was typed → fold it first (5+3* → 8*).
+		bool bDivZero = false;
+		const double Folded = CalcCompute(StoredOperand, Current, PendingOperator, bDivZero);
+		if (bDivZero)
+		{
+			// Division by zero: abort the chain, keep the stored operand as the running value.
+			CurrentText = CalcFormatNumber(StoredOperand);
+			CursorPosition = CurrentText.Len();
+		}
+		else
+		{
+			StoredOperand = Folded;
+		}
+	}
+	else
+	{
+		// First operator (or operator replacing operator with no new operand typed): stored = current.
+		StoredOperand = Current;
+	}
+
+	PendingOperator = Op;
+	bCalcFreshOperand = true;      // next digit starts the second operand fresh
+	bJustEvaluated = false;
+	// Build the expression string for display: "<storedOperand><op>".
+	CalcExpr = CalcFormatNumber(StoredOperand) + Op;
+	CalcCursorPos = CalcExpr.Len();  // caret at the end of the freshly-built expression
+	UpdatePreview();               // preview shows the expression; CurrentText (field) unchanged
+	UpdateSignKey();               // hide ± while an expression is being built
+}
+
+// '=' key. Folds the pending operation; with no pending op but a prior evaluation, repeats the last op.
+void SImSlateVirtualKeyboard::CalcPressEquals()
+{
+	if (!IsCalcEnabled())
+		return;
+
+	if (!PendingOperator.IsEmpty())
+	{
+		// Second operand = the typed one, or the stored operand itself if none was typed (5 + = → 10).
+		const double Second = bCalcFreshOperand ? StoredOperand : FCString::Atod(*CurrentText);
+		bool bDivZero = false;
+		const double Result = CalcCompute(StoredOperand, Second, PendingOperator, bDivZero);
+		if (bDivZero)
+		{
+			// Division by zero: leave the stored operand as the value, drop the pending op, no repeat set.
+			RepeatOperator.Reset();
+			PendingOperator.Reset();
+			CalcWriteResult(StoredOperand);
+			bJustEvaluated = false;
+			return;
+		}
+		RepeatOperator = PendingOperator;   // remember for repeated '='
+		RepeatOperand = Second;
+		PendingOperator.Reset();
+		StoredOperand = Result;             // result becomes the operand for a chained repeat
+		CalcWriteResult(Result);
+		bJustEvaluated = true;
+		bCalcFreshOperand = true;
+	}
+	else if (bJustEvaluated && !RepeatOperator.IsEmpty())
+	{
+		// Repeated '=' : apply the remembered op + operand again (8 =11 =14).
+		const double Base = FCString::Atod(*CurrentText);
+		bool bDivZero = false;
+		const double Result = CalcCompute(Base, RepeatOperand, RepeatOperator, bDivZero);
+		if (bDivZero)
+			return;  // can't happen (operand fixed) but guard anyway
+		StoredOperand = Result;
+		CalcWriteResult(Result);
+		bJustEvaluated = true;
+		bCalcFreshOperand = true;
+	}
+	// else: no pending op, never evaluated → '=' is a no-op.
+}
+
+// Refresh the preview-row ± key: visible only for signed numeric DEC input whose range allows a negative;
+// label tracks the current value's sign (value≥0 → "−" to go negative; value<0 → "+" to go positive).
+void SImSlateVirtualKeyboard::UpdateSignKey()
+{
+	if (!SignKey.IsValid())
+		return;
+	const bool bRangeForbidsNeg = NumericParams.Min.IsSet() && NumericParams.Min.GetValue() >= 0.0;
+	const bool bShow = (KeyboardType == EKeyboardType::Number)
+		&& (NumericRadix == 10)            // sign only meaningful in DEC
+		&& NumericParams.bAllowNegative
+		&& !bRangeForbidsNeg
+		&& CalcExpr.IsEmpty();             // hidden while an expression is being built
+	SignKey->SetVisibility(bShow ? EVisibility::Visible : EVisibility::Collapsed);
+	// Labels are TAttribute lambdas (read the value's sign) — just repaint so they refresh after a change.
+	if (bShow)
+		SignKey->Invalidate(EInvalidateWidgetReason::Paint);
 }
 
 TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetSymbolLayout()
@@ -783,11 +1027,44 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 
 	float Scale = GetKbScale();
 
-	// Preview-row keys: persistent KeyDefs (not rebuilt by BuildKeyboard).
-	ToggleTypeKeyDef = MakeShared<FVirtualKeyDef>();
-	ToggleTypeKeyDef->Action = EVirtualKeyAction::ToggleType;
-	ToggleTypeKeyDef->Label = TEXT("T9");
-	ToggleTypeKey = MakeBoundKey(ToggleTypeKeyDef.Get());
+	// Preview-row toggle key: a two-state switch key (radix DEC/HEX or type T26/T9). Its labels are pulled
+	// live from KeyboardType/NumericRadix; a tap runs the same ToggleType action as before. (Self-drawn
+	// leaf — TAttribute reads don't auto-repaint, so UpdateToggleTypeLabel Invalidates it on change.)
+	SAssignNew(ToggleTypeKey, SImSwitchKey)
+		.CurrentLabel(TAttribute<FText>::CreateLambda([this]() -> FText {
+			if (KeyboardType == EKeyboardType::Number)
+				return FText::FromString((NumericRadix == 16) ? TEXT("HEX") : TEXT("DEC"));
+			return FText::FromString((KeyboardType == EKeyboardType::QWERTY) ? TEXT("T26") : TEXT("T9"));
+		}))
+		.TargetLabel(TAttribute<FText>::CreateLambda([this]() -> FText {
+			if (KeyboardType == EKeyboardType::Number)
+				return FText::FromString((NumericRadix == 16) ? TEXT("DEC") : TEXT("HEX"));
+			return FText::FromString((KeyboardType == EKeyboardType::QWERTY) ? TEXT("T9") : TEXT("T26"));
+		}))
+		.OnClicked_Lambda([this]() { OnKeyAction(EVirtualKeyAction::ToggleType); });
+
+	// Sign (±) key — preview row, right of the radix key. A two-state switch key (like DEC/HEX): the CURRENT
+	// sign big top-left, the sign a tap switches TO small bottom-right, diagonal slash between. Labels pull
+	// live from the value's sign (value<0 → current '−' / target '+', else current '+' / target '−'). A tap
+	// flips the sign (SignToggle). Visibility is managed by UpdateSignKey (signed DEC numeric only).
+	SAssignNew(SignKey, SImSwitchKey)
+		.CurrentLabel(TAttribute<FText>::CreateLambda([this]() -> FText {
+			const bool bNeg = !CurrentText.IsEmpty() && CurrentText[0] == TEXT('-');
+			return FText::FromString(bNeg ? TEXT("\x2212") : TEXT("+"));
+		}))
+		.TargetLabel(TAttribute<FText>::CreateLambda([this]() -> FText {
+			const bool bNeg = !CurrentText.IsEmpty() && CurrentText[0] == TEXT('-');
+			return FText::FromString(bNeg ? TEXT("+") : TEXT("\x2212"));
+		}))
+		.OnClicked_Lambda([this]() { OnKeyAction(EVirtualKeyAction::SignToggle); });
+	SignKey->SetVisibility(EVisibility::Collapsed);  // shown by UpdateSignKey when applicable
+
+	// Backspace (⌫) key — preview row, left of Done. Reuses MakeBackspaceKey (tap = delete one char;
+	// down = Hide, left/right = step delete/undo). The swipe-up "Clr" is removed here (no "Clr" hint above
+	// the ⌫ on the numeric preview row, per design), so the numeric grid needs no ⌫ cell.
+	PreviewBackspaceKeyDef = MakeShared<FVirtualKeyDef>(MakeBackspaceKey(1.f));
+	PreviewBackspaceKeyDef->Swipe.Up = FVirtualKeySwipeEntry{};  // drop swipe-up Clr (label + callback)
+	PreviewBackspaceKey = MakeBoundKey(PreviewBackspaceKeyDef.Get());
 
 	DoneKeyDef = MakeShared<FVirtualKeyDef>();
 	DoneKeyDef->Action = EVirtualKeyAction::Enter;
@@ -899,6 +1176,19 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 								ToggleTypeKey.ToSharedRef()
 							]
 						]
+						// Sign (±) key — right of the radix key, left of the preview text. Auto-width;
+						// collapsed by UpdateSignKey unless signed DEC numeric input applies.
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SBox)
+							.WidthOverride(TAttribute<FOptionalSize>::CreateLambda([]() { return FOptionalSize(40.f * GetKbScale()); }))
+							.HeightOverride(TAttribute<FOptionalSize>::CreateLambda([]() { return FOptionalSize(32.f * GetKbScale()); }))
+							[
+								SignKey.ToSharedRef()
+							]
+						]
 						+ SHorizontalBox::Slot()
 						.FillWidth(1.f)
 						.VAlign(VAlign_Center)
@@ -909,6 +1199,18 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 							.ColorAndOpacity(FLinearColor::White)
 							.Justification(ETextJustify::Center)
 							.IsReadOnly(true)  // caret is self-drawn; native caret/edit disabled
+						]
+						// Backspace (⌫) — left of Done. Persistent preview-row key (numeric grid has no ⌫).
+						+ SHorizontalBox::Slot()
+						.AutoWidth()
+						.VAlign(VAlign_Center)
+						[
+							SNew(SBox)
+							.WidthOverride(TAttribute<FOptionalSize>::CreateLambda([]() { return FOptionalSize(48.f * GetKbScale()); }))
+							.HeightOverride(TAttribute<FOptionalSize>::CreateLambda([]() { return FOptionalSize(32.f * GetKbScale()); }))
+							[
+								PreviewBackspaceKey.ToSharedRef()
+							]
 						]
 						+ SHorizontalBox::Slot()
 						.AutoWidth()
@@ -997,22 +1299,27 @@ void SImSlateVirtualKeyboard::Tick(const FGeometry& AllottedGeometry, const doub
 
 	if (!bVisible) return;
 
-	// Grab Slate user focus onto the keyboard root once it's in the tree (Tick implies parented).
-	// This is the deferred follow-up to Show()'s bPendingFocus — see Show() for why it can't be
-	// done there. SetKeyboardFocus mirrors the pattern used in SImSearchBox.
+	// Grab Slate user focus onto the keyboard root ONCE, when it first appears (deferred follow-up to
+	// Show()'s bPendingFocus — see Show() for why it can't be done inline). SetKeyboardFocus mirrors the
+	// pattern used in SImSearchBox.
 	//
-	// IMPORTANT: don't stop at a single successful grab. Some hosts (notably the ImGui Slate widget)
-	// re-assert keyboard focus onto THEMSELVES every frame, so a one-shot grab gets stolen back the
-	// next frame — the keyboard appears but swallows nothing until you tap a key (which re-focuses it).
-	// While visible, keep focus on the keyboard whenever it (or a descendant) isn't already focused.
-	if (FSlateApplication::IsInitialized() && !HasAnyUserFocusOrFocusedDescendants())
+	// IMPORTANT: only grab while bPendingFocus is set (the initial appearance), NOT every frame. An
+	// unconditional per-frame grab steals GLOBAL keyboard focus back from anything the user clicks —
+	// including editor panels OUTSIDE the viewport — which is why their right-click menus stopped opening
+	// while the keyboard was up. (Trade-off: a host that re-asserts focus onto itself every frame, e.g. the
+	// ImGui Slate widget, can steal it back after this one grab; if that resurfaces, re-scope the re-grab to
+	// "focus is inside the game viewport" rather than re-grabbing unconditionally.)
+	if (bPendingFocus)
 	{
-		if (FSlateApplication::Get().SetKeyboardFocus(SharedThis(this), EFocusCause::SetDirectly))
+		if (HasAnyUserFocusOrFocusedDescendants())
+		{
+			bPendingFocus = false;  // already focused
+		}
+		else if (FSlateApplication::IsInitialized()
+			&& FSlateApplication::Get().SetKeyboardFocus(SharedThis(this), EFocusCause::SetDirectly))
+		{
 			bPendingFocus = false;
-	}
-	else
-	{
-		bPendingFocus = false;  // already focused
+		}
 	}
 
 	// AllottedGeometry here is authoritative (unlike GetCachedGeometry timing during
@@ -1255,17 +1562,11 @@ void SImSlateVirtualKeyboard::BuildKeyRow(TSharedRef<SHorizontalBox> RowBox, con
 
 void SImSlateVirtualKeyboard::UpdateToggleTypeLabel()
 {
-	if (!ToggleTypeKeyDef.IsValid())
-		return;
-	if (KeyboardType == EKeyboardType::Number)
-	{
-		// On the numeric pad this key is the radix switcher; show the CURRENT base.
-		ToggleTypeKeyDef->Label = (NumericRadix == 16) ? TEXT("HEX") : (NumericRadix == 8 ? TEXT("OCT") : TEXT("DEC"));
-	}
-	else
-	{
-		ToggleTypeKeyDef->Label = (KeyboardType == EKeyboardType::QWERTY) ? TEXT("T9") : TEXT("T26");
-	}
+	// ToggleTypeKey is a SImSwitchKey whose CURRENT/TARGET labels are TAttribute lambdas reading
+	// KeyboardType/NumericRadix directly. It's a self-drawn leaf, so a state change doesn't auto-repaint —
+	// just invalidate it here to pull the new labels.
+	if (ToggleTypeKey.IsValid())
+		ToggleTypeKey->Invalidate(EInvalidateWidgetReason::Paint);
 }
 
 void SImSlateVirtualKeyboard::UpdateToggleTypeKeyVisibility()
@@ -1276,9 +1577,18 @@ void SImSlateVirtualKeyboard::UpdateToggleTypeKeyVisibility()
 	// Numeric pad: it becomes the RADIX switcher, pinned here on the preview row's LEFT so its position
 	// stays fixed no matter how the keypad grid changes between DEC/OCT/HEX (the grid no longer carries
 	// a radix key). Shown only for INTEGER numeric input (floats have no base switching) → hidden.
-	const bool bIntegerNumeric = (KeyboardType == EKeyboardType::Number) && !NumericParams.bAllowDecimal;
+	// Numeric pad radix key shows only for INTEGER input AND only when the field is NOT clamped: HEX is a
+	// two's-complement ring view that ignores Min/Max, so a clamped field is locked to DEC (no radix key).
+	const bool bClamped = NumericParams.Min.IsSet() || NumericParams.Max.IsSet();
+	const bool bIntegerNumeric = (KeyboardType == EKeyboardType::Number) && !NumericParams.bAllowDecimal && !bClamped;
 	const bool bShowToggle = (KeyboardType != EKeyboardType::Number) || bIntegerNumeric;
 	ToggleTypeKey->SetVisibility(bShowToggle ? EVisibility::Visible : EVisibility::Collapsed);
+
+	// Preview-row backspace: only on the numeric pad (the QWERTY/T9 grids carry their own ⌫ key, so
+	// showing it here too would duplicate it). Sign (±) visibility is handled by UpdateSignKey.
+	if (PreviewBackspaceKey.IsValid())
+		PreviewBackspaceKey->SetVisibility(
+			(KeyboardType == EKeyboardType::Number) ? EVisibility::Visible : EVisibility::Collapsed);
 }
 
 // ==================== Show / Hide ====================
@@ -1300,7 +1610,7 @@ void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
 
 	ShiftState = EShiftState::Default;
 	CurrentLayer = 0;
-	BackspaceUndoBuffer.Reset();
+	BackspaceUndoStack.Reset();
 	// Apply the requested initial layout (default QWERTY = unchanged behaviour; Number = numeric pad).
 	KeyboardType = Params.InitialKeyboardType;
 	NumericParams = Params.Numeric;   // shapes the numeric keypad (decimal/negative/hex/step/clamp)
@@ -1310,6 +1620,9 @@ void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
 	HistoryMax = Params.MaxHistory;
 	UpdateToggleTypeLabel();
 	UpdateToggleTypeKeyVisibility();  // numeric pad hides the type-toggle key
+	CalcReset();                      // start each session with a clean calculator (no stale expr/memory)
+	ClearDigitHighlight();            // no preview digit selected until the user presses the preview
+	UpdateSignKey();                  // show/hide + label the preview-row ± key per type/range
 
 	bVisible = true;
 	SetVisibility(EVisibility::Visible);
@@ -1353,6 +1666,10 @@ void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
 void SImSlateVirtualKeyboard::Hide(bool bCommit)
 {
 	if (!bVisible) return;
+
+	// If the keyboard is dismissed mid value-scrub, restore the (hidden) cursor first so it never gets
+	// stuck invisible.
+	EndPreviewMouseDrag();
 
 	bVisible = false;
 	bPendingFocus = false;
@@ -1411,6 +1728,9 @@ void SImSlateVirtualKeyboard::InsertText(const FString& Text)
 	else
 		CurrentText.InsertAt(CursorPosition, Text);
 	CursorPosition += Text.Len();
+	ClearDigitHighlight();    // text structure changed → stale preview selection no longer valid
+	BackspaceUndoStack.Reset();  // a fresh insertion ends the delete/undo sequence (stored positions would
+	                             // no longer line up with the new text), matching typical editor behaviour
 }
 
 void SImSlateVirtualKeyboard::DeleteBackward()
@@ -1419,7 +1739,54 @@ void SImSlateVirtualKeyboard::DeleteBackward()
 	{
 		CurrentText.RemoveAt(CursorPosition - 1, 1);
 		CursorPosition--;
+		ClearDigitHighlight();  // text structure changed → stale preview selection no longer valid
 	}
+}
+
+// Record a deletion for undo: the removed text and the index it was removed from. Each call is one undo
+// step; UndoBackspaceFromStack restores the most recent one.
+void SImSlateVirtualKeyboard::PushBackspaceUndo(const FString& RemovedText, int32 Pos)
+{
+	if (RemovedText.IsEmpty())
+		return;
+	FBackspaceUndoEntry Entry;
+	Entry.Text = RemovedText;
+	Entry.Pos = Pos;
+	BackspaceUndoStack.Add(MoveTemp(Entry));
+}
+
+// Delete the char left of the caret AND record it (with its position) so a right-swipe undo can restore it
+// exactly where it was. Returns true if something was deleted.
+bool SImSlateVirtualKeyboard::DeleteBackwardWithUndo()
+{
+	if (CursorPosition <= 0 || CurrentText.Len() == 0)
+		return false;
+	const int32 Pos = CursorPosition - 1;
+	PushBackspaceUndo(CurrentText.Mid(Pos, 1), Pos);  // remember WHAT + WHERE before removing
+	DeleteBackward();
+	return true;
+}
+
+// Undo the most recent recorded deletion: reinsert the stored text at its original index and place the
+// caret just after it. Restores position-faithfully regardless of where the caret moved meanwhile.
+void SImSlateVirtualKeyboard::UndoBackspaceFromStack()
+{
+	if (BackspaceUndoStack.Num() == 0)
+		return;
+	// When backspace deletes the LAST char of a numeric field, UpdatePreview() substitutes a placeholder "0"
+	// so the field never goes empty. That "0" is synthetic (never typed, never pushed to the undo stack), so
+	// undo must drop it before reinserting the real char — otherwise the placeholder accumulates and every
+	// undo step leaves a stray leading/trailing 0 ("一堆0"). Clear it so the stored text takes its place.
+	if (KeyboardType == EKeyboardType::Number && CalcExpr.IsEmpty() && CurrentText == TEXT("0"))
+	{
+		CurrentText.Empty();
+		CursorPosition = 0;
+	}
+	const FBackspaceUndoEntry Entry = BackspaceUndoStack.Pop();
+	const int32 Pos = FMath::Clamp(Entry.Pos, 0, CurrentText.Len());
+	CurrentText.InsertAt(Pos, Entry.Text);
+	CursorPosition = Pos + Entry.Text.Len();
+	ClearDigitHighlight();
 }
 
 void SImSlateVirtualKeyboard::MoveCursor(int32 Delta)
@@ -1436,38 +1803,92 @@ void SImSlateVirtualKeyboard::AdjustDigitAtCursor(int32 Direction)
 	if (Old.IsEmpty())
 		return;
 
-	// Digit to adjust: normally the one just LEFT of the caret (skip non-digits like '-'/'.'). But if
-	// the caret is at the very start (no digit to its left), fall back to the FIRST digit to the RIGHT
-	// — so a left-anchored caret still bumps the leading (most-significant) digit.
-	int32 Idx = FMath::Clamp(CursorPosition, 0, Old.Len()) - 1;
-	while (Idx >= 0 && !FChar::IsHexDigit(Old[Idx]))
-		--Idx;
+	// Digit to adjust. Preview drag-to-edit drives an explicit SelectedDigitIndex (the highlighted digit) —
+	// use it directly when valid. Otherwise (cursor-key path / physical input) fall back to the digit just
+	// LEFT of the caret (skip non-digits like '-'/'.'); if the caret is at the very start, fall back to the
+	// FIRST digit to the RIGHT so a left-anchored caret still bumps the leading (most-significant) digit.
+	int32 Idx;
 	bool bFromLeftEdge = false;
-	if (Idx < 0)
+	if (SelectedDigitIndex != INDEX_NONE && Old.IsValidIndex(SelectedDigitIndex) && FChar::IsHexDigit(Old[SelectedDigitIndex]))
 	{
-		for (int32 i = 0; i < Old.Len(); ++i)
-			if (FChar::IsHexDigit(Old[i])) { Idx = i; bFromLeftEdge = true; break; }
+		Idx = SelectedDigitIndex;
+	}
+	else
+	{
+		Idx = FMath::Clamp(CursorPosition, 0, Old.Len()) - 1;
+		while (Idx >= 0 && !FChar::IsHexDigit(Old[Idx]))
+			--Idx;
 		if (Idx < 0)
-			return;  // no digit at all
+		{
+			for (int32 i = 0; i < Old.Len(); ++i)
+				if (FChar::IsHexDigit(Old[i])) { Idx = i; bFromLeftEdge = true; break; }
+			if (Idx < 0)
+				return;  // no digit at all
+		}
 	}
 
 	const bool bFloat = NumericParams.bAllowDecimal && NumericRadix == 10;
+	const bool bHex   = !bFloat && NumericRadix == 16;
 	const int32 DotPos = Old.Find(TEXT("."));
 
-	if (!bFloat)
+	// Is the adjusted column the most-significant digit (first hex-digit char in the string)?
+	int32 FirstDigit = INDEX_NONE;
+	for (int32 i = 0; i < Old.Len(); ++i)
+		if (FChar::IsHexDigit(Old[i])) { FirstDigit = i; break; }
+	const bool bIsTopDigit = (Idx == FirstDigit);
+
+	if (bHex)
 	{
-		// Integer in current radix: place value = radix^(digits to the right of Idx).
+		// HEX: two's-complement ring at BitWidth. Add/subtract the column's place value (16^right) on the
+		// unsigned view and wrap with the width mask — no '-' sign, no Min/Max clamp (the ring IS the range).
 		int32 RightDigits = 0;
 		for (int32 i = Idx + 1; i < Old.Len(); ++i)
 			if (FChar::IsHexDigit(Old[i])) ++RightDigits;
-		int64 Place = 1;
-		for (int32 i = 0; i < RightDigits; ++i) Place *= NumericRadix;
+		uint64 Place = 1; for (int32 i = 0; i < RightDigits; ++i) Place *= 16ull;
+		const uint64 Mask = NumericWidthMask(NumericParams.BitWidth);
+		uint64 U = FCString::Strtoui64(*Old, nullptr, 16) & Mask;
+		U = (Direction > 0) ? (U + Place) : (U - Place);
+		U &= Mask;  // wrap on the [0, 2^width) ring
+		CurrentText = FormatIntInRadix((int64)U, 16, NumericParams.BitWidth);
+	}
+	else if (!bFloat && bIsTopDigit)
+	{
+		// DEC most-significant digit: continuous cross-magnitude step (1000→900→…→10→9→…→0). Only for
+		// positive values; negatives fall back to the standard place-value step below.
+		int64 Val = FCString::Strtoi64(*Old, nullptr, 10);
+		if (Val > 0)
+		{
+			Val = (Direction < 0) ? TopDigitStepDown(Val) : TopDigitStepUp(Val);
+			if (NumericParams.Min.IsSet()) Val = FMath::Max(Val, (int64)NumericParams.Min.GetValue());
+			if (NumericParams.Max.IsSet()) Val = FMath::Min(Val, (int64)NumericParams.Max.GetValue());
+			CurrentText = FormatIntInRadix(Val, 10, NumericParams.BitWidth);
+		}
+		else
+		{
+			// Val <= 0: standard place-value step (place = 10^right).
+			int32 RightDigits = 0;
+			for (int32 i = Idx + 1; i < Old.Len(); ++i)
+				if (FChar::IsHexDigit(Old[i])) ++RightDigits;
+			int64 Place = 1; for (int32 i = 0; i < RightDigits; ++i) Place *= 10;
+			Val += (int64)Direction * Place;
+			if (NumericParams.Min.IsSet()) Val = FMath::Max(Val, (int64)NumericParams.Min.GetValue());
+			if (NumericParams.Max.IsSet()) Val = FMath::Min(Val, (int64)NumericParams.Max.GetValue());
+			CurrentText = FormatIntInRadix(Val, 10, NumericParams.BitWidth);
+		}
+	}
+	else if (!bFloat)
+	{
+		// DEC non-top integer column: standard place-value step.
+		int32 RightDigits = 0;
+		for (int32 i = Idx + 1; i < Old.Len(); ++i)
+			if (FChar::IsHexDigit(Old[i])) ++RightDigits;
+		int64 Place = 1; for (int32 i = 0; i < RightDigits; ++i) Place *= 10;
 
-		int64 Val = FCString::Strtoi64(*Old, nullptr, NumericRadix);
+		int64 Val = FCString::Strtoi64(*Old, nullptr, 10);
 		Val += (int64)Direction * Place;
 		if (NumericParams.Min.IsSet()) Val = FMath::Max(Val, (int64)NumericParams.Min.GetValue());
 		if (NumericParams.Max.IsSet()) Val = FMath::Min(Val, (int64)NumericParams.Max.GetValue());
-		CurrentText = FormatIntInRadix(Val, NumericRadix);
+		CurrentText = FormatIntInRadix(Val, 10, NumericParams.BitWidth);
 	}
 	else
 	{
@@ -1541,8 +1962,50 @@ void SImSlateVirtualKeyboard::AdjustDigitAtCursor(int32 Direction)
 		}
 	}
 
+	// Preview drag-to-edit: re-lock the highlight onto the SAME digit COLUMN, independent of the caret
+	// re-anchor above (which can mis-place the caret to index 0 when the value changes sign or digit count).
+	// We anchor by "number of digits to the RIGHT of the adjusted digit" — that count is stable across a
+	// ±1 bump of a single column, so we re-find the digit with the same right-count in the new string. This
+	// also keeps the selection (and therefore the ruler) on-screen instead of snapping to the front.
+	const int32 PrevSelForRuler = SelectedDigitIndex;  // detect whether the selected column actually moved
+	if (SelectedDigitIndex != INDEX_NONE)
+	{
+		// Right-of-Idx digit count in the OLD string (Idx was the adjusted column).
+		int32 RightDigits = 0;
+		for (int32 i = Idx + 1; i < Old.Len(); ++i)
+			if (FChar::IsHexDigit(Old[i])) ++RightDigits;
+		// Walk the NEW string from the right; the target digit is the one with exactly RightDigits digits
+		// to its right. If a carry GREW the number (more digits now), the leading new digit has the most
+		// right-digits, so this still lands on the right column; if it can't be matched, fall back to the
+		// most-significant digit (never index 0 / the sign).
+		int32 NewSel = INDEX_NONE, Seen = 0;
+		for (int32 i = CurrentText.Len() - 1; i >= 0; --i)
+		{
+			if (!FChar::IsHexDigit(CurrentText[i])) continue;
+			if (Seen == RightDigits) { NewSel = i; break; }
+			++Seen;
+		}
+		if (NewSel == INDEX_NONE)
+		{
+			// No exact match (digit count shrank) → snap to the most-significant digit.
+			for (int32 i = 0; i < CurrentText.Len(); ++i)
+				if (FChar::IsHexDigit(CurrentText[i])) { NewSel = i; break; }
+		}
+		SelectedDigitIndex = NewSel;  // INDEX_NONE only if no digit remains at all
+		CursorPosition = (NewSel != INDEX_NONE) ? FMath::Clamp(NewSel + 1, 0, CurrentText.Len()) : CurrentText.Len();
+		if (PreviewEdit.IsValid())
+			PreviewEdit->SetHighlightDigit(SelectedDigitIndex);
+	}
+
 	UpdatePreview();
 	UpdateSuggestions();
+	UpdateSignKey();  // value (and possibly its sign) changed → refresh the ± key label
+	// Re-align the scrolling ruler when the selected column moved OR the digit count changed (a magnitude
+	// demotion like 1000001→900001 keeps the same index but shifts every cell's pixel X, so the ruler must
+	// follow). A plain same-width step keeps the ruler put to preserve its continuous scroll offset.
+	if (PreviewStepRuler.IsValid()
+		&& (SelectedDigitIndex != PrevSelForRuler || CurrentText.Len() != Old.Len()))
+		ShowPreviewStepRuler();
 	if (OnTextChanged)
 		OnTextChanged(CurrentText);
 }
@@ -1571,13 +2034,34 @@ void SImSlateVirtualKeyboard::ToggleShift()
 void SImSlateVirtualKeyboard::UpdatePreview()
 {
 	bCursorVisible = true;
+	// Numeric field never shows an empty value: deleting the last char (backspace / Clr) leaves "" which is
+	// not a number and breaks digit hit-test / ruler placement. Fall back to "0" so there is always a digit.
+	// (Only in plain numeric mode — not while a calculator expression is on screen, and not for text fields.)
+	if (KeyboardType == EKeyboardType::Number && CalcExpr.IsEmpty()
+		&& (CurrentText.IsEmpty() || CurrentText == TEXT("-")))
+	{
+		CurrentText = TEXT("0");
+		CursorPosition = CurrentText.Len();
+		SelectedDigitIndex = INDEX_NONE;  // re-picked on next press; stale index would point past "0"
+	}
+	// Calculator: while an expression is being built (CalcExpr non-empty, e.g. "5+3"), the preview shows
+	// the EXPRESSION but the bound field is NOT synced — the field keeps its last confirmed value until
+	// '=' produces a result. In plain numeric / text mode CalcExpr is empty and preview == CurrentText
+	// (the value), which IS synced. This separation keeps the (numeric-only) bound field from ever
+	// receiving a non-numeric expression string like "5+".
+	const bool bExprMode = !CalcExpr.IsEmpty();
+	const FString& Display = bExprMode ? CalcExpr : CurrentText;
 	if (PreviewEdit.IsValid())
 	{
-		PreviewEdit->SetText(FText::FromString(CurrentText));
+		PreviewEdit->SetText(FText::FromString(Display));
 		PreviewEdit->SetPreviewCaretVisible(true);
-		PreviewEdit->GoTo(FTextLocation(0, CursorPosition));  // after SetText: caret to current index
+		// Expression mode: caret follows CalcCursorPos (left/right drag browses it). Plain mode: CursorPosition.
+		const int32 Caret = bExprMode
+			? FMath::Clamp(CalcCursorPos, 0, Display.Len())
+			: FMath::Clamp(CursorPosition, 0, Display.Len());
+		PreviewEdit->GoTo(FTextLocation(0, Caret));
 	}
-	if (OnTextChanged)
+	if (OnTextChanged && !bExprMode)
 		OnTextChanged(CurrentText);
 }
 
@@ -1609,6 +2093,7 @@ void SImSlateVirtualKeyboard::SyncFromEditor(const FString& Text, int32 CaretPos
 	CurrentText = Text;
 	CursorPosition = NewCaret;
 	bCursorVisible = true;
+	ClearDigitHighlight();  // editor-driven text/caret change → drop any stale preview digit selection
 	if (PreviewEdit.IsValid())
 	{
 		PreviewEdit->SetText(FText::FromString(CurrentText));
@@ -1627,38 +2112,368 @@ bool SImSlateVirtualKeyboard::IsInPreviewArea(const FVector2D& AbsPos) const
 	return false;
 }
 
-void SImSlateVirtualKeyboard::HandlePreviewDrag(const FVector2D& ScreenPos)
+// On press in the preview area: hit-test the digit under the finger and make it the initial selection.
+// Numeric pad + plain-numeric (no calculator expression) only; otherwise leaves selection cleared.
+void SImSlateVirtualKeyboard::BeginPreviewSelectAt(const FVector2D& AbsScreenPos)
 {
-	float DeltaX = ScreenPos.X - PreviewDragLastPos.X;
-	PreviewDragLastPos = ScreenPos;
-	PreviewDragAccum += DeltaX;
-	float Step = 12.f * GetKbScale();
-	while (PreviewDragAccum > Step)  { MoveCursor(1);  PreviewDragAccum -= Step; UpdatePreview(); }
-	while (PreviewDragAccum < -Step) { MoveCursor(-1); PreviewDragAccum += Step; UpdatePreview(); }
+	SelectedDigitIndex = INDEX_NONE;
+	if (!CalcExpr.IsEmpty() || KeyboardType != EKeyboardType::Number || !PreviewEdit.IsValid())
+	{
+		if (PreviewEdit.IsValid()) PreviewEdit->SetHighlightDigit(INDEX_NONE);
+		return;
+	}
+	const int32 Hit = PreviewEdit->HitTestDigitIndex(AbsScreenPos);
+	if (Hit != INDEX_NONE)
+	{
+		SelectedDigitIndex = Hit;
+		PreviewEdit->SetHighlightDigit(Hit);
+		CursorPosition = FMath::Clamp(Hit + 1, 0, CurrentText.Len());  // caret right of the selected digit
+		if (PreviewEdit.IsValid()) PreviewEdit->GoTo(FTextLocation(0, CursorPosition));
+	}
+	else
+	{
+		PreviewEdit->SetHighlightDigit(INDEX_NONE);
+	}
+}
+
+// Move the highlighted digit to the next digit char in Dir (+1 = right/lower place, -1 = left/higher),
+// skipping non-digits ('-' '.'). Stops at the edge if there is no further digit.
+void SImSlateVirtualKeyboard::MoveSelectedDigit(int32 Dir)
+{
+	if (SelectedDigitIndex == INDEX_NONE)
+		return;
+	int32 i = SelectedDigitIndex + Dir;
+	while (i >= 0 && i < CurrentText.Len() && !FChar::IsHexDigit(CurrentText[i]))
+		i += Dir;
+	if (i < 0 || i >= CurrentText.Len())
+		return;  // no further digit — stay put
+	SelectedDigitIndex = i;
+	if (PreviewEdit.IsValid())
+	{
+		PreviewEdit->SetHighlightDigit(i);
+		CursorPosition = FMath::Clamp(i + 1, 0, CurrentText.Len());
+		PreviewEdit->GoTo(FTextLocation(0, CursorPosition));
+	}
+}
+
+// Drop the preview digit selection + its highlight. Called whenever the text STRUCTURE changes from a
+// non-scrub path (typing a digit, backspace, editor sync), so a stale highlight never points at a moved
+// or deleted character. NOT called from AdjustDigitAtCursor (it re-locks the selection itself).
+void SImSlateVirtualKeyboard::ClearDigitHighlight()
+{
+	SelectedDigitIndex = INDEX_NONE;
+	if (PreviewEdit.IsValid())
+		PreviewEdit->SetHighlightDigit(INDEX_NONE);
+}
+
+// Whitelist of insertable characters on the numeric pad. DEC integer → 0-9 only (letters like f/d/g are
+// rejected); HEX → 0-9 A-F; '.' only for float DEC; '-' only when negatives allowed. Operators/'=' are
+// handled separately and never inserted as text. Non-numeric layouts: everything allowed.
+bool SImSlateVirtualKeyboard::IsCharAllowedForNumeric(TCHAR Ch) const
+{
+	if (KeyboardType != EKeyboardType::Number)
+		return true;
+	const TCHAR C = FChar::ToUpper(Ch);
+	if (C >= '0' && C <= '9')   return ((C - '0') < NumericRadix);
+	if (C >= 'A' && C <= 'F')   return ((10 + (C - 'A')) < NumericRadix);  // only in HEX
+	if (Ch == '.')              return NumericParams.bAllowDecimal && (NumericRadix == 10);
+	if (Ch == '-')              return NumericParams.bAllowNegative && (NumericRadix == 10);  // no sign in HEX
+	return false;  // any other char (letters g-z, punctuation, …) is not valid in a numeric field
+}
+
+void SImSlateVirtualKeyboard::HandlePreviewDrag(const FVector2D& Delta)
+{
+	// Delta is the per-move cursor delta: mouse passes GetCursorDelta (relative, cursor hidden during the
+	// scrub so it stays put visually); touch passes a position diff. Both are in LOCAL pixels here.
+	const float StepY = 12.f * GetKbScale();  // vertical travel per ±1 value step
+
+	// Calculator expression mode (preview shows "5+3"): the digit-scrub model doesn't apply. Horizontal
+	// drag browses the caret along the EXPRESSION string (CalcCursorPos); input still appends to the end.
+	if (!CalcExpr.IsEmpty())
+	{
+		PreviewDragAccum += Delta.X;
+		while (PreviewDragAccum >  StepY) { CalcCursorPos = FMath::Min(CalcCursorPos + 1, CalcExpr.Len()); PreviewDragAccum -= StepY; UpdatePreview(); }
+		while (PreviewDragAccum < -StepY) { CalcCursorPos = FMath::Max(CalcCursorPos - 1, 0);            PreviewDragAccum += StepY; UpdatePreview(); }
+		return;
+	}
+	// Non-numeric text input: original behaviour — horizontal drag moves the text caret.
+	if (KeyboardType != EKeyboardType::Number)
+	{
+		PreviewDragAccum += Delta.X;
+		while (PreviewDragAccum >  StepY) { MoveCursor(+1); PreviewDragAccum -= StepY; UpdatePreview(); }
+		while (PreviewDragAccum < -StepY) { MoveCursor(-1); PreviewDragAccum += StepY; UpdatePreview(); }
+		return;
+	}
+
+	// Accumulate the delta on BOTH axes FIRST (high-precision raw deltas arrive ~1px/frame, far below any
+	// single-frame threshold — judging the axis on one frame's delta never locked it, so nothing moved).
+	PreviewDragAccum += Delta.X;
+	PreviewDragAccumY += Delta.Y;
+
+	// Axis selection from ACCUMULATED travel (not one frame). Lock once the dominant axis passes a small
+	// threshold; allow re-locking mid-drag when the other axis clearly takes over (reset both accumulators
+	// so leftover travel doesn't instantly trigger).
+	const float AccX = FMath::Abs(PreviewDragAccum), AccY = FMath::Abs(PreviewDragAccumY);
+	const float AxisLockThresh = 3.f;
+	if (PreviewDragAxis == 0)
+	{
+		if (AccX > AccY && AccX > AxisLockThresh)      PreviewDragAxis = 1;
+		else if (AccY > AccX && AccY > AxisLockThresh) { PreviewDragAxis = 2; ShowPreviewStepRuler(); }
+	}
+	else if (PreviewDragAxis == 1 && AccY > AccX + AxisLockThresh)
+	{
+		PreviewDragAxis = 2; PreviewDragAccum = 0.f; PreviewDragAccumY = 0.f; ShowPreviewStepRuler();
+	}
+	else if (PreviewDragAxis == 2 && AccX > AccY + AxisLockThresh)
+	{
+		PreviewDragAxis = 1; PreviewDragAccum = 0.f; PreviewDragAccumY = 0.f; HidePreviewStepRuler();
+	}
+
+	if (PreviewDragAxis == 1 && KeyboardType == EKeyboardType::Number && SelectedDigitIndex != INDEX_NONE)
+	{
+		// Horizontal: switch the highlighted digit. Requires >110% of the cell width of accumulated travel
+		// before each switch (10% elastic margin).
+		float L = 0.f, R = 0.f, CellW = 12.f * GetKbScale();
+		if (PreviewEdit.IsValid() && PreviewEdit->GetDigitCellBounds(SelectedDigitIndex, L, R))
+			CellW = FMath::Max(4.f, R - L);
+		const float Thresh = CellW * 1.1f;
+		while (PreviewDragAccum >  Thresh) { MoveSelectedDigit(+1); PreviewDragAccum -= Thresh; }
+		while (PreviewDragAccum < -Thresh) { MoveSelectedDigit(-1); PreviewDragAccum += Thresh; }
+	}
+	else if (PreviewDragAxis == 2 && KeyboardType == EKeyboardType::Number && SelectedDigitIndex != INDEX_NONE)
+	{
+		// Vertical: bump the highlighted digit by ±1 (carry + clamp), one step per StepY accumulated. Drag UP
+		// = increase (screen Y grows downward, so negate). Ruler scrolls with the finger.
+		while (PreviewDragAccumY < -StepY) { AdjustDigitAtCursor(+1); PreviewDragAccumY += StepY; }
+		while (PreviewDragAccumY > StepY)  { AdjustDigitAtCursor(-1); PreviewDragAccumY -= StepY; }
+		if (PreviewStepRuler.IsValid())
+		{
+			// Delta is already in LOCAL pixels (callers divided out the DPI scale), and the ruler renders in
+			// local space — feed Delta.Y directly so the ticks scroll in lockstep with the value.
+			PreviewStepRuler->SetOffset(PreviewStepRuler->GetOffset() + (float)Delta.Y);
+		}
+	}
+}
+
+// Overlay a value-axis (horizontal-tick) ruler over the CURRENTLY SELECTED DIGIT during a vertical scrub,
+// so the scrolling ticks sit right on the digit being changed (not stretched across the whole text box).
+void SImSlateVirtualKeyboard::ShowPreviewStepRuler()
+{
+	if (!RootOverlay.IsValid() || !PreviewEdit.IsValid())
+		return;
+	HidePreviewStepRuler();  // never stack two
+
+	const FGeometry RootGeo = RootOverlay->GetCachedGeometry();
+	const FGeometry PrevGeo = PreviewEdit->GetCachedGeometry();
+	const float RootScale = FMath::Max(0.01f, RootGeo.GetAccumulatedLayoutTransform().GetScale());
+
+	// Default: span the whole PreviewEdit (used when there is no selected digit, e.g. fallback).
+	FVector2D LocalPos = RootGeo.AbsoluteToLocal(PrevGeo.GetAbsolutePosition());
+	FVector2D LocalSize = FVector2D(PrevGeo.GetAbsoluteSize()) / RootScale;
+
+	// Preferred: clamp the ruler's WIDTH to the selected digit's cell (so ticks sit over that digit), but
+	// make its HEIGHT fill the whole preview ROW (PreviewBorder). The cell's X edges come from the SAME
+	// coordinate path as the blinking caret (GetLocalXAt = GetLocationAt/Scale): left edge = the digit's X,
+	// right edge = the next index's X (where the caret sits). This guarantees the ruler aligns exactly with
+	// the caret/highlight rather than drifting.
+	float CellL = 0.f, CellR = 0.f;
+	if (SelectedDigitIndex != INDEX_NONE
+		&& PreviewEdit->GetLocalXAt(SelectedDigitIndex, CellL)
+		&& PreviewEdit->GetLocalXAt(SelectedDigitIndex + 1, CellR)
+		&& CellR != CellL)
+	{
+		if (CellL > CellR) { const float T = CellL; CellL = CellR; CellR = T; }  // normalize (RTL safety)
+		const FVector2D AbsL = PrevGeo.LocalToAbsolute(FVector2D(CellL, 0.f));
+		const FVector2D AbsR = PrevGeo.LocalToAbsolute(FVector2D(CellR, 0.f));
+		const float CellAbsW = AbsR.X - AbsL.X;
+		// Vertical extent: full preview-row height when available, else fall back to the text height.
+		const FGeometry RowGeo = PreviewBorder.IsValid() ? PreviewBorder->GetCachedGeometry() : PrevGeo;
+		const FVector2D RowAbsPos = RowGeo.GetAbsolutePosition();
+		const FVector2D RowAbsSize = FVector2D(RowGeo.GetAbsoluteSize());
+		// Top-left = (selected digit's X, preview-row top); size = (cell width, full row height).
+		const FVector2D AbsTL(AbsL.X, RowAbsPos.Y);
+		LocalPos = RootGeo.AbsoluteToLocal(AbsTL);
+		LocalSize = FVector2D(CellAbsW, RowAbsSize.Y) / RootScale;
+	}
+
+	PreviewStepRuler = SNew(SImStepRuler)
+		.Axis(EOrientation::Orient_Horizontal)   // value axis: horizontal ticks that scroll vertically
+		.StepW(12.f * GetKbScale());
+	PreviewStepRuler->SetTickFractions(1.0f, 0.5f);  // long tick = full width (1 char), short = half
+	PreviewStepRuler->SetOffset(0.f);
+	PreviewStepRuler->SetVisibility(EVisibility::HitTestInvisible);
+
+	TSharedRef<SWidget> Host = SNew(SBox)
+		.WidthOverride(LocalSize.X)
+		.HeightOverride(LocalSize.Y)
+		[
+			PreviewStepRuler.ToSharedRef()
+		];
+	PreviewStepRulerHost = Host;
+
+	RootOverlay->AddSlot()
+	.HAlign(HAlign_Left)
+	.VAlign(VAlign_Top)
+	.Padding(FMargin(LocalPos.X, LocalPos.Y, 0.f, 0.f))
+	[
+		Host
+	];
+}
+
+void SImSlateVirtualKeyboard::HidePreviewStepRuler()
+{
+	if (PreviewStepRulerHost.IsValid() && RootOverlay.IsValid())
+		RootOverlay->RemoveSlot(PreviewStepRulerHost.ToSharedRef());
+	PreviewStepRulerHost.Reset();
+	PreviewStepRuler.Reset();
 }
 
 FReply SImSlateVirtualKeyboard::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	if (IsInPreviewArea(MouseEvent.GetScreenSpacePosition()))
 	{
+		// [HPDbg] If bPreviewDragging is ALREADY true here, the previous drag never closed (leaked flag) — the
+		// root cause we're hunting. Logs whether each new press starts from a clean state.
+		if (bPreviewDragging)
+			UE_LOG(LogTemp, Warning, TEXT("[HPDbg] DOWN found STALE bPreviewDragging=1 (previous drag never ended)"));
 		bPreviewDragging = true;
 		PreviewDragLastPos = MouseEvent.GetScreenSpacePosition();
 		PreviewDragAccum = 0.f;
+		PreviewDragAccumY = 0.f;
+		PreviewDragAxis = 0;
+		BeginPreviewSelectAt(MouseEvent.GetScreenSpacePosition());
+		// Remember the press point (the EVENT position — GetCursorPos() returns (0,0) in this virtual-window
+		// environment) so we can restore the cursor THERE on release. We don't warp every frame (SetCursorPos
+		// is unreliable here, which caused the oscillation); we only set it once on release and accept it may
+		// occasionally not land — the cursor stays hidden during the whole scrub, so a missed restore just
+		// shows the cursor at the release point, never "flies off" (value scrubbing uses GetCursorDelta).
+		PreviewDragAnchorScreen = MouseEvent.GetScreenSpacePosition();
+		// Two-layer mouse pinning:
+		//  • UseHighPrecisionMouseMovement → in NON-PIE (real native game window) the OS stops updating the
+		//    visible cursor, so it's TRULY pinned in place, and moves arrive as raw deltas (OnRawMouseMove,
+		//    SlateApplication.cpp:6253: CursorDelta = raw X/Y, while ScreenSpacePosition is FROZEN at GetCursorPos).
+		//  • CaptureMouse → keep receiving moves outside the widget; also the fallback path in PIE, where
+		//    high-precision is blocked by bIsVirtualInteraction (SlateApplication.cpp:3536) and the cursor
+		//    can't be pinned — there we just hide it (OnCursorQuery → None).
+		// CRITICAL: OnMouseMove must read MouseEvent.GetCursorDelta() (NOT a ScreenSpacePosition diff): under
+		// high-precision ScreenSpacePosition is frozen, so a position diff would always be 0. GetCursorDelta
+		// is correct in BOTH modes (raw delta when high-precision, pos-minus-last otherwise).
+		// [HPDbg] one-shot env probe on press: GIsEditor distinguishes PIE (editor process) from a real
+		// packaged/desktop runtime; IsVirtualWindow tells whether the event's top window is an SVirtualWindow
+		// (the thing that blocks high-precision via bIsVirtualInteraction). High-precision engages AFTER this
+		// reply is processed, so we log its state again in OnMouseMove.
+		{
+			const TSharedPtr<SWindow> TopWin = FSlateApplication::Get().FindWidgetWindow(SharedThis(this));
+			// Foreground = the exact gate LockCursorInternal checks (SlateUser.cpp:982 NativeWindow->IsForegroundWindow()).
+			//   1 → lock will actually clip the cursor; 0 → LockCursorInternal silently no-ops; -1 → no valid NativeWindow.
+			const TSharedPtr<const FGenericWindow> NativeWin = TopWin.IsValid() ? TopWin->GetNativeWindow() : nullptr;
+			const int32 ForegroundState = NativeWin.IsValid() ? (NativeWin->IsForegroundWindow() ? 1 : 0) : -1;
+			UE_LOG(LogTemp, Warning, TEXT("[HPDbg] DOWN GIsEditor=%d TopWindowVirtual=%d HiPrecNow=%d Foreground=%d Anchor=(%.1f,%.1f)"),
+				GIsEditor ? 1 : 0,
+				TopWin.IsValid() ? (TopWin->IsVirtualWindow() ? 1 : 0) : -1,
+				FSlateApplication::Get().IsUsingHighPrecisionMouseMovment() ? 1 : 0,
+				ForegroundState,
+				PreviewDragAnchorScreen.X, PreviewDragAnchorScreen.Y);
+		}
+		// SSpinBox pattern (Slate/Private/Widgets/Input/SSpinBox.cpp:301): grab capture + high-precision in one
+		// reply, plus LockMouseToWidget to confine the cursor to the keyboard rect (it fills the viewport). All
+		// three are applied together by ProcessReply and torn down together by the matching ReleaseMouse* replies
+		// on button-up / capture-lost. High-precision DOES engage here (logs: PIE TopWindowVirtual=0, HiPrec=1
+		// from the first move), so the cursor is genuinely pinned and the lock's ClipCursor doesn't yank it.
+		return FReply::Handled()
+			.CaptureMouse(SharedThis(this))
+			.UseHighPrecisionMouseMovement(SharedThis(this))
+			.LockMouseToWidget(SharedThis(this));
 	}
 	return FReply::Handled();
 }
 
+void SImSlateVirtualKeyboard::EndPreviewMouseDrag()
+{
+	if (!bPreviewDragging)
+		return;
+	// Restore the cursor to the press point ONLY when high-precision was engaged (non-PIE): there the cursor
+	// was pinned + hidden, so moving it back to the anchor is both meaningful and invisible (do it BEFORE
+	// clearing bPreviewDragging, while OnCursorQuery still hides it). When high-precision did NOT engage (PIE),
+	// the cursor was visible and followed the mouse freely — yanking it back to the press point would be a
+	// jarring visible jump, and SetCursorPos is unreliable there anyway, so leave it where it is.
+	if (FSlateApplication::Get().IsUsingHighPrecisionMouseMovment())
+		FSlateApplication::Get().SetCursorPos(PreviewDragAnchorScreen);
+	// NOTE: capture / high-precision / mouse-lock are NOT released here — EndPreviewMouseDrag is void and can't
+	// return an FReply. The normal button-up path releases them via the reply in OnMouseButtonUp; the abnormal
+	// capture-lost path re-issues that reply explicitly in OnMouseCaptureLost. This keeps every teardown on the
+	// engine's standard ProcessReply path (the only place that turns high-precision back off — SlateApplication
+	// .cpp:3578), matching SSpinBox. Doing it by hand here is what previously leaked high-precision globally.
+	bPreviewDragging = false;
+	HidePreviewStepRuler();
+	bPreviewIgnoreSyntheticMove = false;
+}
+
+FCursorReply SImSlateVirtualKeyboard::OnCursorQuery(const FGeometry& MyGeometry, const FPointerEvent& CursorEvent) const
+{
+	// Hide the OS cursor while scrubbing — but ONLY when high-precision mode actually engaged, i.e. the cursor
+	// is genuinely PINNED in place (non-PIE / real desktop runtime). Hiding only makes sense to mask a pinned
+	// cursor: if it's pinned, hide it so the user doesn't see a frozen arrow; if it's NOT pinned (PIE, where
+	// bIsVirtualInteraction blocks high-precision — SlateApplication.cpp:3536), hiding would make the cursor
+	// vanish while it still physically moves around → user loses it. So when not pinned, leave it visible and
+	// let it follow the mouse freely. (Slate re-queries the cursor every frame, so None reliably overrides
+	// the normal cursor — see reference-ue-high-precision-mouse.)
+	if (bPreviewDragging && FSlateApplication::Get().IsUsingHighPrecisionMouseMovment())
+		return FCursorReply::Cursor(EMouseCursor::None);
+	return FCursorReply::Unhandled();
+}
+
 FReply SImSlateVirtualKeyboard::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
-	bPreviewDragging = false;
-	return FReply::Handled();
+	const bool bWasCapturing = HasMouseCapture();
+	UE_LOG(LogTemp, Warning, TEXT("[HPDbg] UP reached widget: bPreviewDragging=%d HasCapture=%d HiPrec=%d"),
+		bPreviewDragging ? 1 : 0, bWasCapturing ? 1 : 0,
+		FSlateApplication::Get().IsUsingHighPrecisionMouseMovment() ? 1 : 0);
+	EndPreviewMouseDrag();
+	// Tear down capture + high-precision + mouse-lock together via the reply (SSpinBox pattern). ReleaseMouseCapture
+	// is what drives ProcessReply:3578 to turn high-precision back off; ReleaseMouseLock undoes LockMouseToWidget.
+	return bWasCapturing
+		? FReply::Handled().ReleaseMouseCapture().ReleaseMouseLock()
+		: FReply::Handled();
 }
 
 FReply SImSlateVirtualKeyboard::OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	if (bPreviewDragging)
-		HandlePreviewDrag(MouseEvent.GetScreenSpacePosition());
+	{
+		// HandlePreviewDrag thresholds (cell width, StepY) are in LOCAL pixels, but mouse deltas are in SCREEN
+		// pixels — convert to local first so sensitivity matches the on-screen cell size regardless of DPI.
+		const float DPIScale = GetCachedGeometry().GetAccumulatedLayoutTransform().GetScale();
+		const float InvScale = (DPIScale > 0.f) ? (1.f / DPIScale) : 1.f;
+
+		// Use MouseEvent.GetCursorDelta(): it is correct in BOTH modes. Under high-precision (non-PIE, cursor
+		// pinned) it carries the raw hardware delta while ScreenSpacePosition is FROZEN (OnRawMouseMove,
+		// SlateApplication.cpp:6253) — a ScreenPos diff would be 0 there. Without high-precision (PIE) it is
+		// (ScreenPos - LastScreenPos), the normal follow-the-mouse delta. Either way it's the per-event motion.
+		const bool bHiPrec = FSlateApplication::Get().IsUsingHighPrecisionMouseMovment();
+		const FVector2D ScrPos = MouseEvent.GetScreenSpacePosition();
+		const FVector2D Delta = MouseEvent.GetCursorDelta();
+		UE_LOG(LogTemp, Warning, TEXT("[HPDbg] MOVE HiPrec=%d ScrPos=(%.1f,%.1f) Delta=(%.2f,%.2f) DPI=%.2f Axis=%d Sel=%d"),
+			bHiPrec ? 1 : 0, ScrPos.X, ScrPos.Y, Delta.X, Delta.Y, DPIScale, PreviewDragAxis, SelectedDigitIndex);
+		if (!Delta.IsNearlyZero())
+			HandlePreviewDrag(Delta * InvScale);
+	}
 	return FReply::Handled();
+}
+
+void SImSlateVirtualKeyboard::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
+{
+	UE_LOG(LogTemp, Warning, TEXT("[HPDbg] CAPTURELOST reached: bPreviewDragging=%d HiPrec=%d"),
+		bPreviewDragging ? 1 : 0,
+		FSlateApplication::Get().IsUsingHighPrecisionMouseMovment() ? 1 : 0);
+	// Pure SSpinBox pattern: just end our own drag bookkeeping. Do NOT issue any ReleaseMouseCapture /
+	// high-precision reply here. OnMouseCaptureLost ALSO fires on the NORMAL button-up path (OnMouseButtonUp's
+	// ReleaseMouseCapture reply → engine ReleaseCapture → this callback). Re-issuing a reply here re-entered
+	// ReleaseCapture and corrupted the global mouse state mid-teardown — high-precision never cleared (HiPrec
+	// stayed 1) and the next drag came up HiPrec=0 with giant deltas. Capture + high-precision are released by
+	// OnMouseButtonUp's reply (normal end) and by the engine itself when capture is taken away; this callback
+	// must only reset OUR flags so a stale drag doesn't linger.
+	EndPreviewMouseDrag();
 }
 
 FReply SImSlateVirtualKeyboard::OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
@@ -1668,6 +2483,9 @@ FReply SImSlateVirtualKeyboard::OnTouchStarted(const FGeometry& MyGeometry, cons
 		bPreviewDragging = true;
 		PreviewDragLastPos = InTouchEvent.GetScreenSpacePosition();
 		PreviewDragAccum = 0.f;
+		PreviewDragAccumY = 0.f;
+		PreviewDragAxis = 0;
+		BeginPreviewSelectAt(InTouchEvent.GetScreenSpacePosition());
 	}
 	return FReply::Handled();
 }
@@ -1675,13 +2493,22 @@ FReply SImSlateVirtualKeyboard::OnTouchStarted(const FGeometry& MyGeometry, cons
 FReply SImSlateVirtualKeyboard::OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
 {
 	if (bPreviewDragging)
-		HandlePreviewDrag(InTouchEvent.GetScreenSpacePosition());
+	{
+		// Touch has no high-precision/raw mode — feed the position diff (converted to LOCAL pixels so the
+		// thresholds match, same as the mouse path) and track the last position.
+		const FVector2D Pos = InTouchEvent.GetScreenSpacePosition();
+		const float DPIScale = GetCachedGeometry().GetAccumulatedLayoutTransform().GetScale();
+		const float InvScale = (DPIScale > 0.f) ? (1.f / DPIScale) : 1.f;
+		HandlePreviewDrag((Pos - PreviewDragLastPos) * InvScale);
+		PreviewDragLastPos = Pos;
+	}
 	return FReply::Handled();
 }
 
 FReply SImSlateVirtualKeyboard::OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
 {
 	bPreviewDragging = false;
+	HidePreviewStepRuler();
 	return FReply::Handled();
 }
 
@@ -1886,19 +2713,40 @@ void SImSlateVirtualKeyboard::OnKeyInput(const FVirtualKeyDef& KeyDef, const FSt
 	if (IsUpperCase() && Text.Len() == 1 && FChar::IsAlpha(Text[0]))
 		Text = Text.ToUpper();
 
-	// On the integer numeric pad, drop digits that aren't valid in the current radix (e.g. typing 2-9
-	// or A-F while in BIN, or A-F while in DEC). '.' and '-' pass (handled by layout availability).
-	if (KeyboardType == EKeyboardType::Number && !NumericParams.bAllowDecimal && Text.Len() == 1)
+	// Calculator: on the DEC numeric pad, the operator keys (+ − * /) arrive here as Char input but are
+	// NOT inserted as text — they drive the calculator state machine instead.
+	if (IsCalcEnabled() && Text.Len() == 1)
 	{
-		const TCHAR C = FChar::ToUpper(Text[0]);
-		const bool bIsDigitChar = (C >= '0' && C <= '9') || (C >= 'A' && C <= 'F');
-		if (bIsDigitChar)
+		const TCHAR C = Text[0];
+		if (C == '+' || C == '-' || C == '*' || C == '/')
 		{
-			const int32 DigitVal = (C <= '9') ? (C - '0') : (10 + (C - 'A'));
-			if (DigitVal >= NumericRadix)
-				return;  // illegal for this base → ignore
+			CalcPressOperator(Text);
+			return;
 		}
 	}
+
+	// Calculator: a digit pressed right after '=' (a result is showing) or right after an operator (the
+	// expression "5+" is showing) starts a FRESH operand — clear the old value first so we don't append
+	// to the previous result / first operand. (Decimal point also counts as starting the operand.)
+	if (IsCalcEnabled() && (bJustEvaluated || bCalcFreshOperand) && Text.Len() == 1)
+	{
+		const TCHAR C = Text[0];
+		const bool bStartsOperand = (C >= '0' && C <= '9') || C == '.';
+		if (bStartsOperand)
+		{
+			CurrentText.Reset();
+			CursorPosition = 0;
+			CalcExpr.Reset();          // leave expression-display mode; preview now follows the new operand
+			CalcCursorPos = 0;
+			bJustEvaluated = false;
+			bCalcFreshOperand = false;
+		}
+	}
+
+	// Numeric pad: reject any character that isn't valid for this field (letters f/d/g, punctuation, A-F in
+	// DEC, etc.). Operators / '=' were handled above. Shared whitelist with the physical-key path (OnKeyChar).
+	if (Text.Len() == 1 && !IsCharAllowedForNumeric(Text[0]))
+		return;
 
 	InsertText(Text);
 
@@ -1907,6 +2755,7 @@ void SImSlateVirtualKeyboard::OnKeyInput(const FVirtualKeyDef& KeyDef, const FSt
 
 	UpdatePreview();
 	UpdateSuggestions();
+	UpdateSignKey();  // ± label tracks the (possibly changed) value sign; no-op outside signed DEC numeric
 }
 
 void SImSlateVirtualKeyboard::OnKeyAction(EVirtualKeyAction Action)
@@ -1914,10 +2763,8 @@ void SImSlateVirtualKeyboard::OnKeyAction(EVirtualKeyAction Action)
 	switch (Action)
 	{
 	case EVirtualKeyAction::Backspace:
-		if (CursorPosition > 0)
+		if (DeleteBackwardWithUndo())
 		{
-			BackspaceUndoBuffer += CurrentText[CursorPosition - 1];
-			DeleteBackward();
 			UpdatePreview();
 			UpdateSuggestions();
 		}
@@ -1948,11 +2795,9 @@ void SImSlateVirtualKeyboard::OnKeyAction(EVirtualKeyAction Action)
 		UpdatePreview();
 		break;
 	case EVirtualKeyAction::UndoBackspace:
-		if (BackspaceUndoBuffer.Len() > 0)
+		if (BackspaceUndoStack.Num() > 0)
 		{
-			FString Ch = BackspaceUndoBuffer.Right(1);
-			BackspaceUndoBuffer.RemoveAt(BackspaceUndoBuffer.Len() - 1);
-			InsertText(Ch);
+			UndoBackspaceFromStack();
 			UpdatePreview();
 			UpdateSuggestions();
 		}
@@ -1981,6 +2826,35 @@ void SImSlateVirtualKeyboard::OnKeyAction(EVirtualKeyAction Action)
 	case EVirtualKeyAction::StepDown:
 		ApplyNumericStep(-1);
 		break;
+	case EVirtualKeyAction::Equals:
+		CalcPressEquals();
+		break;
+	case EVirtualKeyAction::SignToggle:
+	{
+		// Preview-row ± key: flip the sign of the current value, clamped. Calculator-aware: if an
+		// expression is mid-build the ± applies to the value (rare; ± is hidden in expr mode anyway).
+		const bool bFloat = NumericParams.bAllowDecimal && NumericRadix == 10;
+		if (bFloat)
+		{
+			double V = -FCString::Atod(*CurrentText);
+			if (NumericParams.Min.IsSet()) V = FMath::Max(V, NumericParams.Min.GetValue());
+			if (NumericParams.Max.IsSet()) V = FMath::Min(V, NumericParams.Max.GetValue());
+			CurrentText = FString::SanitizeFloat(V);
+		}
+		else
+		{
+			int64 V = -FCString::Strtoi64(*CurrentText, nullptr, NumericRadix);
+			if (NumericParams.Min.IsSet()) V = FMath::Max(V, (int64)NumericParams.Min.GetValue());
+			if (NumericParams.Max.IsSet()) V = FMath::Min(V, (int64)NumericParams.Max.GetValue());
+			CurrentText = FormatIntInRadix(V, NumericRadix, NumericParams.BitWidth);
+		}
+		CursorPosition = CurrentText.Len();
+		UpdatePreview();
+		UpdateSuggestions();
+		UpdateSignKey();      // preview-row ± switch key repaints to show the new current/target signs
+		// (Grid ± key is a fixed "±" glyph, so no keyboard rebuild is needed here.)
+		break;
+	}
 	default:
 		break;
 	}
@@ -2000,6 +2874,19 @@ FReply SImSlateVirtualKeyboard::OnKeyChar(const FGeometry& MyGeometry, const FCh
 	// char event may leak to the layer underneath.
 	if (Ch < 32 || Ch == 127 || Ch == TEXT(' '))
 		return FReply::Handled();
+
+	// Numeric pad: route physical chars through OnKeyInput so they get the SAME treatment as on-screen keys
+	// — operators (+ − * /) drive the calculator, '=' ... (handled in OnKeyDown), and the numeric whitelist
+	// rejects letters/punctuation. Digits/operators have no case, so the re-casing concern (below) doesn't
+	// apply here. Other layouts keep inserting verbatim (OS already applied Shift/CapsLock).
+	if (KeyboardType == EKeyboardType::Number)
+	{
+		FVirtualKeyDef Tmp;
+		Tmp.Action = EVirtualKeyAction::Char;
+		Tmp.Value = FString::Chr(Ch);
+		OnKeyInput(Tmp, Tmp.Value);
+		return FReply::Handled();
+	}
 
 	InsertText(FString::Chr(Ch));
 	UpdatePreview();

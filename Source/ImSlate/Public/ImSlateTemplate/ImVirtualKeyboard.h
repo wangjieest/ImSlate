@@ -28,6 +28,8 @@ enum class EVirtualKeyAction : uint8
 	ToggleType,
 	StepUp,    // numeric keypad: value += step (clamped to [Min,Max])
 	StepDown,  // numeric keypad: value -= step
+	Equals,    // numeric calculator: evaluate the pending operation (=) ; repeated '=' repeats last op
+	SignToggle,// numeric calculator: flip the sign of the current value (preview-row ± key)
 };
 
 // Swipe direction. Public (was SImSlateKey's private nested enum) so the continuous step callback
@@ -110,6 +112,8 @@ struct FImNumericKeyboardParams
 	bool bAllowDecimal = true;    // false (integer types) → hide the '.' key
 	bool bAllowNegative = true;   // false (unsigned types) → hide the '-' key
 	bool bHex = false;            // true → add A-F keys (hexadecimal entry)
+	int32 BitWidth = 0;           // integer bit width 8/16/32/64 (0 = float / unknown). Drives HEX two's-
+	                              // complement display (FF / FFFFFFFF) and base-switch sign extension.
 	TOptional<double> Min;        // clamp lower bound for step keys (and typed entry)
 	TOptional<double> Max;        // clamp upper bound
 	TOptional<double> Step;       // when set, the keypad shows +/- step keys (SpinBox-like)
@@ -161,6 +165,14 @@ public:
 	virtual FReply OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	virtual FReply OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
 	virtual FReply OnMouseMove(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override;
+	// Preview-drag safety net: if capture is yanked (drag out of viewport in editor / windowed desktop,
+	// alt-tab, focus steal) no button-up arrives, so end the drag + drop the ruler here to avoid getting
+	// stuck in bPreviewDragging.
+	virtual void OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent) override;
+	// Hide the OS cursor during a value-scrub. Slate re-queries the cursor every frame via OnCursorQuery and
+	// would otherwise overwrite a direct SetPlatformCursorVisibility(false); returning None here is the
+	// engine-sanctioned way (same as SImSlateVirtualList's right-drag scroll).
+	virtual FCursorReply OnCursorQuery(const FGeometry& MyGeometry, const FPointerEvent& CursorEvent) const override;
 	virtual FReply OnMouseButtonDoubleClick(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override { return FReply::Handled(); }
 	virtual FReply OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
 	virtual FReply OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent) override;
@@ -226,6 +238,21 @@ private:
 	EKeyboardType KeyboardType = EKeyboardType::QWERTY;
 	FImNumericKeyboardParams NumericParams;  // shapes the numeric keypad (set from Show params)
 	int32 NumericRadix = 10;                 // integer entry base: 10 / 16 / 2 (radix-toggle key cycles)
+
+	// ---- Numeric calculator state (DEC base only; OCT/HEX have no operators) ----
+	// The keypad doubles as a calculator: digits build CurrentText (the "current operand", a valid
+	// number), operator keys (+ − * /) capture it as StoredOperand and append to CalcExpr, '=' folds
+	// the pending op into a result. preview shows CalcExpr while building (e.g. "5+3"); CurrentText (the
+	// value synced to the bound field via OnTextChanged) is only rewritten when '=' produces a result.
+	FString CalcExpr;            // displayed expression string while building (empty = plain numeric mode)
+	int32 CalcCursorPos = 0;     // caret position WITHIN CalcExpr (expression mode only; left/right drag moves it
+	                             // for visual browsing — input still appends to the end via the state machine)
+	FString PendingOperator;     // "+"/"-"/"*"/"/", empty = none pending
+	double StoredOperand = 0.0;  // first operand captured when an operator was pressed
+	bool bCalcFreshOperand = true;  // true → the next digit starts a NEW operand (clears CurrentText first)
+	FString RepeatOperator;      // last evaluated operator, for repeated '=' (5+3=8, =11, =14)
+	double RepeatOperand = 0.0;  // last evaluated second operand, for repeated '='
+	bool bJustEvaluated = false; // last action was '=' → next digit starts fresh; bare '=' repeats
 	FString HistoryKey;                      // non-empty → input history enabled (set from Show params)
 	TFunction<bool(const FString&)> HistoryFilter;  // only entries passing this are recorded
 	int32 HistoryMax = 10;                   // per-key cap (from Show params); default 10
@@ -237,7 +264,16 @@ private:
 	FString CurrentText;
 	int32 CursorPosition = 0;
 	FString OriginalText;
-	FString BackspaceUndoBuffer;
+	// Backspace undo HISTORY: a stack of deletions, each remembering WHAT was removed and WHERE (the text
+	// index it sat at), so a right-swipe undo restores the exact characters at their original positions —
+	// even if the caret moved between the delete and the undo. One entry per delete step; a "Clr" that
+	// removes a run stores the whole run as a single entry (Text = the run, Pos = its start index).
+	struct FBackspaceUndoEntry
+	{
+		FString Text;   // the removed character(s)
+		int32 Pos = 0;  // the index in CurrentText where it was removed from
+	};
+	TArray<FBackspaceUndoEntry> BackspaceUndoStack;
 
 	TFunction<void(const FString&, ETextCommit::Type)> CommitCallback;
 	TFunction<void(const FString&)> OnTextChanged;
@@ -247,15 +283,46 @@ private:
 	TSharedPtr<class SBorder> PreviewBorder;
 	TSharedPtr<class SWidget> BackgroundBlocker;  // full-screen modal hit-blocker
 	// Toggle-type + Done keys flanking the preview row (persist across BuildKeyboard).
-	TSharedPtr<class SImSlateKey> ToggleTypeKey;
+	// ToggleType is a two-state switch key (radix DEC/HEX, type T26/T9); its labels are pulled live via
+	// TAttribute from KeyboardType/NumericRadix (UpdateToggleTypeLabel just invalidates it to repaint).
+	TSharedPtr<class SImSwitchKey> ToggleTypeKey;
 	TSharedPtr<class SImSlateKey> DoneKey;
-	TSharedPtr<FVirtualKeyDef> ToggleTypeKeyDef;
 	TSharedPtr<FVirtualKeyDef> DoneKeyDef;
+	// Sign (±) key on the preview row, right of the radix key. Shown only for signed numeric input whose
+	// range allows a negative; label tracks the current value's sign (value≥0 → "−" to go negative;
+	// value<0 → "+" to go positive). Tapping flips the current value's sign (clamped).
+	// Sign (±) key — a two-state switch key (like DEC/HEX): current sign big top-left, the sign a tap
+	// switches TO small bottom-right, with a diagonal slash. Labels pulled live from the value's sign.
+	TSharedPtr<class SImSwitchKey> SignKey;
+	// Backspace (⌫) key on the preview row, left of Done (the numeric grid has no room for it). Persistent.
+	TSharedPtr<class SImSlateKey> PreviewBackspaceKey;
+	TSharedPtr<FVirtualKeyDef> PreviewBackspaceKeyDef;
 	TSharedPtr<FActiveTimerHandle> CursorBlinkTimer;
 	bool bCursorVisible = true;
 	bool bPreviewDragging = false;
+	// Re-entrancy guard for OnMouseCaptureLost. That callback fires from FSlateUser::ReleaseCapture BEFORE the
+	// captor is removed from the map (SlateUser.cpp:290 callback, :297 removal), so HasMouseCapture() is still
+	// true inside it. We need to re-issue a ReleaseMouseCapture reply there to turn high-precision back off
+	// (the engine only does that via ProcessReply:3578), but that reply walks ReleaseCapture again and would
+	// re-enter this same callback → infinite recursion. This flag short-circuits the nested entry.
+	bool bInCaptureLostCleanup = false;
 	FVector2D PreviewDragLastPos = FVector2D::ZeroVector;
-	float PreviewDragAccum = 0.f;
+	float PreviewDragAccum = 0.f;   // horizontal travel accumulator (switch selected digit, per cell×1.1)
+	float PreviewDragAccumY = 0.f;  // vertical travel accumulator (adjust selected digit, per StepW)
+	int32 PreviewDragAxis = 0;      // locked drag axis: 0=undecided, 1=horizontal(select), 2=vertical(value)
+	// Self-simulated "high-precision" mouse for the value scrub (UE's native UseHighPrecisionMouseMovement
+	// is disabled in our virtual-window environment). Mouse only: on press we hide the cursor and remember
+	// its screen pos as the anchor; each move computes delta = current - anchor, applies it, then warps the
+	// cursor back to the anchor (so it stays pinned and the drag is effectively infinite). The warp itself
+	// fires a synthetic OnMouseMove which we must skip.
+	FVector2D PreviewDragAnchorScreen = FVector2D::ZeroVector;
+	bool bPreviewIgnoreSyntheticMove = false;
+	// Preview digit-scrub: the currently highlighted/adjusted DIGIT char index (INDEX_NONE = none). Set on
+	// press (hit-test), moved left/right by horizontal drag (with 10% elastic threshold), value-adjusted by
+	// vertical drag. Numeric pad + plain-numeric (non-expression) state only.
+	int32 SelectedDigitIndex = INDEX_NONE;
+	TSharedPtr<class SImStepRuler> PreviewStepRuler;  // value-axis ruler overlaid on the preview during vertical scrub
+	TSharedPtr<class SWidget> PreviewStepRulerHost;   // the SBox slot wrapper in RootOverlay (for clean removal)
 	TSharedPtr<class SWrapBox> SuggestionBar;
 	// Current candidate list + keyboard-navigated selection. SelectedSuggestionIndex == -1 means no
 	// selection (Up/Down haven't been used, or input changed). Up/Down move it; Enter on a selected
@@ -321,9 +388,24 @@ private:
 
 	bool IsUpperCase() const;
 	bool IsInPreviewArea(const FVector2D& AbsPos) const;
-	void HandlePreviewDrag(const FVector2D& ScreenPos);
+	void HandlePreviewDrag(const FVector2D& Delta);  // Delta = per-move cursor delta (high-precision mouse / touch)
+	void EndPreviewMouseDrag();  // end a mouse value-scrub: restore cursor (back to press point + visible)
+	void BeginPreviewSelectAt(const FVector2D& AbsScreenPos);  // on press: hit-test + set initial highlighted digit
+	void MoveSelectedDigit(int32 Dir);        // preview: move highlight to the next digit char in Dir (skips -/.)
+	void ClearDigitHighlight();               // drop the preview digit selection (text structure changed)
+	// True if Ch may be inserted as text on the numeric pad (digit valid in radix, or '.'/'-' when allowed).
+	// Non-numeric layouts always allow. Shared by OnKeyInput (on-screen) and OnKeyChar (physical) so letters
+	// never leak into a numeric field from either path.
+	bool IsCharAllowedForNumeric(TCHAR Ch) const;
+	void ShowPreviewStepRuler();              // preview vertical scrub: overlay the value-axis ruler on the preview
+	void HidePreviewStepRuler();              // remove the preview ruler (on release)
 	void InsertText(const FString& Text);
 	void DeleteBackward();
+	// Backspace-at-caret WITH undo: delete the char left of the caret and push it (with its index) onto the
+	// undo stack. Returns true if a char was deleted. (Plain DeleteBackward does not record undo.)
+	bool DeleteBackwardWithUndo();
+	void PushBackspaceUndo(const FString& RemovedText, int32 Pos);  // record a deletion for later undo
+	void UndoBackspaceFromStack();                                  // pop + reinsert at the recorded position
 	void MoveCursor(int32 Delta);
 	void ToggleShift();
 
@@ -339,7 +421,19 @@ private:
 	void AdjustDigitAtCursor(int32 Direction);         // up/down on cursor key: ±1 the digit at caret, with carry, clamped
 	void ClearNumericValue();                          // Del swipe-up Clr in Number mode: set to 0, or the clamp bound nearest 0
 	void CycleNumericRadix();                          // integer keypad: DEC→HEX→OCT→DEC, converts current value
-	static FString FormatIntInRadix(int64 Value, int32 Radix);  // integer → string in base 10/16/2
+	// integer → string. DEC: signed decimal. HEX: two's-complement at BitWidth (negative → FF.., zero-padded
+	// to BitWidth/4 nibbles), never a '-' sign. BitWidth 0 → HEX uses 64-bit mask, no zero-padding.
+	static FString FormatIntInRadix(int64 Value, int32 Radix, int32 BitWidth = 0);
+
+	// ---- Numeric calculator ----
+	bool IsCalcEnabled() const;                        // true only on DEC numeric pad (radix 10)
+	void CalcPressOperator(const FString& Op);         // + − * / : fold any pending op, capture operand, start expr
+	void CalcPressEquals();                            // = : evaluate pending op (or repeat last) → result in CurrentText
+	double CalcCompute(double A, double B, const FString& Op, bool& bOutDivZero) const;  // A op B, int/float aware
+	void CalcWriteResult(double Value);                // clamp + format Value into CurrentText, sync field, exit expr mode
+	void CalcReset();                                  // clear all calculator memory (expr + pending + repeat)
+	FString CalcFormatNumber(double Value) const;      // format per int/float type (no radix; calc is DEC-only)
+	void UpdateSignKey();                              // refresh ± key label (sign of current value) + visibility
 
 };
 

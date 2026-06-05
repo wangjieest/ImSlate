@@ -67,8 +67,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, config)
 	TSubclassOf<UImCheckBox> ImSlateCheckBox = UImCheckBox::StaticClass();
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, config)
-	TSubclassOf<UImSlateNumericWidget> ImSlateNumericWidget = UImSlateNumericWidget::StaticClass();
+	// NOTE: no ImSlateNumericWidget override here. The numeric widget base (UImSlateNumericWidget) is
+	// ABSTRACT with six concrete templated subclasses (Float/Double/Int32/...), so there is no single
+	// representative class to register. Registering the abstract base made FindData's super-chain lookup
+	// resolve concrete subclasses to the abstract base → StaticAllocateObject crash. ImFactoryCreate now
+	// falls back to the concrete InClass (see GetDefaultImpl), so numeric widgets need no entry here.
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, config)
 	TSubclassOf<UImImage> ImSlateImage = UImImage::StaticClass();

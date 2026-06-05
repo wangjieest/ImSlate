@@ -263,6 +263,25 @@ public:
 		.MinDesiredWidth(InArgs._MinDesiredValueWidth)
 		.ToolTipText(this, &SImNumericWidget<NumericType>::GetValueAsText);
 
+		// Shape the virtual keyboard to the EXACT bound type (NumericType is known at compile time): integer
+		// types hide the decimal point, unsigned types hide the sign (± key) entirely. Without this the
+		// keypad fell back to its defaults (float, signed) for every numeric widget, so e.g. a uint32 field
+		// still showed '.' and ±. Min/Max are intentionally left unset here — clamp range is driven by the
+		// explicit SetMinValue/SetMaxValue calls, not by the type's numeric_limits.
+		{
+			const bool bIsFloat = TIsFloatingPoint<NumericType>::Value;
+			const bool bIsSigned = TIsSigned<NumericType>::Value;  // false for uint32/uint64 → no ± key
+			const int32 BitWidth = bIsFloat ? 0 : (int32)(sizeof(NumericType) * 8);  // 8/16/32/64; HEX two's-comp width
+			// EditableText is declared as the base SEditableText; SetNumericParams lives on our SImEditableText
+			// (it's always constructed as one via SAssignNew above), so cast to call it.
+			if (TSharedPtr<SImEditableText> ImEdit = StaticCastSharedPtr<SImEditableText>(EditableText))
+			{
+				ImEdit->SetNumericParams(/*decimal*/ bIsFloat, /*negative*/ bIsSigned, /*hex*/ false,
+					/*Min*/ TOptional<double>(), /*Max*/ TOptional<double>(), /*Step*/ TOptional<double>(),
+					/*BitWidth*/ BitWidth);
+			}
+		}
+
 		TSharedRef<SHorizontalBox> HorizontalBox = SNew(SHorizontalBox);
 
 		if (InArgs._Label.Widget != SNullWidget::NullWidget)

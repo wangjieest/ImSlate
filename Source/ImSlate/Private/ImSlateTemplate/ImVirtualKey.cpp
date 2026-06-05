@@ -102,8 +102,9 @@ int32 SImSlateKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeom
 	bool bDrawnIcon = false;
 	if (KeyDef->Action == EVirtualKeyAction::Backspace)
 	{
+		// Backspace: a tag/arrow outline (point on the left) with an "×" inside the right portion.
+		float W = IconSize * 0.9f, H = IconSize * 0.62f;
 		TArray<FVector2D> Points;
-		float W = IconSize * 0.8f, H = IconSize * 0.55f;
 		Points.Add(Center + FVector2D(-W, 0));
 		Points.Add(Center + FVector2D(-W * 0.3f, -H));
 		Points.Add(Center + FVector2D(W, -H));
@@ -111,6 +112,14 @@ int32 SImSlateKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeom
 		Points.Add(Center + FVector2D(-W * 0.3f, H));
 		Points.Add(Center + FVector2D(-W, 0));
 		FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(), Points, ESlateDrawEffect::None, IconColor, true, 1.5f);
+
+		// The "×" inside the box's right half (clear of the left point). Two crossing strokes.
+		const float Cx = Center.X + W * 0.35f;    // × center x: right portion of the tag
+		const float R = H * 0.5f;                  // × half-extent (stays inside top/bottom edges)
+		TArray<FVector2D> D1 = { FVector2D(Cx - R, Center.Y - R), FVector2D(Cx + R, Center.Y + R) };
+		TArray<FVector2D> D2 = { FVector2D(Cx - R, Center.Y + R), FVector2D(Cx + R, Center.Y - R) };
+		FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(), D1, ESlateDrawEffect::None, IconColor, true, 1.5f);
+		FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(), D2, ESlateDrawEffect::None, IconColor, true, 1.5f);
 		bDrawnIcon = true;
 	}
 	else if (KeyDef->Action == EVirtualKeyAction::Shift)
@@ -188,9 +197,21 @@ int32 SImSlateKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeom
 		// Prefer the swipe-up symbol as the hint (T26 punctuation like ',' over the '.' key, etc.);
 		// fall back to Value (the T9 number) when there's no swipe-up. (Width-based detection was wrong:
 		// a WIDE punctuation key like the bottom '.' is also >=2 wide but should show its swipe-up ','.)
-		FString HintText = KeyDef->Swipe.Up.Label;
-		if (HintText.IsEmpty())
+		// T9 keys (wide, WidthMultiplier>=2): show the NUMBER (Value) top-right ONLY — their Swipe.Up is a
+		// letter (e.g. 'a'), which must NOT appear as a centered hint. Other keys (narrow): show the
+		// swipe-up symbol (e.g. ',' over the '.' key) top-centered.
+		const bool bIsT9 = (KeyDef->WidthMultiplier >= 2.f);
+		FString HintText;
+		bool bHintIsNumber = false;          // true → T9 number (Value), shown top-RIGHT
+		if (bIsT9)
+		{
 			HintText = KeyDef->Value;
+			bHintIsNumber = !HintText.IsEmpty();
+		}
+		else
+		{
+			HintText = KeyDef->Swipe.Up.Label;
+		}
 
 		// Skip the hint when it duplicates the main label (e.g. the T9 "0" key, whose label AND number
 		// are both "0" → don't draw a second 0 stacked on top).
@@ -202,8 +223,11 @@ int32 SImSlateKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeom
 			FSlateFontInfo HintFont = GetImSlateDefaultFont(7);
 			FLinearColor HintColor(0.72f, 0.72f, 0.72f, 0.95f * Dim);  // brighter so thin glyphs like ',' read
 			FVector2D HintSize = (FVector2D)FontMeasure->Measure(HintText, HintFont);
-			float TopMargin = 1.f;
-			FVector2D HintPos((LocalSize.X - HintSize.X) * 0.5f, TopMargin);  // top-centered, hugging the top edge
+			const float Margin = 3.f;
+			// T9 number hint → top-RIGHT corner (per request). Swipe-up symbol hint → top-centered.
+			FVector2D HintPos = bHintIsNumber
+				? FVector2D(LocalSize.X - HintSize.X - Margin, Margin)
+				: FVector2D((LocalSize.X - HintSize.X) * 0.5f, 1.f);
 			FSlateDrawElement::MakeText(OutDrawElements, LayerId + 1,
 				AllottedGeometry.ToPaintGeometry(HintSize, FSlateLayoutTransform(1.f, UE::Slate::CastToVector2f(HintPos))),
 				HintText, HintFont, ESlateDrawEffect::None, HintColor);
@@ -665,6 +689,108 @@ static FSlateBrush& GetPopupBgBrush()
 	return Brush;
 }
 
+// ==================== SImSwitchKey ====================
+
+void SImSwitchKey::Construct(const FArguments& InArgs)
+{
+	CurrentLabel = InArgs._CurrentLabel;
+	TargetLabel = InArgs._TargetLabel;
+	OnClicked = InArgs._OnClicked;
+}
+
+FVector2D SImSwitchKey::ComputeDesiredSize(float) const
+{
+	const float Scale = GetImSlateKeyboardScale();
+	return FVector2D(32.f * Scale * 1.4f, 32.f * Scale);  // a touch wider than a square key for two labels
+}
+
+int32 SImSwitchKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry, const FSlateRect& MyCullingRect,
+	FSlateWindowElementList& OutDrawElements, int32 LayerId, const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const
+{
+	const FVector2D LocalSize = AllottedGeometry.GetLocalSize();
+
+	// Background (same rounded brush as the regular keys; brighter when pressed).
+	FSlateDrawElement::MakeBox(OutDrawElements, LayerId,
+		AllottedGeometry.ToPaintGeometry(),
+		&GetKeyBrush(bIsPressed),
+		ESlateDrawEffect::None,
+		GetKeyBrush(bIsPressed).TintColor.GetSpecifiedColor());
+
+	TSharedRef<FSlateFontMeasure> FontMeasure = FSlateApplication::Get().GetRenderer()->GetFontMeasureService();
+	const FString TopText = CurrentLabel.Get().ToString();  // current state
+	const FString BotText = TargetLabel.Get().ToString();   // switch target
+
+	// Diagonal slash from bottom-left to top-right (the 中/英 separator).
+	TArray<FVector2D> Slash = {
+		FVector2D(LocalSize.X * 0.18f, LocalSize.Y * 0.82f),
+		FVector2D(LocalSize.X * 0.82f, LocalSize.Y * 0.18f)
+	};
+	FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(), Slash,
+		ESlateDrawEffect::None, FLinearColor(0.5f, 0.5f, 0.5f, 0.7f), true, 1.f);
+
+	// Current state: big, top-left (above the slash). Switch target: small, bottom-right (below it).
+	if (!TopText.IsEmpty())
+	{
+		FSlateFontInfo TopFont = GetImSlateDefaultFont(11);
+		const FVector2D TopSize = (FVector2D)FontMeasure->Measure(TopText, TopFont);
+		const FVector2D TopPos(LocalSize.X * 0.10f, LocalSize.Y * 0.12f);
+		FSlateDrawElement::MakeText(OutDrawElements, LayerId + 1,
+			AllottedGeometry.ToPaintGeometry(TopSize, FSlateLayoutTransform(1.f, UE::Slate::CastToVector2f(TopPos))),
+			TopText, TopFont, ESlateDrawEffect::None, FLinearColor(1.f, 1.f, 1.f, 1.f));
+	}
+	if (!BotText.IsEmpty())
+	{
+		FSlateFontInfo BotFont = GetImSlateDefaultFont(7);
+		const FVector2D BotSize = (FVector2D)FontMeasure->Measure(BotText, BotFont);
+		const FVector2D BotPos(LocalSize.X * 0.90f - BotSize.X, LocalSize.Y * 0.88f - BotSize.Y);
+		FSlateDrawElement::MakeText(OutDrawElements, LayerId + 1,
+			AllottedGeometry.ToPaintGeometry(BotSize, FSlateLayoutTransform(1.f, UE::Slate::CastToVector2f(BotPos))),
+			BotText, BotFont, ESlateDrawEffect::None, FLinearColor(0.62f, 0.62f, 0.62f, 0.95f));
+	}
+	return LayerId + 1;
+}
+
+FReply SImSwitchKey::OnMouseButtonDown(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton)
+	{
+		bIsPressed = true;
+		return FReply::Handled().CaptureMouse(SharedThis(this));
+	}
+	return FReply::Unhandled();
+}
+
+FReply SImSwitchKey::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
+{
+	if (MouseEvent.GetEffectingButton() == EKeys::LeftMouseButton && HasMouseCapture())
+	{
+		bIsPressed = false;
+		// Fire only if released inside the key (standard button behaviour).
+		if (MyGeometry.IsUnderLocation(MouseEvent.GetScreenSpacePosition()))
+			OnClicked.ExecuteIfBound();
+		return FReply::Handled().ReleaseMouseCapture();
+	}
+	return FReply::Unhandled();
+}
+
+FReply SImSwitchKey::OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
+{
+	bIsPressed = true;
+	return FReply::Handled().CaptureMouse(SharedThis(this));
+}
+
+FReply SImSwitchKey::OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
+{
+	if (HasMouseCapture())
+	{
+		bIsPressed = false;
+		if (MyGeometry.IsUnderLocation(InTouchEvent.GetScreenSpacePosition()))
+			OnClicked.ExecuteIfBound();
+		return FReply::Handled().ReleaseMouseCapture();
+	}
+	return FReply::Unhandled();
+}
+
 void SImSlateKeyPopup::Construct(const FArguments& InArgs)
 {
 	Chars = InArgs._Chars;
@@ -756,15 +882,13 @@ int32 SImStepRuler::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeo
 	// (step points) reach deeper and are thicker; short ticks (subdivisions) are shallow and thin.
 	// Vertical ticks (cursor axis) grow DOWN from the TOP edge; horizontal ticks (value axis) grow
 	// LEFT from the RIGHT edge.
-	const float LongFrac  = 0.31f;   // long tick depth as fraction of the cross-axis extent (halved)
-	const float ShortFrac = 0.15f;   // short tick depth (halved)
 	const float LongThick = 1.8f;
 	const float ShortThick = 1.0f;
 	auto DrawTick = [&](float P, bool bLong)
 	{
 		const FLinearColor C = bLong ? LongTick : ShortTick;
 		const float Thick = bLong ? LongThick : ShortThick;
-		const float Frac  = bLong ? LongFrac : ShortFrac;
+		const float Frac  = bLong ? LongFrac : ShortFrac;  // member fractions (preview overrides to 1.0 / 0.5)
 		if (Axis == EOrientation::Orient_Vertical)
 		{
 			// vertical tick at X=P, grows down from the top edge (y=0).

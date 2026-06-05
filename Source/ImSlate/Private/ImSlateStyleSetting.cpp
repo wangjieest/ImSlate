@@ -27,8 +27,16 @@ namespace Factory
 	UClass* GetDefaultImpl(TSubclassOf<UWidget> InClass)
 	{
 		check(InClass.Get());
+		// FindData walks the SUPER chain, so a query for a concrete subclass (e.g. UImNumericFloatWidget)
+		// can resolve to a mapping registered on a base class. If that mapping points at an ABSTRACT class
+		// (e.g. the numeric widget base UImSlateNumericWidget, which has six concrete templated subclasses
+		// and no single representative), instantiating it would crash in StaticAllocateObject. Fall back to
+		// the concrete InClass whenever the resolved class is missing or abstract.
 		FDefalutClassData* Ptr = DefaultClassStorage.FindData(InClass.Get());
-		return ensure(Ptr && Ptr->Class) ? Ptr->Class : InClass;
+		UClass* Resolved = (Ptr && Ptr->Class) ? Ptr->Class.Get() : nullptr;
+		if (!Resolved || Resolved->HasAnyClassFlags(CLASS_Abstract))
+			return InClass;
+		return Resolved;
 	}
 
 	void ModifyDefault(UClass* InClass, UClass* InNativeClass)
@@ -76,7 +84,7 @@ void UXImSlateStyleSetting::PreloadClasses() const
 	ModifyDefault(ImSlateEditableText);
 	ModifyDefault(ImSlateSpinBox);
 	ModifyDefault(ImSlateCheckBox);
-	ModifyDefault(ImSlateNumericWidget);
+	// ImSlateNumericWidget removed: abstract base, no single representative class (see header note).
 	ModifyDefault(ImSlateColorWidget);
 	ModifyDefault(ImSlateMobilityWidget);
 	ModifyDefault(ImSlateImage);
