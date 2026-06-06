@@ -11,7 +11,6 @@
 #include "Engine/GameViewportClient.h"
 #include "UnrealClient.h"
 #include "Framework/Application/SlateApplication.h"
-#include "GenericPlatform/GenericWindow.h"  // FGenericWindow::IsForegroundWindow ([HPDbg] lock gate, SlateUser.cpp:982)
 #include "HAL/PlatformApplicationMisc.h"  // FPlatformApplicationMisc::ClipboardPaste
 #include "Framework/Text/TextLayout.h"
 #include "Widgets/Input/SEditableText.h"
@@ -77,37 +76,13 @@ static float GetKbScale()
 	// Cap the keyboard to a fraction of the viewport height by clamping the scale. We need both the
 	// viewport height and the keyboard's natural per-unit-scale height; both are measured at runtime
 	// (see Tick). Until measured, no cap is applied.
-	float MaxScaleDbg = -1.f;  // [KbSizeDbg]
 	if (GKeyboardMaxHeightFraction > 0.f && GCachedViewportHeight > 0.f && GCachedKeyboardUnitHeight > 0.f)
 	{
 		const float MaxH = GCachedViewportHeight * GKeyboardMaxHeightFraction;
 		const float MaxScale = MaxH / GCachedKeyboardUnitHeight;
-		MaxScaleDbg = MaxScale;  // [KbSizeDbg]
 		Scale = FMath::Min(Scale, MaxScale);
 	}
 	Scale = FMath::Max(Scale, 0.1f);
-
-	// [KbSizeDbg] TEMP — diagnose PIE vs non-PIE keyboard size mismatch. The final scale is clamped
-	// by the viewport height (Plan A). Log only when an input changes (GetKbScale runs every frame).
-	// EffScale = GetImSlateEffectiveScale() (= DPIScaleAtPoint × LayoutScale on desktop); ViewportH =
-	// cached AllottedGeometry.Y; UnitH = content height at scale 1; MaxScale = ViewportH×Frac/UnitH;
-	// Capped = whether the height-cap won over BaseScale. If PIE shows a smaller ViewportH → smaller
-	// MaxScale → smaller final Scale, the size difference is the cap, not the DPI.
-	{
-		static float LastEff = -1.f, LastVpH = -1.f, LastUnitH = -1.f, LastFinal = -1.f;
-		const float EffScale = GetImSlateEffectiveScale();
-		if (!FMath::IsNearlyEqual(EffScale, LastEff, 0.001f) ||
-			!FMath::IsNearlyEqual(GCachedViewportHeight, LastVpH, 0.1f) ||
-			!FMath::IsNearlyEqual(GCachedKeyboardUnitHeight, LastUnitH, 0.1f) ||
-			!FMath::IsNearlyEqual(Scale, LastFinal, 0.001f))
-		{
-			LastEff = EffScale; LastVpH = GCachedViewportHeight; LastUnitH = GCachedKeyboardUnitHeight; LastFinal = Scale;
-			UE_LOG(LogTemp, Warning, TEXT("[KbSizeDbg] GIsEditor=%d EffScale=%.3f KbMult=%.2f BaseScale=%.3f ViewportH=%.1f UnitH=%.1f Frac=%.2f MaxScale=%.3f Capped=%d FinalScale=%.3f"),
-				GIsEditor ? 1 : 0, EffScale, GImSlateKeyboardScale, BaseScale,
-				GCachedViewportHeight, GCachedKeyboardUnitHeight, GKeyboardMaxHeightFraction,
-				MaxScaleDbg, (MaxScaleDbg >= 0.f && MaxScaleDbg < BaseScale) ? 1 : 0, Scale);
-		}
-	}
 	return Scale;
 }
 
@@ -2332,58 +2307,32 @@ FReply SImSlateVirtualKeyboard::OnMouseButtonDown(const FGeometry& MyGeometry, c
 {
 	if (IsInPreviewArea(MouseEvent.GetScreenSpacePosition()))
 	{
-		// [HPDbg] If bPreviewDragging is ALREADY true here, the previous drag never closed (leaked flag) — the
-		// root cause we're hunting. Logs whether each new press starts from a clean state.
-		if (bPreviewDragging)
-			UE_LOG(LogTemp, Warning, TEXT("[HPDbg] DOWN found STALE bPreviewDragging=1 (previous drag never ended)"));
+		// Start every press from a CLEAN drag state regardless of how the previous one ended (leaked flags from
+		// SetCursorPos-synthesized moves, lost capture, etc.) — don't trust prior teardown.
+		bPreviewIgnoreSyntheticMove = false;
 		bPreviewDragging = true;
 		PreviewDragLastPos = MouseEvent.GetScreenSpacePosition();
 		PreviewDragAccum = 0.f;
 		PreviewDragAccumY = 0.f;
 		PreviewDragAxis = 0;
 		BeginPreviewSelectAt(MouseEvent.GetScreenSpacePosition());
-		// Remember the press point (the EVENT position — GetCursorPos() returns (0,0) in this virtual-window
-		// environment) so we can restore the cursor THERE on release. We don't warp every frame (SetCursorPos
-		// is unreliable here, which caused the oscillation); we only set it once on release and accept it may
-		// occasionally not land — the cursor stays hidden during the whole scrub, so a missed restore just
-		// shows the cursor at the release point, never "flies off" (value scrubbing uses GetCursorDelta).
+		// Remember the press point so we can restore the cursor THERE on release (only meaningful under
+		// high-precision, where the cursor is pinned + hidden — see EndPreviewMouseDrag).
 		PreviewDragAnchorScreen = MouseEvent.GetScreenSpacePosition();
-		// Two-layer mouse pinning:
-		//  • UseHighPrecisionMouseMovement → in NON-PIE (real native game window) the OS stops updating the
-		//    visible cursor, so it's TRULY pinned in place, and moves arrive as raw deltas (OnRawMouseMove,
-		//    SlateApplication.cpp:6253: CursorDelta = raw X/Y, while ScreenSpacePosition is FROZEN at GetCursorPos).
-		//  • CaptureMouse → keep receiving moves outside the widget; also the fallback path in PIE, where
-		//    high-precision is blocked by bIsVirtualInteraction (SlateApplication.cpp:3536) and the cursor
-		//    can't be pinned — there we just hide it (OnCursorQuery → None).
-		// CRITICAL: OnMouseMove must read MouseEvent.GetCursorDelta() (NOT a ScreenSpacePosition diff): under
-		// high-precision ScreenSpacePosition is frozen, so a position diff would always be 0. GetCursorDelta
-		// is correct in BOTH modes (raw delta when high-precision, pos-minus-last otherwise).
-		// [HPDbg] one-shot env probe on press: GIsEditor distinguishes PIE (editor process) from a real
-		// packaged/desktop runtime; IsVirtualWindow tells whether the event's top window is an SVirtualWindow
-		// (the thing that blocks high-precision via bIsVirtualInteraction). High-precision engages AFTER this
-		// reply is processed, so we log its state again in OnMouseMove.
-		{
-			const TSharedPtr<SWindow> TopWin = FSlateApplication::Get().FindWidgetWindow(SharedThis(this));
-			// Foreground = the exact gate LockCursorInternal checks (SlateUser.cpp:982 NativeWindow->IsForegroundWindow()).
-			//   1 → lock will actually clip the cursor; 0 → LockCursorInternal silently no-ops; -1 → no valid NativeWindow.
-			const TSharedPtr<const FGenericWindow> NativeWin = TopWin.IsValid() ? TopWin->GetNativeWindow() : nullptr;
-			const int32 ForegroundState = NativeWin.IsValid() ? (NativeWin->IsForegroundWindow() ? 1 : 0) : -1;
-			UE_LOG(LogTemp, Warning, TEXT("[HPDbg] DOWN GIsEditor=%d TopWindowVirtual=%d HiPrecNow=%d Foreground=%d Anchor=(%.1f,%.1f)"),
-				GIsEditor ? 1 : 0,
-				TopWin.IsValid() ? (TopWin->IsVirtualWindow() ? 1 : 0) : -1,
-				FSlateApplication::Get().IsUsingHighPrecisionMouseMovment() ? 1 : 0,
-				ForegroundState,
-				PreviewDragAnchorScreen.X, PreviewDragAnchorScreen.Y);
-		}
 		// SSpinBox pattern (Slate/Private/Widgets/Input/SSpinBox.cpp:301): grab capture + high-precision in one
 		// reply, plus LockMouseToWidget to confine the cursor to the keyboard rect (it fills the viewport). All
 		// three are applied together by ProcessReply and torn down together by the matching ReleaseMouse* replies
 		// on button-up / capture-lost. High-precision DOES engage here (logs: PIE TopWindowVirtual=0, HiPrec=1
 		// from the first move), so the cursor is genuinely pinned and the lock's ClipCursor doesn't yank it.
+		// SetUserFocus mirrors SSpinBox.cpp:301 — re-assert focus onto the keyboard root on press. Without it,
+		// after clicking OUTSIDE the preview area (which leaves focus elsewhere), a subsequent press-to-drag may
+		// not route moves/capture to us → "drag does nothing after clicking out and back". Same target as the
+		// Tick/bPendingFocus grab (the keyboard root), so they don't fight.
 		return FReply::Handled()
 			.CaptureMouse(SharedThis(this))
 			.UseHighPrecisionMouseMovement(SharedThis(this))
-			.LockMouseToWidget(SharedThis(this));
+			.LockMouseToWidget(SharedThis(this))
+			.SetUserFocus(SharedThis(this), EFocusCause::Mouse);
 	}
 	return FReply::Handled();
 }
@@ -2398,7 +2347,15 @@ void SImSlateVirtualKeyboard::EndPreviewMouseDrag()
 	// the cursor was visible and followed the mouse freely — yanking it back to the press point would be a
 	// jarring visible jump, and SetCursorPos is unreliable there anyway, so leave it where it is.
 	if (FSlateApplication::Get().IsUsingHighPrecisionMouseMovment())
+	{
+		// SetCursorPos warps the cursor, which SYNTHESIZES a mouse-move event. In PIE that warp is unreliable and
+		// the synthesized move arrives while bPreviewDragging is still true (we clear it below, AFTER this, to keep
+		// the cursor hidden during the warp — see :2412). That synthesized frame then scrubs the value from a stale
+		// position. Flag it so OnMouseMove skips exactly that frame. (This is what bPreviewIgnoreSyntheticMove was
+		// designed for; it had been set but never read.)
+		bPreviewIgnoreSyntheticMove = true;
 		FSlateApplication::Get().SetCursorPos(PreviewDragAnchorScreen);
+	}
 	// NOTE: capture / high-precision / mouse-lock are NOT released here — EndPreviewMouseDrag is void and can't
 	// return an FReply. The normal button-up path releases them via the reply in OnMouseButtonUp; the abnormal
 	// capture-lost path re-issues that reply explicitly in OnMouseCaptureLost. This keeps every teardown on the
@@ -2426,9 +2383,6 @@ FCursorReply SImSlateVirtualKeyboard::OnCursorQuery(const FGeometry& MyGeometry,
 FReply SImSlateVirtualKeyboard::OnMouseButtonUp(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
 {
 	const bool bWasCapturing = HasMouseCapture();
-	UE_LOG(LogTemp, Warning, TEXT("[HPDbg] UP reached widget: bPreviewDragging=%d HasCapture=%d HiPrec=%d"),
-		bPreviewDragging ? 1 : 0, bWasCapturing ? 1 : 0,
-		FSlateApplication::Get().IsUsingHighPrecisionMouseMovment() ? 1 : 0);
 	EndPreviewMouseDrag();
 	// Tear down capture + high-precision + mouse-lock together via the reply (SSpinBox pattern). ReleaseMouseCapture
 	// is what drives ProcessReply:3578 to turn high-precision back off; ReleaseMouseLock undoes LockMouseToWidget.
@@ -2441,20 +2395,37 @@ FReply SImSlateVirtualKeyboard::OnMouseMove(const FGeometry& MyGeometry, const F
 {
 	if (bPreviewDragging)
 	{
-		// HandlePreviewDrag thresholds (cell width, StepY) are in LOCAL pixels, but mouse deltas are in SCREEN
-		// pixels — convert to local first so sensitivity matches the on-screen cell size regardless of DPI.
+		// Skip the single synthesized move produced by EndPreviewMouseDrag's SetCursorPos warp (it set this flag
+		// right before warping). Consuming it would scrub the value from the stale anchor position. One-shot.
+		if (bPreviewIgnoreSyntheticMove)
+		{
+			bPreviewIgnoreSyntheticMove = false;
+			return FReply::Handled();
+		}
+
+		// SSpinBox guard (SSpinBox.cpp:425). bPreviewDragging is our own flag and CAN leak true without an actual
+		// drag in progress (logs: after a normal UP+CAPTURELOST, a synthesized MOVE arrives with bPreviewDragging
+		// still true but NO mouse capture — it then computes a giant first-frame Delta from a stale LastScreenPos
+		// and scrubs the value wildly). HasMouseCapture() is the AUTHORITATIVE test: every real drag MOVE logs
+		// HasCap=1, every broken/stale MOVE logs HasCap=0. So if we don't hold capture, this isn't a real drag —
+		// reset and bail. (Verified safe: real drags keep capture on the keyboard root the whole time.)
+		// SSpinBox guard (SSpinBox.cpp:425): bPreviewDragging is our own flag and CAN leak true without a real
+		// drag (e.g. a synthesized move after teardown). HasMouseCapture() is the authoritative "drag in progress"
+		// test — every real drag (mouse OR faking-touch) holds capture. If we don't, bail rather than scrub from a
+		// stale position.
+		if (!HasMouseCapture())
+		{
+			EndPreviewMouseDrag();
+			return FReply::Unhandled();
+		}
+
+		// HandlePreviewDrag thresholds are in LOCAL pixels, mouse deltas are in SCREEN pixels — convert first.
 		const float DPIScale = GetCachedGeometry().GetAccumulatedLayoutTransform().GetScale();
 		const float InvScale = (DPIScale > 0.f) ? (1.f / DPIScale) : 1.f;
 
-		// Use MouseEvent.GetCursorDelta(): it is correct in BOTH modes. Under high-precision (non-PIE, cursor
-		// pinned) it carries the raw hardware delta while ScreenSpacePosition is FROZEN (OnRawMouseMove,
-		// SlateApplication.cpp:6253) — a ScreenPos diff would be 0 there. Without high-precision (PIE) it is
-		// (ScreenPos - LastScreenPos), the normal follow-the-mouse delta. Either way it's the per-event motion.
-		const bool bHiPrec = FSlateApplication::Get().IsUsingHighPrecisionMouseMovment();
-		const FVector2D ScrPos = MouseEvent.GetScreenSpacePosition();
+		// GetCursorDelta() is correct in BOTH modes: high-precision → raw delta (ScreenSpacePosition frozen);
+		// otherwise → ScreenPos-minus-last. Either way it's the per-event motion.
 		const FVector2D Delta = MouseEvent.GetCursorDelta();
-		UE_LOG(LogTemp, Warning, TEXT("[HPDbg] MOVE HiPrec=%d ScrPos=(%.1f,%.1f) Delta=(%.2f,%.2f) DPI=%.2f Axis=%d Sel=%d"),
-			bHiPrec ? 1 : 0, ScrPos.X, ScrPos.Y, Delta.X, Delta.Y, DPIScale, PreviewDragAxis, SelectedDigitIndex);
 		if (!Delta.IsNearlyZero())
 			HandlePreviewDrag(Delta * InvScale);
 	}
@@ -2463,9 +2434,6 @@ FReply SImSlateVirtualKeyboard::OnMouseMove(const FGeometry& MyGeometry, const F
 
 void SImSlateVirtualKeyboard::OnMouseCaptureLost(const FCaptureLostEvent& CaptureLostEvent)
 {
-	UE_LOG(LogTemp, Warning, TEXT("[HPDbg] CAPTURELOST reached: bPreviewDragging=%d HiPrec=%d"),
-		bPreviewDragging ? 1 : 0,
-		FSlateApplication::Get().IsUsingHighPrecisionMouseMovment() ? 1 : 0);
 	// Pure SSpinBox pattern: just end our own drag bookkeeping. Do NOT issue any ReleaseMouseCapture /
 	// high-precision reply here. OnMouseCaptureLost ALSO fires on the NORMAL button-up path (OnMouseButtonUp's
 	// ReleaseMouseCapture reply → engine ReleaseCapture → this callback). Re-issuing a reply here re-entered
@@ -2480,12 +2448,27 @@ FReply SImSlateVirtualKeyboard::OnTouchStarted(const FGeometry& MyGeometry, cons
 {
 	if (IsInPreviewArea(InTouchEvent.GetScreenSpacePosition()))
 	{
+		bPreviewIgnoreSyntheticMove = false;  // start clean (parity with mouse OnMouseButtonDown)
 		bPreviewDragging = true;
 		PreviewDragLastPos = InTouchEvent.GetScreenSpacePosition();
 		PreviewDragAccum = 0.f;
 		PreviewDragAccumY = 0.f;
 		PreviewDragAxis = 0;
 		BeginPreviewSelectAt(InTouchEvent.GetScreenSpacePosition());
+		// CRITICAL: take capture even on the TOUCH path. Capture is managed per-PointerIndex (SlateUser.h:65-76),
+		// so FReply::CaptureMouse() is valid for touch/faking-touch (PointerIndex 0) and makes HasMouseCapture()
+		// return true. Without it, this widget's OnMouseMove HasMouseCapture() guard (added for the mouse path)
+		// would bail every frame when bUseMouseForTouch=True routes the drag through touch — that's the "drag does
+		// nothing" bug. SetUserFocus re-asserts keyboard focus on press (mirrors mouse path / SSpinBox.cpp:301).
+		// LockMouseToWidget: faking-touch is backed by a REAL mouse with a REAL OS cursor that follows movement,
+		// so without a clip the cursor drifts out of the viewport (user-reported "still flies out"). Clip it to
+		// this widget's rect (fills the viewport). No high-precision (touch can't engage it — its reply never
+		// reaches ProcessReply), so the cursor is CONFINED, not pinned. NOTE: LockCursorInternal is gated by
+		// IsForegroundWindow() (SlateUser.cpp:982) — under PIE this may silently no-op; verify on real runtime.
+		return FReply::Handled()
+			.CaptureMouse(SharedThis(this))
+			.LockMouseToWidget(SharedThis(this))
+			.SetUserFocus(SharedThis(this), EFocusCause::Mouse);
 	}
 	return FReply::Handled();
 }
@@ -2494,6 +2477,14 @@ FReply SImSlateVirtualKeyboard::OnTouchMoved(const FGeometry& MyGeometry, const 
 {
 	if (bPreviewDragging)
 	{
+		// Same authoritative guard as OnMouseMove: if bPreviewDragging leaked true without real capture, this is a
+		// stale move — reset and bail rather than scrub from a stale position. (Now that OnTouchStarted takes
+		// capture, a real touch drag has HasMouseCapture()==1 and passes.)
+		if (!HasMouseCapture())
+		{
+			EndPreviewMouseDrag();
+			return FReply::Unhandled();
+		}
 		// Touch has no high-precision/raw mode — feed the position diff (converted to LOCAL pixels so the
 		// thresholds match, same as the mouse path) and track the last position.
 		const FVector2D Pos = InTouchEvent.GetScreenSpacePosition();
@@ -2507,9 +2498,14 @@ FReply SImSlateVirtualKeyboard::OnTouchMoved(const FGeometry& MyGeometry, const 
 
 FReply SImSlateVirtualKeyboard::OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
 {
-	bPreviewDragging = false;
-	HidePreviewStepRuler();
-	return FReply::Handled();
+	// Symmetric with OnMouseButtonUp: route teardown through EndPreviewMouseDrag (its SetCursorPos restore is
+	// high-precision-gated, so the touch path skips it automatically) and RELEASE the capture + mouse-lock taken
+	// in OnTouchStarted (LockMouseToWidget there → ReleaseMouseLock here).
+	const bool bWasCapturing = HasMouseCapture();
+	EndPreviewMouseDrag();
+	return bWasCapturing
+		? FReply::Handled().ReleaseMouseCapture().ReleaseMouseLock()
+		: FReply::Handled().ReleaseMouseLock();
 }
 
 void SImSlateVirtualKeyboard::UpdateSuggestions()

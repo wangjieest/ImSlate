@@ -300,12 +300,6 @@ private:
 	TSharedPtr<FActiveTimerHandle> CursorBlinkTimer;
 	bool bCursorVisible = true;
 	bool bPreviewDragging = false;
-	// Re-entrancy guard for OnMouseCaptureLost. That callback fires from FSlateUser::ReleaseCapture BEFORE the
-	// captor is removed from the map (SlateUser.cpp:290 callback, :297 removal), so HasMouseCapture() is still
-	// true inside it. We need to re-issue a ReleaseMouseCapture reply there to turn high-precision back off
-	// (the engine only does that via ProcessReply:3578), but that reply walks ReleaseCapture again and would
-	// re-enter this same callback → infinite recursion. This flag short-circuits the nested entry.
-	bool bInCaptureLostCleanup = false;
 	FVector2D PreviewDragLastPos = FVector2D::ZeroVector;
 	float PreviewDragAccum = 0.f;   // horizontal travel accumulator (switch selected digit, per cell×1.1)
 	float PreviewDragAccumY = 0.f;  // vertical travel accumulator (adjust selected digit, per StepW)
