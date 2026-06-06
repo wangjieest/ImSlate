@@ -268,14 +268,16 @@ private:
 	FString CurrentText;
 	int32 CursorPosition = 0;
 	FString OriginalText;
-	// Backspace undo HISTORY: a stack of deletions, each remembering WHAT was removed and WHERE (the text
-	// index it sat at), so a right-swipe undo restores the exact characters at their original positions —
-	// even if the caret moved between the delete and the undo. One entry per delete step; a "Clr" that
-	// removes a run stores the whole run as a single entry (Text = the run, Pos = its start index).
+	// Backspace undo HISTORY: a stack of full SNAPSHOTS taken right BEFORE each deletion (the whole value +
+	// caret at that moment), so a right-swipe undo restores the exact prior state by overwriting CurrentText.
+	// Snapshots (not per-char increments) sidestep the synthetic-"0" placeholder problem entirely: deleting a
+	// numeric field to empty makes UpdatePreview substitute "0", but undo just overwrites the whole value so
+	// that placeholder never leaks into the restored text (e.g. "0.123" del-to-empty then undo → "0.123",
+	// not ".123"). One snapshot per delete step; a "Clr" that removes a run stores one snapshot too.
 	struct FBackspaceUndoEntry
 	{
-		FString Text;   // the removed character(s)
-		int32 Pos = 0;  // the index in CurrentText where it was removed from
+		FString Snapshot;  // the COMPLETE CurrentText as it was just before this deletion
+		int32 Caret = 0;   // the caret position (CursorPosition) at that same moment
 	};
 	TArray<FBackspaceUndoEntry> BackspaceUndoStack;
 
@@ -406,8 +408,8 @@ private:
 	// Backspace-at-caret WITH undo: delete the char left of the caret and push it (with its index) onto the
 	// undo stack. Returns true if a char was deleted. (Plain DeleteBackward does not record undo.)
 	bool DeleteBackwardWithUndo();
-	void PushBackspaceUndo(const FString& RemovedText, int32 Pos);  // record a deletion for later undo
-	void UndoBackspaceFromStack();                                  // pop + reinsert at the recorded position
+	void PushBackspaceUndo();         // snapshot the CURRENT value + caret before a deletion (call pre-delete)
+	void UndoBackspaceFromStack();    // pop + restore the whole snapshot (overwrites CurrentText)
 	void MoveCursor(int32 Delta);
 	void ToggleShift();
 

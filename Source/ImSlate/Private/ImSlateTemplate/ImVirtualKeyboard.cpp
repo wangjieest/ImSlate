@@ -285,8 +285,8 @@ FVirtualKeyDef SImSlateVirtualKeyboard::MakeBackspaceKey(float Width)
 			ClearNumericValue();
 			return;
 		}
-		// Clr removes the whole run left of the caret — record it as ONE undo entry (the run, at index 0).
-		PushBackspaceUndo(CurrentText.Left(CursorPosition), 0);
+		// Clr removes the whole run left of the caret — one undo snapshot of the full value restores it.
+		PushBackspaceUndo();   // snapshot full value first → undo restores the whole run
 		CurrentText.RemoveAt(0, CursorPosition);
 		CursorPosition = 0;
 		ClearDigitHighlight();
@@ -934,7 +934,18 @@ void SImSlateVirtualKeyboard::CalcPressEquals()
 		bJustEvaluated = true;
 		bCalcFreshOperand = true;
 	}
-	// else: no pending op, never evaluated → '=' is a no-op.
+	else
+	{
+		// No pending op and nothing to repeat: '=' just NORMALISES the current value — parse it and rewrite
+		// through CalcWriteResult so it gets clamped to [Min,Max] and formatted per type. This canonicalises
+		// loose input like ".088" → "0.088" (SanitizeFloat adds the leading zero) or an integer field's "7."
+		// → "7", and applies range clamping, all without an actual calculation. NOT a real evaluation, so the
+		// repeat-'=' and fresh-operand states are left clear: the next digit keeps editing the value in place
+		// (it must NOT trigger OnKeyInput's fresh-operand clear — see R017).
+		CalcWriteResult(FCString::Atod(*CurrentText));
+		bJustEvaluated = false;
+		bCalcFreshOperand = false;
+	}
 }
 
 // Refresh the preview-row ± key: visible only for signed numeric DEC input whose range allows a negative;
@@ -1612,6 +1623,12 @@ void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
 	UpdateToggleTypeLabel();
 	UpdateToggleTypeKeyVisibility();  // numeric pad hides the type-toggle key
 	CalcReset();                      // start each session with a clean calculator (no stale expr/memory)
+	// CalcReset() leaves bCalcFreshOperand=true (the "next digit starts a fresh operand" flag). But we just
+	// loaded the field's existing value into CurrentText above — the first keypress must INSERT into it, not
+	// wipe it (OnKeyInput's fresh-operand branch clears CurrentText). So when a value is preloaded, treat it
+	// as an existing operand: clear the flag. (Empty initial value keeps the flag → first digit just types.)
+	if (!CurrentText.IsEmpty())
+		bCalcFreshOperand = false;
 	ClearDigitHighlight();            // no preview digit selected until the user presses the preview
 	UpdateSignKey();                  // show/hide + label the preview-row ± key per type/range
 
@@ -1772,13 +1789,15 @@ void SImSlateVirtualKeyboard::DeleteBackward()
 
 // Record a deletion for undo: the removed text and the index it was removed from. Each call is one undo
 // step; UndoBackspaceFromStack restores the most recent one.
-void SImSlateVirtualKeyboard::PushBackspaceUndo(const FString& RemovedText, int32 Pos)
+void SImSlateVirtualKeyboard::PushBackspaceUndo()
 {
-	if (RemovedText.IsEmpty())
+	// Snapshot the COMPLETE value + caret as they are RIGHT NOW (i.e. just before the deletion the caller is
+	// about to perform). Undo restores this snapshot wholesale. Empty value → nothing meaningful to restore.
+	if (CurrentText.IsEmpty())
 		return;
 	FBackspaceUndoEntry Entry;
-	Entry.Text = RemovedText;
-	Entry.Pos = Pos;
+	Entry.Snapshot = CurrentText;
+	Entry.Caret = CursorPosition;
 	BackspaceUndoStack.Add(MoveTemp(Entry));
 }
 
@@ -1788,8 +1807,7 @@ bool SImSlateVirtualKeyboard::DeleteBackwardWithUndo()
 {
 	if (CursorPosition <= 0 || CurrentText.Len() == 0)
 		return false;
-	const int32 Pos = CursorPosition - 1;
-	PushBackspaceUndo(CurrentText.Mid(Pos, 1), Pos);  // remember WHAT + WHERE before removing
+	PushBackspaceUndo();   // snapshot the whole value + caret BEFORE removing, so undo restores it exactly
 	DeleteBackward();
 	return true;
 }
@@ -1800,19 +1818,14 @@ void SImSlateVirtualKeyboard::UndoBackspaceFromStack()
 {
 	if (BackspaceUndoStack.Num() == 0)
 		return;
-	// When backspace deletes the LAST char of a numeric field, UpdatePreview() substitutes a placeholder "0"
-	// so the field never goes empty. That "0" is synthetic (never typed, never pushed to the undo stack), so
-	// undo must drop it before reinserting the real char — otherwise the placeholder accumulates and every
-	// undo step leaves a stray leading/trailing 0 ("一堆0"). Clear it so the stored text takes its place.
-	if (KeyboardType == EKeyboardType::Number && CalcExpr.IsEmpty() && CurrentText == TEXT("0"))
-	{
-		CurrentText.Empty();
-		CursorPosition = 0;
-	}
+	// Restore the snapshot taken before the last deletion: overwrite the WHOLE value + caret. Because the
+	// entire value is replaced, any synthetic "0" placeholder UpdatePreview left behind (numeric field deleted
+	// to empty) is simply discarded — no special-casing, and a real leading "0" survives intact. This is the
+	// fix for "0.123 del-to-empty then undo → .123": the old per-char model couldn't tell the placeholder "0"
+	// from a restored real "0" and dropped the latter; snapshots have no such ambiguity.
 	const FBackspaceUndoEntry Entry = BackspaceUndoStack.Pop();
-	const int32 Pos = FMath::Clamp(Entry.Pos, 0, CurrentText.Len());
-	CurrentText.InsertAt(Pos, Entry.Text);
-	CursorPosition = Pos + Entry.Text.Len();
+	CurrentText = Entry.Snapshot;
+	CursorPosition = FMath::Clamp(Entry.Caret, 0, CurrentText.Len());
 	ClearDigitHighlight();
 }
 
