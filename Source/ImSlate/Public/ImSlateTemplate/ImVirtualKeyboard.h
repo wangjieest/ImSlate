@@ -154,6 +154,10 @@ public:
 	SLATE_END_ARGS()
 
 	void Construct(const FArguments& InArgs);
+	// Safety net: if the keyboard is destroyed while still shown (e.g. SImViewportGame::RemoveKeyboard resets it
+	// on world teardown WITHOUT going through Hide), restore bUseMouseForTouch so the desktop faking toggle from
+	// Show() never leaks globally.
+	virtual ~SImSlateVirtualKeyboard();
 	virtual void Tick(const FGeometry& AllottedGeometry, const double InCurrentTime, const float InDeltaTime) override;
 	// Force the keyboard widget to fill the whole viewport so its top-left origin is fixed.
 	// Confirmed by logs: without this the widget sized to its content (keys+suggestions), so
@@ -300,6 +304,10 @@ private:
 	TSharedPtr<FActiveTimerHandle> CursorBlinkTimer;
 	bool bCursorVisible = true;
 	bool bPreviewDragging = false;
+	// Desktop only: while the keyboard is shown we temporarily disable bUseMouseForTouch so preview dragging runs
+	// the REAL mouse path (high-precision: pinned + hidden cursor). This stores the original value to restore on
+	// Hide. Set true only when we actually toggled it (was faking + desktop). See Show()/Hide().
+	bool bSavedUseMouseForTouch = false;
 	FVector2D PreviewDragLastPos = FVector2D::ZeroVector;
 	float PreviewDragAccum = 0.f;   // horizontal travel accumulator (switch selected digit, per cell×1.1)
 	float PreviewDragAccumY = 0.f;  // vertical travel accumulator (adjust selected digit, per StepW)

@@ -9,6 +9,7 @@
 #include "ImSlateTemplate/ImEditableText.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
+#include "GameFramework/InputSettings.h"  // UInputSettings::bUseMouseForTouch (desktop real-mouse drag)
 #include "UnrealClient.h"
 #include "Framework/Application/SlateApplication.h"
 #include "HAL/PlatformApplicationMisc.h"  // FPlatformApplicationMisc::ClipboardPaste
@@ -996,6 +997,21 @@ static constexpr float GMaxKeyboardHeight = 300.f;
 
 // ==================== Construct ====================
 
+SImSlateVirtualKeyboard::~SImSlateVirtualKeyboard()
+{
+	// Safety net for the desktop real-mouse toggle (Show() may set bUseMouseForTouch=false). Normally Hide()
+	// restores it, but if we're destroyed while still shown (RemoveKeyboard resets without Hide on world
+	// teardown), restore here so the global config never leaks.
+#if PLATFORM_DESKTOP
+	if (bSavedUseMouseForTouch)
+	{
+		if (UInputSettings* IS = GetMutableDefault<UInputSettings>())
+			IS->bUseMouseForTouch = true;
+		bSavedUseMouseForTouch = false;
+	}
+#endif
+}
+
 void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 {
 	SetVisibility(EVisibility::Collapsed);
@@ -1599,6 +1615,32 @@ void SImSlateVirtualKeyboard::Show(const FVirtualKeyboardShowParams& Params)
 	ClearDigitHighlight();            // no preview digit selected until the user presses the preview
 	UpdateSignKey();                  // show/hide + label the preview-row ± key per type/range
 
+	// DESKTOP + currently faking-touch (bUseMouseForTouch): while the keyboard is up, disable mouse-as-touch so
+	// preview dragging runs the REAL mouse path (OnMouseButtonDown/Move/Up). Only the mouse path can engage
+	// high-precision (its reply reaches ProcessReply; touch's does not) → pinned + hidden cursor + clip that
+	// actually holds. Two parts: (1) flip bUseMouseForTouch off at the SOURCE so GameViewportClient's
+	// MouseEnter/ReceivedFocus stop re-enabling it (GetUseMouseForTouch() is read fresh, not cached); (2) clear
+	// the CURRENT bIsGameFakingTouch via SetGameIsFakingTouchEvents(false) (flipping the config alone doesn't
+	// reset already-true state). Gated by IsFakingTouchEvents() so non-faking / mobile is a no-op.
+#if PLATFORM_DESKTOP
+	bSavedUseMouseForTouch = false;
+	if (UInputSettings* IS = GetMutableDefault<UInputSettings>())
+	{
+		// Disable based on the CONFIG (not the live faking state): even if faking isn't active *this instant*
+		// (mouse not yet in viewport), the config being true means GameViewportClient will enable it on the next
+		// MouseEnter/click — which is exactly the "cursor becomes faketouch after clicking" the user saw. Flipping
+		// the config off now makes GetUseMouseForTouch() return false → that re-enable never happens.
+		if (IS->bUseMouseForTouch)
+		{
+			bSavedUseMouseForTouch = true;
+			IS->bUseMouseForTouch = false;
+		}
+		// Also clear any CURRENTLY-active faking state (config flip alone doesn't reset bIsGameFakingTouch).
+		if (FSlateApplication::IsInitialized())
+			FSlateApplication::Get().SetGameIsFakingTouchEvents(false);
+	}
+#endif
+
 	bVisible = true;
 	SetVisibility(EVisibility::Visible);
 
@@ -1645,6 +1687,16 @@ void SImSlateVirtualKeyboard::Hide(bool bCommit)
 	// If the keyboard is dismissed mid value-scrub, restore the (hidden) cursor first so it never gets
 	// stuck invisible.
 	EndPreviewMouseDrag();
+
+	// Restore mouse-as-touch if Show() disabled it (desktop faking). Only when we actually toggled it.
+#if PLATFORM_DESKTOP
+	if (bSavedUseMouseForTouch)
+	{
+		if (UInputSettings* IS = GetMutableDefault<UInputSettings>())
+			IS->bUseMouseForTouch = true;
+		bSavedUseMouseForTouch = false;
+	}
+#endif
 
 	bVisible = false;
 	bPendingFocus = false;
@@ -1888,7 +1940,20 @@ void SImSlateVirtualKeyboard::AdjustDigitAtCursor(int32 Direction)
 		Val += (double)Direction * Place;
 		if (NumericParams.Min.IsSet()) Val = FMath::Max(Val, NumericParams.Min.GetValue());
 		if (NumericParams.Max.IsSet()) Val = FMath::Min(Val, NumericParams.Max.GetValue());
-		CurrentText = FString::SanitizeFloat(Val);
+		// PRESERVE the fractional digit count of the OLD text while SCRUBBING — SanitizeFloat strips trailing
+		// zeros (1.50→1.5), which shrinks the decimals and makes the highlight jump as the user drags a low
+		// fractional digit to 0. Only this drag-scrub path needs the fixed width; normal typing/commit is
+		// unaffected (this code only runs from HandlePreviewDrag → AdjustDigitAtCursor). If the old text had N
+		// fractional digits, format the new value with exactly N.
+		{
+			int32 OldFracDigits = 0;
+			if (DotPos != INDEX_NONE)
+				for (int32 i = DotPos + 1; i < Old.Len(); ++i)
+					if (FChar::IsHexDigit(Old[i])) ++OldFracDigits;
+			CurrentText = (OldFracDigits > 0)
+				? FString::Printf(TEXT("%.*f"), OldFracDigits, Val)
+				: FString::SanitizeFloat(Val);
+		}
 	}
 
 	// Re-anchor the caret to stay on the SAME digit column.
@@ -2129,6 +2194,10 @@ void SImSlateVirtualKeyboard::MoveSelectedDigit(int32 Dir)
 		CursorPosition = FMath::Clamp(i + 1, 0, CurrentText.Len());
 		PreviewEdit->GoTo(FTextLocation(0, CursorPosition));
 	}
+	// If the step ruler is up, move it under the newly-highlighted digit immediately (horizontal switching used
+	// to leave the ruler under the old digit until the next vertical drag re-positioned it).
+	if (PreviewStepRuler.IsValid())
+		ShowPreviewStepRuler();
 }
 
 // Drop the preview digit selection + its highlight. Called whenever the text STRUCTURE changes from a
@@ -2201,7 +2270,9 @@ void SImSlateVirtualKeyboard::HandlePreviewDrag(const FVector2D& Delta)
 	}
 	else if (PreviewDragAxis == 2 && AccX > AccY + AxisLockThresh)
 	{
-		PreviewDragAxis = 1; PreviewDragAccum = 0.f; PreviewDragAccumY = 0.f; HidePreviewStepRuler();
+		// Switch to horizontal (digit-select). Keep the step ruler VISIBLE — user wants it shown during
+		// horizontal switching too (only hidden on release, by EndPreviewMouseDrag).
+		PreviewDragAxis = 1; PreviewDragAccum = 0.f; PreviewDragAccumY = 0.f;
 	}
 
 	if (PreviewDragAxis == 1 && KeyboardType == EKeyboardType::Number && SelectedDigitIndex != INDEX_NONE)
@@ -2403,12 +2474,6 @@ FReply SImSlateVirtualKeyboard::OnMouseMove(const FGeometry& MyGeometry, const F
 			return FReply::Handled();
 		}
 
-		// SSpinBox guard (SSpinBox.cpp:425). bPreviewDragging is our own flag and CAN leak true without an actual
-		// drag in progress (logs: after a normal UP+CAPTURELOST, a synthesized MOVE arrives with bPreviewDragging
-		// still true but NO mouse capture — it then computes a giant first-frame Delta from a stale LastScreenPos
-		// and scrubs the value wildly). HasMouseCapture() is the AUTHORITATIVE test: every real drag MOVE logs
-		// HasCap=1, every broken/stale MOVE logs HasCap=0. So if we don't hold capture, this isn't a real drag —
-		// reset and bail. (Verified safe: real drags keep capture on the keyboard root the whole time.)
 		// SSpinBox guard (SSpinBox.cpp:425): bPreviewDragging is our own flag and CAN leak true without a real
 		// drag (e.g. a synthesized move after teardown). HasMouseCapture() is the authoritative "drag in progress"
 		// test — every real drag (mouse OR faking-touch) holds capture. If we don't, bail rather than scrub from a
