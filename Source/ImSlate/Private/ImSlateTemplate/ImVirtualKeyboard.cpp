@@ -513,7 +513,7 @@ TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetNumberLayout()
 	//     7 8 9 *              7 8 9 C
 	//     0 . / =              0 D E F
 	// Digit keys feed OnKeyInput→InsertText (hex letters too). Operator chars (+ − * /) also go through the
-	// Char pipeline but OnKeyInput routes them to the calculator (CalcPressOperator) on the DEC pad. '=' is
+	// Char pipeline but OnKeyInput routes them to the calculator (CalcAppendOperator) on the DEC pad. '=' is
 	// an action (Equals). There is NO backspace / Clr / cursor key — value editing is via the preview drag.
 	TArray<TArray<FVirtualKeyDef>> Rows;
 
@@ -523,7 +523,7 @@ TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetNumberLayout()
 	// Hex letter key (A-F): plain Char input.
 	auto HexLetter = [this](const TCHAR* L) { return MakeCharKey(L, L); };
 	// Operator key (+ − * /): Char pipeline with Value = the ASCII operator; OnKeyInput detects an operator
-	// char on the DEC pad and routes it to CalcPressOperator instead of inserting text. Display label may
+	// char on the DEC pad and routes it to CalcAppendOperator instead of inserting text. Display label may
 	// be a prettier glyph (− U+2212, × , ÷) while the value stays ASCII for simple comparison.
 	auto OpKey = [this](const TCHAR* Label, const TCHAR* Value) {
 		FVirtualKeyDef Key = MakeCharKey(Value, Value);
@@ -557,7 +557,7 @@ TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetNumberLayout()
 		Row.Add(bHex ? HexLetter(TEXT("C")) : OpKey(TEXT("\xD7"), TEXT("*")));
 		Rows.Add(MoveTemp(Row));
 	}
-	// Row 4 DEC: 0 . / =     |  Row 4 HEX: 0 D E F
+	// Row 4 DEC: 0 . = /     |  Row 4 HEX: 0 D E F
 	{
 		TArray<FVirtualKeyDef> Row;
 		Row.Add(Digit(TEXT("0")));
@@ -567,7 +567,7 @@ TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetNumberLayout()
 		}
 		else
 		{
-			// DEC bottom row tail: [. or ±] / =.
+			// DEC bottom row tail: [. or ±] = ÷.
 			//  - float fields: '.' (decimal point)
 			//  - integer fields: a sign (±) key IF the range can actually hold a negative; otherwise a blank
 			//    spacer. The sign key's label shows the sign a tap switches TO (value<0 → '+', else '−').
@@ -590,8 +590,8 @@ TArray<TArray<FVirtualKeyDef>> SImSlateVirtualKeyboard::GetNumberLayout()
 					Row.Add(MoveTemp(Spacer));
 				}
 			}
-			Row.Add(OpKey(TEXT("\xF7"), TEXT("/")));   // ÷
 			Row.Add(EqualsKey());
+			Row.Add(OpKey(TEXT("\xF7"), TEXT("/")));   // ÷
 		}
 		Rows.Add(MoveTemp(Row));
 	}
@@ -850,102 +850,141 @@ void SImSlateVirtualKeyboard::CalcWriteResult(double Value)
 	UpdateSignKey();
 }
 
-// Operator key (+ − * /). Captures the current operand, chains any already-pending op, records the
-// operator, and begins/extends the displayed expression string. The bound field is NOT touched (it keeps
-// the last confirmed value until '=').
-void SImSlateVirtualKeyboard::CalcPressOperator(const FString& Op)
+// Is C one of the four operator chars? (helper for expression-string editing)
+static bool IsCalcOperatorChar(TCHAR C)
 {
-	if (!IsCalcEnabled())
+	return C == '+' || C == '-' || C == '*' || C == '/';
+}
+
+// Operator key (+ − * /). Expression-string model: seed CalcExpr from the current value on the FIRST operator,
+// then append. A trailing operator is REPLACED so consecutive operators switch (5+ then − → 5−). The bound
+// field (CurrentText) is NOT touched — it keeps its value until '=' evaluates the whole string.
+void SImSlateVirtualKeyboard::CalcAppendOperator(const FString& Op)
+{
+	if (!IsCalcEnabled() || Op.Len() != 1)
 		return;
 
-	const double Current = FCString::Atod(*CurrentText);
-
-	if (!PendingOperator.IsEmpty() && !bCalcFreshOperand)
+	if (CalcExpr.IsEmpty())
 	{
-		// Chained: a previous op is pending AND a second operand was typed → fold it first (5+3* → 8*).
-		bool bDivZero = false;
-		const double Folded = CalcCompute(StoredOperand, Current, PendingOperator, bDivZero);
-		if (bDivZero)
-		{
-			// Division by zero: abort the chain, keep the stored operand as the running value.
-			CurrentText = CalcFormatNumber(StoredOperand);
-			CursorPosition = CurrentText.Len();
-		}
-		else
-		{
-			StoredOperand = Folded;
-		}
+		// Starting an expression: the current field value becomes the first operand. Use CurrentText verbatim
+		// (it is already a valid number; "0" placeholder included) so "5" + "+" → "5+".
+		CalcExpr = CurrentText + Op;
 	}
 	else
 	{
-		// First operator (or operator replacing operator with no new operand typed): stored = current.
-		StoredOperand = Current;
+		// Mid-expression. If the last char is already an operator, REPLACE it (consecutive operators switch:
+		// "5+" then "−" → "5−"). Otherwise append after the just-typed operand ("5+3" then "−" → "5+3−").
+		const TCHAR Last = CalcExpr[CalcExpr.Len() - 1];
+		if (IsCalcOperatorChar(Last))
+			CalcExpr[CalcExpr.Len() - 1] = Op[0];
+		else
+			CalcExpr += Op;
 	}
-
-	PendingOperator = Op;
-	bCalcFreshOperand = true;      // next digit starts the second operand fresh
+	CalcCursorPos = CalcExpr.Len();  // caret at the end of the expression
 	bJustEvaluated = false;
-	// Build the expression string for display: "<storedOperand><op>".
-	CalcExpr = CalcFormatNumber(StoredOperand) + Op;
-	CalcCursorPos = CalcExpr.Len();  // caret at the end of the freshly-built expression
-	UpdatePreview();               // preview shows the expression; CurrentText (field) unchanged
-	UpdateSignKey();               // hide ± while an expression is being built
+	UpdatePreview();                 // preview shows the expression; bound field unchanged
+	UpdateSignKey();                 // hide ± while an expression is being built
 }
 
-// '=' key. Folds the pending operation; with no pending op but a prior evaluation, repeats the last op.
+// Digit / '.' pressed while an expression is being typed: append it straight to the expression string. The
+// bound field (CurrentText) stays frozen until '='. (Only called in expression mode — CalcExpr non-empty.)
+void SImSlateVirtualKeyboard::CalcAppendDigit(const FString& Ch)
+{
+	if (!IsCalcEnabled() || CalcExpr.IsEmpty())
+		return;
+	// One decimal point per operand: if the CURRENT operand (the run after the last operator) already has a
+	// '.', ignore a further '.' — so "3.5" then "." does nothing, but "3.5+2" then "." → "3.5+2." is allowed.
+	if (Ch == TEXT("."))
+	{
+		int32 OpStart = 0;
+		for (int32 i = CalcExpr.Len() - 1; i >= 0; --i)
+			if (IsCalcOperatorChar(CalcExpr[i])) { OpStart = i + 1; break; }
+		if (CalcExpr.Mid(OpStart).Contains(TEXT(".")))
+			return;
+	}
+	CalcExpr += Ch;
+	CalcCursorPos = CalcExpr.Len();
+	UpdatePreview();
+}
+
+// Evaluate a full expression string LEFT-TO-RIGHT (no operator precedence — a plain calculator): tokenise into
+// number / operator runs and fold pairwise with CalcCompute. A trailing dangling operator ("5+") is ignored
+// (uses the running value). Returns the running result; sets bOutDivZero if any division by zero occurred.
+double SImSlateVirtualKeyboard::CalcEvaluateExpression(const FString& Expr, bool& bOutDivZero) const
+{
+	bOutDivZero = false;
+	double Acc = 0.0;
+	FString PendingOp;          // operator awaiting its right operand
+	FString NumTok;             // the number token being accumulated
+	bool bHaveAcc = false;      // has Acc been seeded by the first number yet?
+
+	auto FoldToken = [&](const FString& Num)
+	{
+		if (Num.IsEmpty())
+			return;
+		const double Val = FCString::Atod(*Num);
+		if (!bHaveAcc)
+		{
+			Acc = Val;            // first operand seeds the accumulator
+			bHaveAcc = true;
+		}
+		else if (!PendingOp.IsEmpty())
+		{
+			bool bDZ = false;
+			Acc = CalcCompute(Acc, Val, PendingOp, bDZ);
+			if (bDZ) bOutDivZero = true;
+			PendingOp.Reset();
+		}
+	};
+
+	for (int32 i = 0; i < Expr.Len(); ++i)
+	{
+		const TCHAR C = Expr[i];
+		// A leading '-' is the SIGN of the first operand (the expression is seeded from CurrentText, which may
+		// be negative, e.g. "-5+3"), not subtraction. Operators never sit back-to-back — pressing an operator
+		// REPLACES a trailing one (CalcAppendOperator), so "3+-5" can't occur; only i==0 needs the sign case.
+		const bool bSignMinus = (C == '-') && (i == 0);
+		if (IsCalcOperatorChar(C) && !bSignMinus)
+		{
+			FoldToken(NumTok);
+			NumTok.Reset();
+			PendingOp = FString::Chr(C);
+		}
+		else
+		{
+			NumTok.AppendChar(C);  // digit, '.', or a sign '-'
+		}
+	}
+	FoldToken(NumTok);             // fold the final number (dangling trailing operator is simply ignored)
+	return bHaveAcc ? Acc : FCString::Atod(*CurrentText);
+}
+
+// '=' key. Evaluate the whole expression string left-to-right, write the (clamped/formatted) result back into
+// the value, and EXIT expression mode → plain numeric insert mode (next key edits the result in place, R017).
+// With no expression in progress, '=' just NORMALISES the current value (".088" → "0.088", clamp, format).
 void SImSlateVirtualKeyboard::CalcPressEquals()
 {
 	if (!IsCalcEnabled())
 		return;
 
-	if (!PendingOperator.IsEmpty())
+	if (!CalcExpr.IsEmpty())
 	{
-		// Second operand = the typed one, or the stored operand itself if none was typed (5 + = → 10).
-		const double Second = bCalcFreshOperand ? StoredOperand : FCString::Atod(*CurrentText);
+		// Evaluate the typed expression. CalcWriteResult clamps + formats + writes CurrentText AND resets
+		// CalcExpr (exits expression mode). On divide-by-zero, keep the result CalcEvaluateExpression returns
+		// (the running value before the bad division) rather than corrupting the field.
 		bool bDivZero = false;
-		const double Result = CalcCompute(StoredOperand, Second, PendingOperator, bDivZero);
-		if (bDivZero)
-		{
-			// Division by zero: leave the stored operand as the value, drop the pending op, no repeat set.
-			RepeatOperator.Reset();
-			PendingOperator.Reset();
-			CalcWriteResult(StoredOperand);
-			bJustEvaluated = false;
-			return;
-		}
-		RepeatOperator = PendingOperator;   // remember for repeated '='
-		RepeatOperand = Second;
-		PendingOperator.Reset();
-		StoredOperand = Result;             // result becomes the operand for a chained repeat
-		CalcWriteResult(Result);
-		bJustEvaluated = true;
-		bCalcFreshOperand = true;
-	}
-	else if (bJustEvaluated && !RepeatOperator.IsEmpty())
-	{
-		// Repeated '=' : apply the remembered op + operand again (8 =11 =14).
-		const double Base = FCString::Atod(*CurrentText);
-		bool bDivZero = false;
-		const double Result = CalcCompute(Base, RepeatOperand, RepeatOperator, bDivZero);
-		if (bDivZero)
-			return;  // can't happen (operand fixed) but guard anyway
-		StoredOperand = Result;
-		CalcWriteResult(Result);
-		bJustEvaluated = true;
-		bCalcFreshOperand = true;
+		const double Result = CalcEvaluateExpression(CalcExpr, bDivZero);
+		CalcWriteResult(Result);   // also CalcExpr.Reset() → leaves expression mode
 	}
 	else
 	{
-		// No pending op and nothing to repeat: '=' just NORMALISES the current value — parse it and rewrite
-		// through CalcWriteResult so it gets clamped to [Min,Max] and formatted per type. This canonicalises
-		// loose input like ".088" → "0.088" (SanitizeFloat adds the leading zero) or an integer field's "7."
-		// → "7", and applies range clamping, all without an actual calculation. NOT a real evaluation, so the
-		// repeat-'=' and fresh-operand states are left clear: the next digit keeps editing the value in place
-		// (it must NOT trigger OnKeyInput's fresh-operand clear — see R017).
+		// No expression: normalise the current value in place (loose input like ".088" → "0.088", clamp, format).
 		CalcWriteResult(FCString::Atod(*CurrentText));
-		bJustEvaluated = false;
-		bCalcFreshOperand = false;
 	}
+	// '=' always lands in plain numeric mode: the next key edits the result in place (must NOT trigger the
+	// fresh-operand clear — see R017). bJustEvaluated stays false so no special post-'=' digit handling.
+	bJustEvaluated = false;
+	bCalcFreshOperand = false;
 }
 
 // Refresh the preview-row ± key: visible only for signed numeric DEC input whose range allows a negative;
@@ -1785,6 +1824,34 @@ void SImSlateVirtualKeyboard::DeleteBackward()
 		CursorPosition--;
 		ClearDigitHighlight();  // text structure changed → stale preview selection no longer valid
 	}
+}
+
+// Remove redundant leading zeros from the integer part of CurrentText, keeping the caret on the same logical
+// spot. "05"→"5", "0.1"+digit "05.1"→"5.1", "007"→"7"; a value that IS just zero stays "0" ("0", "0.5",
+// "0." keep their single leading 0). A leading '-' sign is preserved. DEC plain-numeric only (caller gates).
+void SImSlateVirtualKeyboard::StripLeadingZeros()
+{
+	// Where the integer part starts (after an optional '-' sign).
+	const int32 Start = (CurrentText.Len() > 0 && CurrentText[0] == TEXT('-')) ? 1 : 0;
+
+	// End of the integer part = first '.' (or end of string).
+	int32 DotPos = CurrentText.Len();
+	for (int32 i = Start; i < CurrentText.Len(); ++i)
+		if (CurrentText[i] == TEXT('.')) { DotPos = i; break; }
+
+	// Count leading '0's in the integer part, but never strip the LAST integer digit (so an all-zero integer
+	// part collapses to a single "0", and "0.5" keeps its "0").
+	int32 Zeros = 0;
+	while (Start + Zeros < DotPos - 1 && CurrentText[Start + Zeros] == TEXT('0'))
+		++Zeros;
+
+	if (Zeros == 0)
+		return;
+
+	CurrentText.RemoveAt(Start, Zeros);
+	// Shift the caret left by however many stripped zeros sat at or before it.
+	if (CursorPosition > Start)
+		CursorPosition = FMath::Max(Start, CursorPosition - Zeros);
 }
 
 // Record a deletion for undo: the removed text and the index it was removed from. Each call is one undo
@@ -2787,33 +2854,27 @@ void SImSlateVirtualKeyboard::OnKeyInput(const FVirtualKeyDef& KeyDef, const FSt
 	if (IsUpperCase() && Text.Len() == 1 && FChar::IsAlpha(Text[0]))
 		Text = Text.ToUpper();
 
-	// Calculator: on the DEC numeric pad, the operator keys (+ − * /) arrive here as Char input but are
-	// NOT inserted as text — they drive the calculator state machine instead.
+	// Calculator (expression-string model): on the DEC numeric pad, the operator keys (+ − * /) build the
+	// expression string instead of being inserted as text. ('-' here is the subtraction operator; a negative
+	// VALUE is entered via the ± key, not this key.)
 	if (IsCalcEnabled() && Text.Len() == 1)
 	{
 		const TCHAR C = Text[0];
 		if (C == '+' || C == '-' || C == '*' || C == '/')
 		{
-			CalcPressOperator(Text);
+			CalcAppendOperator(Text);   // seed from CurrentText on first op, append / replace trailing op
 			return;
 		}
-	}
-
-	// Calculator: a digit pressed right after '=' (a result is showing) or right after an operator (the
-	// expression "5+" is showing) starts a FRESH operand — clear the old value first so we don't append
-	// to the previous result / first operand. (Decimal point also counts as starting the operand.)
-	if (IsCalcEnabled() && (bJustEvaluated || bCalcFreshOperand) && Text.Len() == 1)
-	{
-		const TCHAR C = Text[0];
-		const bool bStartsOperand = (C >= '0' && C <= '9') || C == '.';
-		if (bStartsOperand)
+		// While an expression is being typed, digits / '.' append straight to the expression string (the
+		// bound value stays frozen until '='). Outside expression mode they fall through to plain insertion.
+		if (!CalcExpr.IsEmpty())
 		{
-			CurrentText.Reset();
-			CursorPosition = 0;
-			CalcExpr.Reset();          // leave expression-display mode; preview now follows the new operand
-			CalcCursorPos = 0;
-			bJustEvaluated = false;
-			bCalcFreshOperand = false;
+			const bool bStartsOperand = (C >= '0' && C <= '9') || C == '.';
+			if (bStartsOperand)
+			{
+				CalcAppendDigit(Text);
+				return;
+			}
 		}
 	}
 
@@ -2822,7 +2883,26 @@ void SImSlateVirtualKeyboard::OnKeyInput(const FVirtualKeyDef& KeyDef, const FSt
 	if (Text.Len() == 1 && !IsCharAllowedForNumeric(Text[0]))
 		return;
 
+	// A number may have only ONE decimal point: the first '.' wins, any further '.' is ignored (so tapping
+	// '.' again — anywhere — does nothing rather than producing an invalid "0.5.3"). Numeric pad only; the
+	// expression path returned above, so "1.5+2.3" (two dots across DIFFERENT operands) is unaffected.
+	if (Text == TEXT(".") && KeyboardType == EKeyboardType::Number && CurrentText.Contains(TEXT(".")))
+		return;
+
+	// Plain numeric / text insert. R017: a digit right after Show/'=' on a preloaded value must INSERT into it
+	// (bCalcFreshOperand is already cleared at those points), not replace — handled by InsertText at the caret.
+	bJustEvaluated = false;
+	bCalcFreshOperand = false;
+
 	InsertText(Text);
+
+	// Strip redundant leading zeros from the integer part (DEC plain-numeric only): typing a digit onto the
+	// placeholder/leading "0" should give a clean number — "0"→"1" (not "01"), "0.1" with the caret after the
+	// "0" + "5" → "5.1" (not "05.1"), "007"→"7". The integer part keeps a single "0" when that's all it is
+	// ("0", "0.5" stay; an all-zero run collapses to one "0"). A leading '-' (sign) is preserved. Not for HEX
+	// (it has width-padded zero formatting) and not in expression mode (which returned above; "0-1" is safe).
+	if (KeyboardType == EKeyboardType::Number && NumericRadix == 10)
+		StripLeadingZeros();
 
 	if (ShiftState == EShiftState::SingleShot)
 		ShiftState = EShiftState::Default;
@@ -2837,6 +2917,16 @@ void SImSlateVirtualKeyboard::OnKeyAction(EVirtualKeyAction Action)
 	switch (Action)
 	{
 	case EVirtualKeyAction::Backspace:
+		// Calculator expression mode: backspace edits the EXPRESSION string (delete its last char), not the
+		// frozen value. Emptying it exits expression mode (preview falls back to the value via UpdatePreview).
+		if (IsCalcEnabled() && !CalcExpr.IsEmpty())
+		{
+			CalcExpr = CalcExpr.LeftChop(1);
+			CalcCursorPos = CalcExpr.Len();
+			UpdatePreview();
+			UpdateSuggestions();
+			break;
+		}
 		if (DeleteBackwardWithUndo())
 		{
 			UpdatePreview();
@@ -2856,6 +2946,14 @@ void SImSlateVirtualKeyboard::OnKeyAction(EVirtualKeyAction Action)
 		Hide(false);
 		break;
 	case EVirtualKeyAction::Space:
+		// Calculator: space doubles as '=' (user request). Only on the DEC numeric pad; text fields still
+		// insert a real space.
+		if (IsCalcEnabled())
+		{
+			CalcPressEquals();
+			UpdateSuggestions();
+			break;
+		}
 		InsertText(TEXT(" "));
 		UpdatePreview();
 		UpdateSuggestions();

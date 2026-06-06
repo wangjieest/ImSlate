@@ -244,19 +244,21 @@ private:
 	int32 NumericRadix = 10;                 // integer entry base: 10 / 16 / 2 (radix-toggle key cycles)
 
 	// ---- Numeric calculator state (DEC base only; OCT/HEX have no operators) ----
-	// The keypad doubles as a calculator: digits build CurrentText (the "current operand", a valid
-	// number), operator keys (+ − * /) capture it as StoredOperand and append to CalcExpr, '=' folds
-	// the pending op into a result. preview shows CalcExpr while building (e.g. "5+3"); CurrentText (the
-	// value synced to the bound field via OnTextChanged) is only rewritten when '=' produces a result.
-	FString CalcExpr;            // displayed expression string while building (empty = plain numeric mode)
-	int32 CalcCursorPos = 0;     // caret position WITHIN CalcExpr (expression mode only; left/right drag moves it
-	                             // for visual browsing — input still appends to the end via the state machine)
-	FString PendingOperator;     // "+"/"-"/"*"/"/", empty = none pending
-	double StoredOperand = 0.0;  // first operand captured when an operator was pressed
-	bool bCalcFreshOperand = true;  // true → the next digit starts a NEW operand (clears CurrentText first)
-	FString RepeatOperator;      // last evaluated operator, for repeated '=' (5+3=8, =11, =14)
-	double RepeatOperand = 0.0;  // last evaluated second operand, for repeated '='
-	bool bJustEvaluated = false; // last action was '=' → next digit starts fresh; bare '=' repeats
+	// Expression-string model: the keypad doubles as a calculator. While typing an expression, CalcExpr holds
+	// the WHOLE string the user entered ("3+4-7+8") and is shown verbatim in the preview; digits and operators
+	// append straight to it. CurrentText (the value synced to the bound field via OnTextChanged) is FROZEN
+	// during expression entry and only rewritten when '=' evaluates the whole string left-to-right. CalcExpr
+	// non-empty ⇔ expression mode (the 5 IsEmpty() call sites use this as the mode switch).
+	FString CalcExpr;            // the full expression string being typed (empty = plain numeric mode)
+	int32 CalcCursorPos = 0;     // caret position WITHIN CalcExpr (expression mode; left/right drag browses it)
+	// Legacy two-operand state-machine fields — no longer drive entry (the expression string does), but kept
+	// because bJustEvaluated / bCalcFreshOperand still gate the plain-numeric insert path (R017) and Show().
+	FString PendingOperator;     // (legacy) unused by the expression model
+	double StoredOperand = 0.0;  // (legacy) unused by the expression model
+	bool bCalcFreshOperand = true;  // plain-numeric: true → first digit after Show/= starts fresh (R017 gate)
+	FString RepeatOperator;      // (legacy) unused
+	double RepeatOperand = 0.0;  // (legacy) unused
+	bool bJustEvaluated = false; // set right after '='; plain-numeric insert path consults it
 	FString HistoryKey;                      // non-empty → input history enabled (set from Show params)
 	TFunction<bool(const FString&)> HistoryFilter;  // only entries passing this are recorded
 	int32 HistoryMax = 10;                   // per-key cap (from Show params); default 10
@@ -405,6 +407,7 @@ private:
 	void HidePreviewStepRuler();              // remove the preview ruler (on release)
 	void InsertText(const FString& Text);
 	void DeleteBackward();
+	void StripLeadingZeros();         // drop redundant leading zeros of the integer part (DEC numeric; "05"→"5")
 	// Backspace-at-caret WITH undo: delete the char left of the caret and push it (with its index) onto the
 	// undo stack. Returns true if a char was deleted. (Plain DeleteBackward does not record undo.)
 	bool DeleteBackwardWithUndo();
@@ -429,10 +432,16 @@ private:
 	// to BitWidth/4 nibbles), never a '-' sign. BitWidth 0 → HEX uses 64-bit mask, no zero-padding.
 	static FString FormatIntInRadix(int64 Value, int32 Radix, int32 BitWidth = 0);
 
-	// ---- Numeric calculator ----
+	// ---- Numeric calculator (expression-string model) ----
+	// CalcExpr holds the FULL expression the user typed ("3+4-7+8"), shown verbatim in the preview (WYSIWYG).
+	// CurrentText (the value synced to the bound field) is frozen while an expression is being typed and is
+	// only rewritten when '=' evaluates the whole string. CalcExpr non-empty ⇔ "expression mode".
 	bool IsCalcEnabled() const;                        // true only on DEC numeric pad (radix 10)
-	void CalcPressOperator(const FString& Op);         // + − * / : fold any pending op, capture operand, start expr
-	void CalcPressEquals();                            // = : evaluate pending op (or repeat last) → result in CurrentText
+	void CalcAppendOperator(const FString& Op);        // + − * / : seed CalcExpr from CurrentText (first op) then
+	                                                   //   append; a trailing operator is REPLACED (5+− → 5−)
+	void CalcAppendDigit(const FString& Ch);           // append a digit/'.' to the expression string (expr mode)
+	double CalcEvaluateExpression(const FString& Expr, bool& bOutDivZero) const;  // left-to-right fold of the whole string
+	void CalcPressEquals();                            // = : evaluate CalcExpr → result into CurrentText, exit expr mode
 	double CalcCompute(double A, double B, const FString& Op, bool& bOutDivZero) const;  // A op B, int/float aware
 	void CalcWriteResult(double Value);                // clamp + format Value into CurrentText, sync field, exit expr mode
 	void CalcReset();                                  // clear all calculator memory (expr + pending + repeat)
