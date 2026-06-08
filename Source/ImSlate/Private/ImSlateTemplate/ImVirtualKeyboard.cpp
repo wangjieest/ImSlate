@@ -997,8 +997,10 @@ void SImSlateVirtualKeyboard::UpdateSignKey()
 	const bool bShow = (KeyboardType == EKeyboardType::Number)
 		&& (NumericRadix == 10)            // sign only meaningful in DEC
 		&& NumericParams.bAllowNegative
-		&& !bRangeForbidsNeg
-		&& CalcExpr.IsEmpty();             // hidden while an expression is being built
+		&& !bRangeForbidsNeg;
+	// NOTE: ± stays visible during expression entry too (it signs the FIRST operand). Collapsing it mid-
+	// expression used to make the preview row jump — keep a stable layout. (Fields that can't go negative
+	// still hide it via bAllowNegative / bRangeForbidsNeg above.)
 	SignKey->SetVisibility(bShow ? EVisibility::Visible : EVisibility::Collapsed);
 	// Labels are TAttribute lambdas (read the value's sign) — just repaint so they refresh after a change.
 	if (bShow)
@@ -1999,25 +2001,44 @@ void SImSlateVirtualKeyboard::AdjustDigitAtCursor(int32 Direction)
 	}
 	else
 	{
-		// Decimal float: place value = 10^(exponent of the cursor's digit relative to the dot).
-		// Digits left of the dot have exponent >=0; right of the dot are negative.
-		int32 Exp;
-		if (DotPos == INDEX_NONE || Idx < DotPos)
+		// Decimal float. The cursor's digit drives a place-value step, EXCEPT the most-significant integer
+		// digit which uses the same cross-magnitude "top digit" step as integers (100000→90000, not →0). The
+		// fractional part is preserved across a top-digit step (500000.5→400000.5→…→90000.5). Works on the
+		// MAGNITUDE so negatives behave symmetrically (sign kept): -100000 toward 0 → -90000, away → -200000.
+		double Val = FCString::Atod(*Old);
+		const bool bIntegerSide = (DotPos == INDEX_NONE || Idx < DotPos);
+		const double IntPartD = FMath::TruncToDouble(FMath::Abs(Val));
+
+		if (bIsTopDigit && bIntegerSide && IntPartD > 0.0)
 		{
-			// integer side: count digit columns from Idx to the dot (or end)
-			const int32 End = (DotPos == INDEX_NONE) ? Old.Len() : DotPos;
-			int32 RightDigits = 0;
-			for (int32 i = Idx + 1; i < End; ++i) if (FChar::IsHexDigit(Old[i])) ++RightDigits;
-			Exp = RightDigits;
+			// Same handling as an integer field's top digit, applied to the |INTEGER part|; keep the fraction
+			// and the sign. "Down" (Direction<0) shrinks the magnitude, "Up" grows it — for a negative value
+			// that means down→toward 0, up→more negative (the digit under the caret still goes the way it
+			// visually should, since it's the magnitude's leading digit).
+			const double Sign = (Val < 0.0) ? -1.0 : 1.0;
+			const double Frac = FMath::Abs(Val) - IntPartD;
+			int64 IntPart = (int64)IntPartD;
+			IntPart = (Direction < 0) ? TopDigitStepDown(IntPart) : TopDigitStepUp(IntPart);
+			Val = Sign * ((double)IntPart + Frac);
 		}
 		else
 		{
-			// fractional side: position after the dot (1-based) → negative exponent
-			Exp = -(Idx - DotPos);
+			// Standard place-value step: 10^(exponent of the cursor's digit relative to the dot).
+			int32 Exp;
+			if (bIntegerSide)
+			{
+				const int32 End = (DotPos == INDEX_NONE) ? Old.Len() : DotPos;
+				int32 RightDigits = 0;
+				for (int32 i = Idx + 1; i < End; ++i) if (FChar::IsHexDigit(Old[i])) ++RightDigits;
+				Exp = RightDigits;
+			}
+			else
+			{
+				Exp = -(Idx - DotPos);  // fractional side: 1-based position after the dot → negative exponent
+			}
+			const double Place = FMath::Pow(10.0, (double)Exp);
+			Val += (double)Direction * Place;
 		}
-		double Place = FMath::Pow(10.0, (double)Exp);
-		double Val = FCString::Atod(*Old);
-		Val += (double)Direction * Place;
 		if (NumericParams.Min.IsSet()) Val = FMath::Max(Val, NumericParams.Min.GetValue());
 		if (NumericParams.Max.IsSet()) Val = FMath::Min(Val, NumericParams.Max.GetValue());
 		// PRESERVE the fractional digit count of the OLD text while SCRUBBING — SanitizeFloat strips trailing
@@ -3003,8 +3024,24 @@ void SImSlateVirtualKeyboard::OnKeyAction(EVirtualKeyAction Action)
 		break;
 	case EVirtualKeyAction::SignToggle:
 	{
-		// Preview-row ± key: flip the sign of the current value, clamped. Calculator-aware: if an
-		// expression is mid-build the ± applies to the value (rare; ± is hidden in expr mode anyway).
+		// Expression mode: ± signs the FIRST operand of the expression string (the leading number). A leading
+		// '-' is removed, otherwise one is prepended — "5+3" ↔ "-5+3". The bound value stays frozen until '='.
+		if (IsCalcEnabled() && !CalcExpr.IsEmpty())
+		{
+			if (CalcExpr.Len() > 0 && CalcExpr[0] == TEXT('-'))
+			{
+				CalcExpr.RemoveAt(0, 1);
+				CalcCursorPos = FMath::Max(0, CalcCursorPos - 1);
+			}
+			else
+			{
+				CalcExpr.InsertAt(0, TEXT('-'));
+				CalcCursorPos += 1;
+			}
+			UpdatePreview();
+			break;
+		}
+		// Preview-row ± key: flip the sign of the current value, clamped.
 		const bool bFloat = NumericParams.bAllowDecimal && NumericRadix == 10;
 		if (bFloat)
 		{

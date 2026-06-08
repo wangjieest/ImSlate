@@ -728,10 +728,25 @@ int32 SImSwitchKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeo
 	FSlateDrawElement::MakeLines(OutDrawElements, LayerId + 1, AllottedGeometry.ToPaintGeometry(), Slash,
 		ESlateDrawEffect::None, FLinearColor(0.5f, 0.5f, 0.5f, 0.7f), true, 1.f);
 
+	// Pick the largest font (≤ a preferred logical size) whose rendered width fits MaxWidthPx, so a 3-char
+	// label like "DEC" shrinks on a narrow key instead of overflowing (the old fixed 11pt was too big there).
+	auto FitFont = [&](const FString& Str, int32 PreferredSize, float MaxWidthPx, int32 MinSize) -> FSlateFontInfo
+	{
+		FSlateFontInfo Font = GetImSlateDefaultFont(PreferredSize);
+		const float W = (float)FontMeasure->Measure(Str, Font).X;
+		if (W > MaxWidthPx && W > 0.f)
+		{
+			const int32 Fitted = FMath::Clamp(FMath::FloorToInt(PreferredSize * (MaxWidthPx / W)), MinSize, PreferredSize);
+			Font = GetImSlateDefaultFont(Fitted);
+		}
+		return Font;
+	};
+
 	// Current state: big, top-left (above the slash). Switch target: small, bottom-right (below it).
 	if (!TopText.IsEmpty())
 	{
-		FSlateFontInfo TopFont = GetImSlateDefaultFont(11);
+		// Available width = from the left inset (0.10) to roughly the slash mid-line; clamp so it never spills.
+		FSlateFontInfo TopFont = FitFont(TopText, 11, LocalSize.X * 0.62f, 6);
 		const FVector2D TopSize = (FVector2D)FontMeasure->Measure(TopText, TopFont);
 		const FVector2D TopPos(LocalSize.X * 0.10f, LocalSize.Y * 0.12f);
 		FSlateDrawElement::MakeText(OutDrawElements, LayerId + 1,
@@ -740,7 +755,7 @@ int32 SImSwitchKey::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeo
 	}
 	if (!BotText.IsEmpty())
 	{
-		FSlateFontInfo BotFont = GetImSlateDefaultFont(7);
+		FSlateFontInfo BotFont = FitFont(BotText, 7, LocalSize.X * 0.55f, 5);
 		const FVector2D BotSize = (FVector2D)FontMeasure->Measure(BotText, BotFont);
 		const FVector2D BotPos(LocalSize.X * 0.90f - BotSize.X, LocalSize.Y * 0.88f - BotSize.Y);
 		FSlateDrawElement::MakeText(OutDrawElements, LayerId + 1,
