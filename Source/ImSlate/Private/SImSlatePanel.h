@@ -345,6 +345,10 @@ protected:
 	bool bPanningCapture = false;                        // crossed threshold & captured
 	EPanMode PanMode = EPanMode::None;                   // locked once at the threshold (no mid-drag switch)
 	FVector2D AbsGrabOffset = FVector2D::ZeroVector;     // MoveWindow only: press pos - window abs pos
+	// MoveWindow only: the window's position + the finger's screen pos at the moment the move started, so each
+	// frame sets window = MoveWindowStartWindowPos + (currentScreenPos - MoveWindowStartScreenPos)/scale.
+	FVector2D MoveWindowStartWindowPos = FVector2D::ZeroVector;
+	FVector2D MoveWindowStartScreenPos = FVector2D::ZeroVector;
 
 	void BeginPanCandidate(const FPointerEvent& PointerEvent);
 	// Returns true (with OutReply set) when a pan starts this move; false to keep bubbling.

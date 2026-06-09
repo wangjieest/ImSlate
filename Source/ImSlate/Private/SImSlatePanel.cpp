@@ -23,6 +23,17 @@ static FAutoConsoleVariableRef CVar_ImSlateDragScrollContent(
 	TEXT("imslate.DragScrollContent"),
 	GImSlateDragScrollContent,
 	TEXT("Drag/touch-to-scroll on panel content (e.g. drag a fold header to scroll). 1=on, 0=off."));
+
+// Horizontal-drag-to-move-window threshold factor. On a SCROLLABLE panel, a vertical drag scrolls content
+// while a HORIZONTAL drag in the blank area moves the whole window (the thin titlebar is hard to grab on
+// mobile). The horizontal trigger distance = GetDragTriggerDistance() * this factor — made larger than the
+// vertical scroll trigger so a small sideways wobble during a vertical scroll doesn't accidentally move the
+// window. 0 disables horizontal-drag-to-move (vertical scroll only).
+float GImSlatePanelHSlideMoveFactor = 2.5f;
+static FAutoConsoleVariableRef CVar_ImSlatePanelHSlideMoveFactor(
+	TEXT("imslate.PanelHSlideMoveFactor"),
+	GImSlatePanelHSlideMoveFactor,
+	TEXT("Horizontal blank-area drag on a scrollable panel moves the window past this *DragTriggerDistance. 0=off."));
 XMetaVar(TEXT("imslate.LayoutScale"), DisplayName, TEXT("UI Scale"))(ClampMin, 0.5)(ClampMax, 4.0)(UIMin, 0.5)(UIMax, 4.0);
 
 // Reference physical density (PPI). On desktop, scale=1 looks right and desktops sit around
@@ -707,15 +718,24 @@ bool SImSlatePanel::TryStartPan(const FGeometry& MyGeometry, const FPointerEvent
 
 void SImSlatePanel::ApplyPanDelta(const FGeometry& MyGeometry, FVector2D CurAbsScreenPos, FVector2D ScreenDelta)
 {
-	// Only Scroll reaches here: move-window is handed off to drag-drop at TryStartPan, not driven per-move.
+	const float Scale = MyGeometry.Scale > 0.f ? MyGeometry.Scale : 1.f;
+
 	if (PanMode == EPanMode::Scroll)
 	{
-		const float Scale = MyGeometry.Scale > 0.f ? MyGeometry.Scale : 1.f;
 		ScrollByDelta(-ScreenDelta.Y / Scale);  // content moves opposite to the finger
 		// Sample velocity for flick-to-coast. Sign matches the offset delta above (-ScreenDelta.Y), so the
 		// coast continues in the content-move direction. Sampled in screen space; converted by Scale on use.
 		LastScrollSampleTime = FSlateApplication::Get().GetCurrentTime();
 		InertialScrollManager.AddScrollSample(-ScreenDelta.Y, LastScrollSampleTime);
+	}
+	else if (PanMode == EPanMode::MoveWindow && Window)
+	{
+		// Move the whole window: window pos = start pos + total finger travel (screen→local via Scale). Using
+		// the absolute travel-from-start (not per-frame delta) avoids drift accumulation. DragingWindowPos's
+		// CacheDesiredSize clamp keeps the window inside the viewport.
+		const FVector2D TravelLocal = (CurAbsScreenPos - MoveWindowStartScreenPos) / Scale;
+		const FVector2D NewPos = MoveWindowStartWindowPos + TravelLocal;
+		Window->DragingWindowPos(NewPos, NewPos);
 	}
 }
 
@@ -895,7 +915,31 @@ FReply SImSlatePanel::OnMouseMove(const FGeometry& MyGeometry, const FPointerEve
 		// Accumulate until past the drag threshold; below it, children keep receiving clicks.
 		PendingDragTrigger += (Cur - LastMoveScreenPos).Size();
 		LastMoveScreenPos = Cur;
-		if (PendingDragTrigger > FSlateApplication::Get().GetDragTriggerDistance())
+
+		// Axis split (scrollable panel, blank area): a HORIZONTAL drag past the (larger) horizontal threshold
+		// moves the WHOLE window — the thin mobile titlebar is hard to grab. A VERTICAL drag scrolls content.
+		// Use the offset from the PRESS point for direction. Horizontal threshold is bigger so a small sideways
+		// wobble during a vertical scroll doesn't trip it. (Only when there's scroll room; a non-scrollable
+		// panel already bubbles the press to the window for dragging — handled in OnMouseButtonDown.)
+		const FVector2D FromPress = Cur - PressScreenPos;
+		const float BaseTrigger = FSlateApplication::Get().GetDragTriggerDistance();
+		const float HMoveTrigger = BaseTrigger * FMath::Max(GImSlatePanelHSlideMoveFactor, 0.f);
+		const bool bHorizontalDominant = FMath::Abs(FromPress.X) > FMath::Abs(FromPress.Y);
+
+		if (CanScroll() && GImSlatePanelHSlideMoveFactor > 0.f && bHorizontalDominant
+			&& FMath::Abs(FromPress.X) > HMoveTrigger && Window)
+		{
+			// Start moving the window. Panel keeps capture and drives SetWindowPos directly (no drag-drop), so
+			// the (0,0) phantom-pointer issue that affects drag-drop can't occur here.
+			PanMode = EPanMode::MoveWindow;
+			bPanningCapture = true;
+			LastMoveScreenPos = Cur;
+			MoveWindowStartScreenPos = Cur;
+			MoveWindowStartWindowPos = Window->GetWindowPos();
+			return FReply::Handled().CaptureMouse(AsShared());
+		}
+
+		if (PendingDragTrigger > BaseTrigger)
 		{
 			FReply Reply = FReply::Unhandled();
 			if (TryStartPan(MyGeometry, MouseEvent, Reply))

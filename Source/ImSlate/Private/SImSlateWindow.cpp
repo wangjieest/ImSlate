@@ -109,9 +109,9 @@ class FImSlateDragOperation : public FDragDropOperation
 public:
 	DRAG_DROP_OPERATOR_TYPE(FImSlateDragOperation, FDragDropOperation)
 
-	static TSharedRef<FImSlateDragOperation> New(const TSharedRef<SImSlateWindow>& InWindowToBeDragged, const FVector2D& InGrabOffset)
+	static TSharedRef<FImSlateDragOperation> New(const TSharedRef<SImSlateWindow>& InWindowToBeDragged, const FVector2D& InGrabOffset, int32 InOwnerPointerIndex)
 	{
-		const TSharedRef<FImSlateDragOperation> Operation = MakeShareable(new FImSlateDragOperation(InWindowToBeDragged, InGrabOffset));
+		const TSharedRef<FImSlateDragOperation> Operation = MakeShareable(new FImSlateDragOperation(InWindowToBeDragged, InGrabOffset, InOwnerPointerIndex));
 		return Operation;
 	}
 
@@ -119,14 +119,23 @@ protected:
 	TSharedRef<SImSlateWindow> ImSlateWindow;
 	FVector2D AbsGrabOffset;
 	int32 FrameKeepInGameView = 0;
-	FImSlateDragOperation(const TSharedRef<SImSlateWindow>& InWindowToBeDragged, const FVector2D& InGrabOffset)
+	int32 OwnerPointerIndex = -1;  // the pointer (finger) that started the drag; OnDragged ignores all others
+	FImSlateDragOperation(const TSharedRef<SImSlateWindow>& InWindowToBeDragged, const FVector2D& InGrabOffset, int32 InOwnerPointerIndex)
 		: ImSlateWindow(InWindowToBeDragged)
 		, AbsGrabOffset(InGrabOffset)
+		, OwnerPointerIndex(InOwnerPointerIndex)
 	{
 	}
 
 	virtual void OnDragged(const FDragDropEvent& DragDropEvent) override
 	{
+		// Ignore drag updates from any pointer OTHER than the finger/cursor that started this drag. On mobile a
+		// phantom pointer (observed PtrIdx=10, ScreenPos=(0,0)) interleaves with the real finger's events; acting
+		// on it sets the window to ~origin, so the panel flickers between the correct spot and (0,0). Filtering
+		// by the originating pointer index drops those bogus (0,0) frames. (OwnerPointerIndex == -1 → no filter.)
+		if (OwnerPointerIndex != -1 && DragDropEvent.GetPointerIndex() != OwnerPointerIndex)
+			return;
+
 		bool bIsHostGameViewport = ImSlateWindow->IsViewportGame();
 
 		if (bSupportImViewportHost && bIsHostGameViewport && !ImSlateWindow->IsAreaInGameViewport())
@@ -665,7 +674,12 @@ public:
 	TOptional<float> TitleHeight;
 	float GetTitleHeight() const
 	{
-		return TitleHeight.Get(24.f) * ImSlate::GetImSlateEffectiveScale();
+		float H = TitleHeight.Get(24.f);
+#if !PLATFORM_DESKTOP
+		// Mobile: finger-friendly minimum (matches SImSlateWindow::GetTitleHeight). Desktop keeps the value.
+		H = FMath::Max(H, 44.f);
+#endif
+		return H * ImSlate::GetImSlateEffectiveScale();
 	}
 
 public:
@@ -1422,7 +1436,13 @@ float SImSlateWindow::GetTitleHeight() const
 {
 	if (Flags & ImSlateWindowFlags_NoTitleBar)
 		return 0.f;
-	return TitleHeight * ImSlate::GetImSlateEffectiveScale();
+	float H = TitleHeight;
+#if PLATFORM_IOS || PLATFORM_ANDROID
+	// Mobile: the titlebar doubles as the touch grab area for moving the window, so enforce a finger-friendly
+	// minimum height (~44pt) — the desktop default (24) is too thin to hit reliably. Desktop keeps TitleHeight.
+	H = FMath::Max(H, 44.f);
+#endif
+	return H * ImSlate::GetImSlateEffectiveScale();
 }
 
 FReply SImSlateWindow::OnDragDetected(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
@@ -1450,7 +1470,7 @@ FReply SImSlateWindow::OnDragDetected(const FGeometry& MyGeometry, const FPointe
 			AbsGrabOffset.Y = FMath::Min((float)AbsGrabOffset.Y, TitleH * 0.5f);  // clamp into the titlebar
 		}
 
-		TSharedRef<FImSlateDragOperation> DragDropOperation = FImSlateDragOperation::New(ToSharedRef(), AbsGrabOffset);
+		TSharedRef<FImSlateDragOperation> DragDropOperation = FImSlateDragOperation::New(ToSharedRef(), AbsGrabOffset, MouseEvent.GetPointerIndex());
 		return FReply::Handled().BeginDragDrop(DragDropOperation).PreventThrottling();
 	}
 	return SImSlateWindowBase::OnDragDetected(MyGeometry, MouseEvent);
