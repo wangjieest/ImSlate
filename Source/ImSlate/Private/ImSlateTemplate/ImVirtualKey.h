@@ -91,6 +91,12 @@ private:
 	// LongPressAnchorPos (Space/Del's single-axis step-drag) so the two never interfere.
 	FVector2D StepAnchorPos = FVector2D::ZeroVector;
 	bool bStepDragActive = false;
+	// Last-fired step direction per step-drag channel, for ImSlateStepAccumulate's reverse-debounce. Four-way
+	// has independent X/Y; the long-press family (Space cursor / spin / Del / Done / selection) is single-axis
+	// and mutually exclusive so one suffices. Reset on press/release.
+	int32 StepDragLastDirX = 0;
+	int32 StepDragLastDirY = 0;
+	int32 LongPressLastDir = 0;
 
 	using ESwipeDirection = EImSwipeDir;  // public enum; alias keeps existing references compiling
 

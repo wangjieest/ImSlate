@@ -284,6 +284,12 @@ FReply SImSlateKey::OnTouchStarted(const FGeometry& MyGeometry, const FPointerEv
 {
 	if (KeyDef && KeyDef->bDisabled)
 		return FReply::Unhandled();
+	// During a preview scrub, don't consume/capture this touch — bubble it UP so the keyboard can register it
+	// as a relay finger (a 2nd finger landing on a key continues the scrub instead of typing). HandlePress also
+	// no-ops mid-scrub, but returning Unhandled here is what lets the event reach the parent keyboard.
+	if (TSharedPtr<SImSlateVirtualKeyboard> Kb = SImSlateVirtualKeyboard::Get())
+		if (Kb->IsPreviewDragging())
+			return FReply::Unhandled();
 	HandlePress(MyGeometry, InTouchEvent.GetScreenSpacePosition());
 	return FReply::Handled().CaptureMouse(SharedThis(this));
 }
@@ -326,6 +332,14 @@ void SImSlateKey::HandlePress(const FGeometry& MyGeometry, const FVector2D& Scre
 	if (KeyDef && KeyDef->bDisabled)
 		return;
 
+	// While the preview value is being scrub-dragged, keys are inert: a finger drifting onto a key (or a relay
+	// finger landing on one) must not type. HandlePress is the single press entry for ALL keys, so one check
+	// here covers every digit/function key. (Keyboard already exists — this key is its child — so Get() won't
+	// create one.)
+	if (TSharedPtr<SImSlateVirtualKeyboard> Kb = SImSlateVirtualKeyboard::Get())
+		if (Kb->IsPreviewDragging())
+			return;
+
 	bIsPressed = true;
 	bSwipeDetected = false;
 	bSwipeActive = false;
@@ -333,6 +347,9 @@ void SImSlateKey::HandlePress(const FGeometry& MyGeometry, const FVector2D& Scre
 	bWasInOuterZone = false;
 	bSwipeVisualShown = false;
 	bStepDragActive = false;
+	StepDragLastDirX = 0;  // fresh press → no stale reverse-debounce direction on any step-drag channel
+	StepDragLastDirY = 0;
+	LongPressLastDir = 0;
 	StepAnchorPos = ScreenPos;
 	ActiveSwipeDir = ESwipeDirection::None;
 	LastCursorZone = 0;
@@ -532,14 +549,19 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 	if (bStepDragActive && KeyDef->Swipe.OnStep)
 	{
 		const float StepW = 12.f * GetImSlateEffectiveScale();
+		const float Scale = GetImSlateEffectiveScale();
+		// Horizontal (right = +X). Feed the offset to the shared helper (reverse-debounce), then advance the
+		// anchor by however much it consumed. Vertical mirrors it (screen Y down → up = -Y).
 		float XOff = ScreenPos.X - StepAnchorPos.X;
+		ImSlateStepAccumulate(XOff, StepDragLastDirX, StepW, Scale,
+			[this] { if (KeyDef->Swipe.Right.bStep) KeyDef->Swipe.OnStep(EImSwipeDir::Right); },
+			[this] { if (KeyDef->Swipe.Left.bStep)  KeyDef->Swipe.OnStep(EImSwipeDir::Left); });
+		StepAnchorPos.X = ScreenPos.X - XOff;
 		float YOff = ScreenPos.Y - StepAnchorPos.Y;
-		// Horizontal: right = +X, left = -X.
-		while (XOff > StepW)  { if (KeyDef->Swipe.Right.bStep) KeyDef->Swipe.OnStep(EImSwipeDir::Right); StepAnchorPos.X += StepW; XOff -= StepW; }
-		while (XOff < -StepW) { if (KeyDef->Swipe.Left.bStep)  KeyDef->Swipe.OnStep(EImSwipeDir::Left);  StepAnchorPos.X -= StepW; XOff += StepW; }
-		// Vertical: screen Y grows downward → up = -Y, down = +Y.
-		while (YOff < -StepW) { if (KeyDef->Swipe.Up.bStep)   KeyDef->Swipe.OnStep(EImSwipeDir::Up);   StepAnchorPos.Y -= StepW; YOff += StepW; }
-		while (YOff > StepW)  { if (KeyDef->Swipe.Down.bStep) KeyDef->Swipe.OnStep(EImSwipeDir::Down); StepAnchorPos.Y += StepW; YOff -= StepW; }
+		ImSlateStepAccumulate(YOff, StepDragLastDirY, StepW, Scale,
+			[this] { if (KeyDef->Swipe.Down.bStep) KeyDef->Swipe.OnStep(EImSwipeDir::Down); },  // +Y = down
+			[this] { if (KeyDef->Swipe.Up.bStep)   KeyDef->Swipe.OnStep(EImSwipeDir::Up); });   // -Y = up
+		StepAnchorPos.Y = ScreenPos.Y - YOff;
 		// Drive the ruler visual (absolute drag delta; the visual itself does the fmod wrap).
 		OnMoveVisual.ExecuteIfBound(FVector2D(ScreenPos.X - PressStartPos.X, ScreenPos.Y - PressStartPos.Y), true);
 		return;  // step-drag owns this move; skip the single-shot swipe-visual direction logic below
@@ -549,46 +571,46 @@ void SImSlateKey::HandleMove(const FGeometry& MyGeometry, const FVector2D& Scree
 	if (bLongPressHandled)
 	{
 		float XOffset = ScreenPos.X - LongPressAnchorPos.X;
-		float StepW = 12.f * GetImSlateEffectiveScale();
+		const float StepW = 12.f * GetImSlateEffectiveScale();
+		const float Scale = GetImSlateEffectiveScale();
+		OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);
 
+		// All long-press step-drags are single horizontal-axis and mutually exclusive (only one branch runs),
+		// so they share LongPressLastDir for the shared reverse-debounce helper. Each branch supplies its
+		// Pos (drag-right) / Neg (drag-left) action; the anchor is then advanced by however much was consumed.
 		if (KeyDef->Action == EVirtualKeyAction::Space)
 		{
-			OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);
-			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Right); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
-			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Left);  LongPressAnchorPos.X -= StepW; XOffset += StepW; }
+			ImSlateStepAccumulate(XOffset, LongPressLastDir, StepW, Scale,
+				[this] { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Right); },
+				[this] { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Left); });
 		}
 		else if (bIsStep)
 		{
-			// Numeric spin keys: horizontal drag continuously adjusts the value (right = +, left = −),
-			// one step per StepW of travel — same step-drag feel as Space's cursor. A plain tap (no
-			// drag) still fires the key's own StepUp/StepDown once via HandleRelease.
-			OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);
-			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::StepUp);   LongPressAnchorPos.X += StepW; XOffset -= StepW; }
-			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::StepDown); LongPressAnchorPos.X -= StepW; XOffset += StepW; }
+			// Numeric spin keys: horizontal drag continuously adjusts the value (right = +, left = −). A plain
+			// tap (no drag) still fires the key's own StepUp/StepDown once via HandleRelease.
+			ImSlateStepAccumulate(XOffset, LongPressLastDir, StepW, Scale,
+				[this] { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::StepUp); },
+				[this] { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::StepDown); });
 		}
-		else if (KeyDef->Action == EVirtualKeyAction::Backspace)
+		else if (KeyDef->Action == EVirtualKeyAction::Backspace || KeyDef->Action == EVirtualKeyAction::Enter)
 		{
-			OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);
-			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Backspace);     LongPressAnchorPos.X -= StepW; XOffset += StepW; }
-			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::UndoBackspace); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
-		}
-		else if (KeyDef->Action == EVirtualKeyAction::Enter)  // Done horizontal drag: same as Del
-		{
-			OnMoveVisual.ExecuteIfBound(FVector2D(XOffset, 0.f), true);  // highlight ◀ Del / Undo ▶
-			while (XOffset < -StepW) { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Backspace);     LongPressAnchorPos.X -= StepW; XOffset += StepW; }
-			while (XOffset > StepW)  { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::UndoBackspace); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
+			// Del / Done horizontal drag: right = Undo, left = Delete.
+			ImSlateStepAccumulate(XOffset, LongPressLastDir, StepW, Scale,
+				[this] { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::UndoBackspace); },
+				[this] { OnKeyAction.ExecuteIfBound(EVirtualKeyAction::Backspace); });
 		}
 		else if (LongPressCharCount > 0)
 		{
-			// Step-drag selection (like Space/Del): every StepW of movement advances the
-			// selection by one, accumulating — so a small finger motion scans many entries.
-			// NOT an absolute finger-position mapping.
-			int32 OldIndex = LongPressSelIndex;
-			while (XOffset > StepW)  { LongPressSelIndex = FMath::Min(LongPressSelIndex + 1, LongPressCharCount - 1); LongPressAnchorPos.X += StepW; XOffset -= StepW; }
-			while (XOffset < -StepW) { LongPressSelIndex = FMath::Max(LongPressSelIndex - 1, 0);                      LongPressAnchorPos.X -= StepW; XOffset += StepW; }
+			// Step-drag selection: each StepW of travel advances the selection by one (accumulating scan, not
+			// an absolute finger-position mapping).
+			const int32 OldIndex = LongPressSelIndex;
+			ImSlateStepAccumulate(XOffset, LongPressLastDir, StepW, Scale,
+				[this] { LongPressSelIndex = FMath::Min(LongPressSelIndex + 1, LongPressCharCount - 1); },
+				[this] { LongPressSelIndex = FMath::Max(LongPressSelIndex - 1, 0); });
 			if (LongPressSelIndex != OldIndex)
 				OnLongPressMove.ExecuteIfBound(LongPressSelIndex);
 		}
+		LongPressAnchorPos.X = ScreenPos.X - XOffset;  // advance anchor by the consumed amount
 		return;
 	}
 

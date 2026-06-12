@@ -106,6 +106,55 @@ static FAutoConsoleVariableRef CVar_ImSlateKeyboardEdgeMargin(
 	GImSlateKeyboardEdgeMargin,
 	TEXT("Min keyboard edge margin in logical px (×KeyboardScale), max'd with the OS safe area. 0 = flush on desktop."));
 
+// Horizontal preview-scrub step tuning. Base step threshold = CellWidth × WidthMult (the "speed" knob):
+//  - WidthMult: how many CELL WIDTHS of travel make one column step (1.0 = one cell per step; lower = quicker,
+//    higher = more travel per step). Same-direction consecutive steps use exactly this — fully responsive.
+//  - DebouncePx: a REVERSE-only dead zone (logical px, ×KbScale) added ONLY when the next step would reverse
+//    the previous step's direction, so the selection doesn't flicker back and forth across a column boundary.
+//    Forward (same-direction) stepping is unaffected.
+float GImSlatePreviewHWidthMult = 1.0f;
+static FAutoConsoleVariableRef CVar_ImSlatePreviewHWidthMult(
+	TEXT("imslate.PreviewHWidthMult"),
+	GImSlatePreviewHWidthMult,
+	TEXT("Cell-width multiple of horizontal travel per preview digit-column step (the speed knob; 1.0 = 1 cell)."));
+
+// Reverse-direction dead zone (logical px, ×scale) shared by ALL continuous step gestures (preview H/V scrub
+// AND SImSlateKey step-drag): added only when the next step would reverse the previous step's direction, so
+// nothing flickers back and forth at a boundary. Same-direction stepping is unaffected. Global (not static):
+// ImVirtualKey.cpp uses it via the extern in ImVirtualKeyboard.h. Used by ImSlateStepAccumulate below.
+float GImSlateStepReverseDebouncePx = 8.0f;
+static FAutoConsoleVariableRef CVar_ImSlateStepReverseDebouncePx(
+	TEXT("imslate.StepReverseDebouncePx"),
+	GImSlateStepReverseDebouncePx,
+	TEXT("Extra dead zone in logical px (×scale) to REVERSE any continuous step-drag direction (anti-flicker)."));
+
+// Shared stepping helper — see header doc. Fires Pos/Neg per BaseStep of accumulated travel, with a
+// reverse-direction dead zone. Returns net steps (anchor-based callers advance their anchor by this).
+int32 ImSlateStepAccumulate(float& Accum, int32& InOutLastDir, float BaseStep, float ScalePx,
+	TFunctionRef<void()> PosStep, TFunctionRef<void()> NegStep)
+{
+	if (BaseStep <= 0.f)
+		return 0;
+	const float Dead = FMath::Max(GImSlateStepReverseDebouncePx, 0.f) * FMath::Max(ScalePx, 0.f);
+	int32 Net = 0;
+	// Positive direction: a reverse is when the last fired step was negative → require the extra dead zone.
+	while (Accum > (BaseStep + (InOutLastDir < 0 ? Dead : 0.f)))
+	{
+		PosStep();
+		Accum -= BaseStep + (InOutLastDir < 0 ? Dead : 0.f);
+		InOutLastDir = +1;
+		++Net;
+	}
+	while (Accum < -(BaseStep + (InOutLastDir > 0 ? Dead : 0.f)))
+	{
+		NegStep();
+		Accum += BaseStep + (InOutLastDir > 0 ? Dead : 0.f);
+		InOutLastDir = -1;
+		--Net;
+	}
+	return Net;
+}
+
 // Extra LEFT/RIGHT margin on mobile when the screen is in LANDSCAPE, as a fraction of screen
 // width. Phones in landscape put cutouts/rounded corners on the left & right; this pulls the
 // keyboard edges further in so keys stay reachable and unobscured. Applied via max() like the
@@ -1158,7 +1207,16 @@ void SImSlateVirtualKeyboard::Construct(const FArguments& InArgs)
 		}))
 		[
 			SNew(SBox)
-			.MaxDesiredHeight(120.f)  // cap; beyond this the scroll box scrolls
+			// Max height = the empty space ABOVE the preview row: from the viewport top (minus the top safe
+			// area) down to the top of the preview+keys block. So candidates wrap UPWARD and fill that whole
+			// gap before the scroll box ever scrolls (the old fixed 120px — un-scaled — scrolled almost
+			// immediately on high-PPI screens while leaving the space above empty).
+			.MaxDesiredHeight(TAttribute<FOptionalSize>::CreateLambda([this]() -> FOptionalSize {
+				const float PreviewKeysH = PreviewKeysRoot.IsValid() ? PreviewKeysRoot->GetCachedGeometry().GetLocalSize().Y : 0.f;
+				const FMargin Safe = GetKbSafeMargin();
+				const float Avail = GCachedViewportHeight - PreviewKeysH - Safe.Bottom - Safe.Top;
+				return FOptionalSize(FMath::Max(Avail, 40.f * GetKbScale()));  // never collapse below ~one row
+			}))
 			[
 				SNew(SScrollBox)
 				.Orientation(Orient_Vertical)
@@ -2378,21 +2436,22 @@ void SImSlateVirtualKeyboard::HandlePreviewDrag(const FVector2D& Delta)
 
 	if (PreviewDragAxis == 1 && KeyboardType == EKeyboardType::Number && SelectedDigitIndex != INDEX_NONE)
 	{
-		// Horizontal: switch the highlighted digit. Requires >110% of the cell width of accumulated travel
-		// before each switch (10% elastic margin).
+		// Horizontal: switch the highlighted digit. Base step = CellWidth × WidthMult; reverse-debounce via the
+		// shared helper (Accum>0 = drag right = next column). Same-direction steps stay snappy.
 		float L = 0.f, R = 0.f, CellW = 12.f * GetKbScale();
 		if (PreviewEdit.IsValid() && PreviewEdit->GetDigitCellBounds(SelectedDigitIndex, L, R))
 			CellW = FMath::Max(4.f, R - L);
-		const float Thresh = CellW * 1.1f;
-		while (PreviewDragAccum >  Thresh) { MoveSelectedDigit(+1); PreviewDragAccum -= Thresh; }
-		while (PreviewDragAccum < -Thresh) { MoveSelectedDigit(-1); PreviewDragAccum += Thresh; }
+		const float BaseStep = CellW * FMath::Max(GImSlatePreviewHWidthMult, 0.1f);
+		ImSlateStepAccumulate(PreviewDragAccum, PreviewHLastStepDir, BaseStep, GetKbScale(),
+			[this] { MoveSelectedDigit(+1); }, [this] { MoveSelectedDigit(-1); });
 	}
 	else if (PreviewDragAxis == 2 && KeyboardType == EKeyboardType::Number && SelectedDigitIndex != INDEX_NONE)
 	{
-		// Vertical: bump the highlighted digit by ±1 (carry + clamp), one step per StepY accumulated. Drag UP
-		// = increase (screen Y grows downward, so negate). Ruler scrolls with the finger.
-		while (PreviewDragAccumY < -StepY) { AdjustDigitAtCursor(+1); PreviewDragAccumY += StepY; }
-		while (PreviewDragAccumY > StepY)  { AdjustDigitAtCursor(-1); PreviewDragAccumY -= StepY; }
+		// Vertical: bump the highlighted digit by ±1 (carry + clamp), base step = StepY; reverse-debounce via the
+		// shared helper. Screen Y grows downward, so AccumY>0 (drag DOWN) decreases the value and AccumY<0 (drag
+		// UP) increases it — hence PosStep = AdjustDigitAtCursor(-1), NegStep = AdjustDigitAtCursor(+1).
+		ImSlateStepAccumulate(PreviewDragAccumY, PreviewVLastStepDir, StepY, GetKbScale(),
+			[this] { AdjustDigitAtCursor(-1); }, [this] { AdjustDigitAtCursor(+1); });
 		if (PreviewStepRuler.IsValid())
 		{
 			// Delta is already in LOCAL pixels (callers divided out the DPI scale), and the ruler renders in
@@ -2534,6 +2593,13 @@ void SImSlateVirtualKeyboard::EndPreviewMouseDrag()
 	// engine's standard ProcessReply path (the only place that turns high-precision back off — SlateApplication
 	// .cpp:3578), matching SSpinBox. Doing it by hand here is what previously leaked high-precision globally.
 	bPreviewDragging = false;
+	// Scrub over → release all finger ownership (next touch starts a fresh scrub).
+	PreviewDragPointerIndex = -1;
+	PreviewTouches[0] = FPreviewTouch{};
+	PreviewTouches[1] = FPreviewTouch{};
+	PreviewTouchCount = 0;
+	PreviewHLastStepDir = 0;  // fresh scrub next time → no stale reverse-debounce direction
+	PreviewVLastStepDir = 0;
 	HidePreviewStepRuler();
 	bPreviewIgnoreSyntheticMove = false;
 }
@@ -2612,15 +2678,40 @@ void SImSlateVirtualKeyboard::OnMouseCaptureLost(const FCaptureLostEvent& Captur
 
 FReply SImSlateVirtualKeyboard::OnTouchStarted(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
 {
-	if (IsInPreviewArea(InTouchEvent.GetScreenSpacePosition()))
+	const int32 Idx = InTouchEvent.GetPointerIndex();
+	const FVector2D Pos = InTouchEvent.GetScreenSpacePosition();
+
+	// RELAY multi-touch: a scrub is already running. If this NEW finger also lands in the preview area, register
+	// it (up to 2) and HAND DRIVING OVER to it — but DON'T reset the accumulators/axis, so the in-progress
+	// scrub continues seamlessly. A 3rd finger, or a touch outside the preview, is ignored. Only the driving
+	// finger moves the value (no speed-doubling); when it lifts, driving relays to the other finger (see Ended).
+	if (bPreviewDragging)
+	{
+		if (IsInPreviewArea(Pos) && PreviewTouchCount < 2 && FindPreviewTouch(Idx) == INDEX_NONE)
+		{
+			PreviewTouches[PreviewTouchCount].Index = Idx;
+			PreviewTouches[PreviewTouchCount].LastPos = Pos;
+			++PreviewTouchCount;
+			PreviewDragPointerIndex = Idx;   // newest finger drives
+			PreviewDragLastPos = Pos;         // seed so its first move delta is ~0 (no jump)
+			return FReply::Handled().CaptureMouse(SharedThis(this));
+		}
+		return FReply::Handled();
+	}
+
+	if (IsInPreviewArea(Pos))
 	{
 		bPreviewIgnoreSyntheticMove = false;  // start clean (parity with mouse OnMouseButtonDown)
 		bPreviewDragging = true;
-		PreviewDragLastPos = InTouchEvent.GetScreenSpacePosition();
+		PreviewTouches[0].Index = Idx;        // first finger
+		PreviewTouches[0].LastPos = Pos;
+		PreviewTouchCount = 1;
+		PreviewDragPointerIndex = Idx;        // this finger drives the scrub
+		PreviewDragLastPos = Pos;
 		PreviewDragAccum = 0.f;
 		PreviewDragAccumY = 0.f;
 		PreviewDragAxis = 0;
-		BeginPreviewSelectAt(InTouchEvent.GetScreenSpacePosition());
+		BeginPreviewSelectAt(Pos);
 		// CRITICAL: take capture even on the TOUCH path. Capture is managed per-PointerIndex (SlateUser.h:65-76),
 		// so FReply::CaptureMouse() is valid for touch/faking-touch (PointerIndex 0) and makes HasMouseCapture()
 		// return true. Without it, this widget's OnMouseMove HasMouseCapture() guard (added for the mouse path)
@@ -2641,32 +2732,62 @@ FReply SImSlateVirtualKeyboard::OnTouchStarted(const FGeometry& MyGeometry, cons
 
 FReply SImSlateVirtualKeyboard::OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
 {
-	if (bPreviewDragging)
+	if (!bPreviewDragging)
+		return FReply::Handled();
+
+	const int32 Idx = InTouchEvent.GetPointerIndex();
+	const FVector2D Pos = InTouchEvent.GetScreenSpacePosition();
+
+	// Keep every tracked finger's last position current (even a non-driving one), so if the driving finger
+	// lifts, the relay can seed PreviewDragLastPos from the survivor's real position (no jump).
+	const int32 Slot = FindPreviewTouch(Idx);
+	if (Slot != INDEX_NONE)
+		PreviewTouches[Slot].LastPos = Pos;
+
+	// Only the DRIVING finger moves the value (relay model: one active finger at a time, no speed-doubling).
+	if (Idx != PreviewDragPointerIndex)
+		return FReply::Handled();
+
+	// Same authoritative guard as OnMouseMove: if bPreviewDragging leaked true without real capture, this is a
+	// stale move — reset and bail rather than scrub from a stale position.
+	if (!HasMouseCapture())
 	{
-		// Same authoritative guard as OnMouseMove: if bPreviewDragging leaked true without real capture, this is a
-		// stale move — reset and bail rather than scrub from a stale position. (Now that OnTouchStarted takes
-		// capture, a real touch drag has HasMouseCapture()==1 and passes.)
-		if (!HasMouseCapture())
-		{
-			EndPreviewMouseDrag();
-			return FReply::Unhandled();
-		}
-		// Touch has no high-precision/raw mode — feed the position diff (converted to LOCAL pixels so the
-		// thresholds match, same as the mouse path) and track the last position.
-		const FVector2D Pos = InTouchEvent.GetScreenSpacePosition();
-		const float DPIScale = GetCachedGeometry().GetAccumulatedLayoutTransform().GetScale();
-		const float InvScale = (DPIScale > 0.f) ? (1.f / DPIScale) : 1.f;
-		HandlePreviewDrag((Pos - PreviewDragLastPos) * InvScale);
-		PreviewDragLastPos = Pos;
+		EndPreviewMouseDrag();
+		return FReply::Unhandled();
 	}
+	// Touch has no high-precision/raw mode — feed the position diff (converted to LOCAL pixels so the
+	// thresholds match, same as the mouse path) and track the last position.
+	const float DPIScale = GetCachedGeometry().GetAccumulatedLayoutTransform().GetScale();
+	const float InvScale = (DPIScale > 0.f) ? (1.f / DPIScale) : 1.f;
+	HandlePreviewDrag((Pos - PreviewDragLastPos) * InvScale);
+	PreviewDragLastPos = Pos;
 	return FReply::Handled();
 }
 
 FReply SImSlateVirtualKeyboard::OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& InTouchEvent)
 {
-	// Symmetric with OnMouseButtonUp: route teardown through EndPreviewMouseDrag (its SetCursorPos restore is
-	// high-precision-gated, so the touch path skips it automatically) and RELEASE the capture + mouse-lock taken
-	// in OnTouchStarted (LockMouseToWidget there → ReleaseMouseLock here).
+	const int32 Idx = InTouchEvent.GetPointerIndex();
+	const int32 Slot = FindPreviewTouch(Idx);
+	if (!bPreviewDragging || Slot == INDEX_NONE)
+		return FReply::Handled();  // a finger we weren't tracking lifted — nothing to do
+
+	// Remove this finger from the tracked slots (compact so [0] stays the survivor).
+	for (int32 i = Slot; i < PreviewTouchCount - 1; ++i)
+		PreviewTouches[i] = PreviewTouches[i + 1];
+	PreviewTouches[--PreviewTouchCount] = FPreviewTouch{};
+
+	if (PreviewTouchCount > 0)
+	{
+		// RELAY: other finger(s) still down → hand driving over to the survivor and keep the scrub alive. Seed
+		// PreviewDragLastPos from the survivor's tracked position so the next move delta is ~0 (no jump). Release
+		// THIS finger's capture only; keep the mouse-lock (still scrubbing).
+		PreviewDragPointerIndex = PreviewTouches[0].Index;
+		PreviewDragLastPos = PreviewTouches[0].LastPos;
+		return FReply::Handled().ReleaseMouseCapture();
+	}
+
+	// Last finger up → end the scrub. Symmetric with OnMouseButtonUp: teardown via EndPreviewMouseDrag (its
+	// SetCursorPos restore is high-precision-gated, so touch skips it) + release capture + mouse-lock.
 	const bool bWasCapturing = HasMouseCapture();
 	EndPreviewMouseDrag();
 	return bWasCapturing

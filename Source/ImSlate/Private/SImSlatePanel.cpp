@@ -46,6 +46,27 @@ static FAutoConsoleVariableRef CVar_ImSlateReferencePPI(
 	GImSlateReferencePPI,
 	TEXT("Reference PPI that maps to scale 1.0 for physical-size-consistent mobile UI."));
 
+// Physical-size clamp for the effective scale: a "standard touch unit" (one tappable cell, ~the key height)
+// must render between TouchUnitMinMM and TouchUnitMaxMM physically. On very high-PPI phones ReferencePPI=96
+// makes the raw scale push elements oversized (titlebar buttons pushed off-screen, text too big); clamping
+// the unit's physical size keeps the WHOLE UI (controls + text scale together) within a finger-friendly band.
+// Only applies on mobile when the real screen density is known. CVars let you tune the band at runtime.
+static float GImSlateTouchUnitLogical = 32.f;  // logical height of the reference tappable unit (the key base)
+static FAutoConsoleVariableRef CVar_ImSlateTouchUnitLogical(
+	TEXT("imslate.TouchUnitLogical"),
+	GImSlateTouchUnitLogical,
+	TEXT("Logical height of the reference tappable unit used for the physical-size scale clamp."));
+static float GImSlateTouchUnitMinMM = 4.f;
+static FAutoConsoleVariableRef CVar_ImSlateTouchUnitMinMM(
+	TEXT("imslate.TouchUnitMinMM"),
+	GImSlateTouchUnitMinMM,
+	TEXT("Minimum physical size (mm) of the reference tappable unit; clamps the effective scale up to this."));
+static float GImSlateTouchUnitMaxMM = 8.f;
+static FAutoConsoleVariableRef CVar_ImSlateTouchUnitMaxMM(
+	TEXT("imslate.TouchUnitMaxMM"),
+	GImSlateTouchUnitMaxMM,
+	TEXT("Maximum physical size (mm) of the reference tappable unit; clamps the effective scale down to this."));
+
 // Extra multiplier on top of the physical scale, for fine-tuning hand feel on mobile.
 float GImSlateMobileScaleTweak = 1.f;
 static FAutoConsoleVariableRef CVar_ImSlateMobileScaleTweak(
@@ -66,7 +87,20 @@ float GetImSlateEffectiveScale()
 	const EScreenPhysicalAccuracy Accuracy = FPlatformApplicationMisc::GetPhysicalScreenDensity(ScreenDensity);
 	if (Accuracy != EScreenPhysicalAccuracy::Unknown && ScreenDensity > 0 && GImSlateReferencePPI > 0.f)
 	{
-		const float PhysicalScale = ((float)ScreenDensity / GImSlateReferencePPI) * GImSlateMobileScaleTweak;
+		float PhysicalScale = ((float)ScreenDensity / GImSlateReferencePPI) * GImSlateMobileScaleTweak;
+		PhysicalScale = FMath::Max(PhysicalScale, 1.f);
+
+		// Physical-size clamp: keep the reference tappable unit (TouchUnitLogical × scale) within
+		// [TouchUnitMinMM, TouchUnitMaxMM] physically. px = mm/25.4 × ScreenDensity, so the scale that puts
+		// the unit at a given mm = (mm/25.4 × ScreenDensity) / TouchUnitLogical. This pulls the whole UI
+		// (controls AND text scale by the same value) into a finger-friendly band on very high-PPI screens.
+		if (GImSlateTouchUnitLogical > 0.f && GImSlateTouchUnitMaxMM > 0.f)
+		{
+			const float MMToScale = ((float)ScreenDensity / 25.4f) / GImSlateTouchUnitLogical;
+			const float ScaleMin = FMath::Max(GImSlateTouchUnitMinMM, 0.f) * MMToScale;
+			const float ScaleMax = GImSlateTouchUnitMaxMM * MMToScale;
+			PhysicalScale = FMath::Clamp(PhysicalScale, ScaleMin, ScaleMax);
+		}
 		return FMath::Max(PhysicalScale, 1.f);
 	}
 	// Fallback (density unknown): the previous heuristic, which is "good enough" per design.
@@ -927,7 +961,7 @@ FReply SImSlatePanel::OnMouseMove(const FGeometry& MyGeometry, const FPointerEve
 		const bool bHorizontalDominant = FMath::Abs(FromPress.X) > FMath::Abs(FromPress.Y);
 
 		if (CanScroll() && GImSlatePanelHSlideMoveFactor > 0.f && bHorizontalDominant
-			&& FMath::Abs(FromPress.X) > HMoveTrigger && Window)
+			&& FMath::Abs(FromPress.X) > HMoveTrigger && Window && Window->CanStartMoveDrag())
 		{
 			// Start moving the window. Panel keeps capture and drives SetWindowPos directly (no drag-drop), so
 			// the (0,0) phantom-pointer issue that affects drag-drop can't occur here.

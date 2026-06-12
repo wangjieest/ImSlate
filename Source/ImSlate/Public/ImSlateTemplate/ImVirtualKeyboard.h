@@ -12,6 +12,20 @@ class SConstraintCanvas;
 namespace ImSlate
 {
 
+// Global reverse-direction step debounce (logical px), shared by ALL continuous step-drag gestures (preview
+// digit select/value scrub, and SImSlateKey four-way / spin / cursor / del step-drag). Defined in
+// ImVirtualKeyboard.cpp + CVar imslate.StepReverseDebouncePx; used by ImSlateStepAccumulate.
+extern float GImSlateStepReverseDebouncePx;
+
+// Accumulator-based stepping with reverse-direction debounce (shared by every continuous step gesture).
+// For each BaseStep of |Accum| travel it fires PosStep()/NegStep() and consumes that much from Accum. A step
+// that REVERSES InOutLastDir must additionally clear a dead zone (GImSlateStepReverseDebouncePx × ScalePx) so
+// the value/selection doesn't flicker back and forth at a boundary. InOutLastDir tracks the last fired
+// direction (+1/-1/0). Returns the NET steps fired (+N right/up / -N left/down) so anchor-based callers can
+// advance their anchor by NetSteps; accumulator-based callers can ignore the return (Accum is consumed).
+int32 ImSlateStepAccumulate(float& Accum, int32& InOutLastDir, float BaseStep, float ScalePx,
+	TFunctionRef<void()> PosStep, TFunctionRef<void()> NegStep);
+
 enum class EVirtualKeyAction : uint8
 {
 	Char,
@@ -204,6 +218,10 @@ public:
 	bool IsOwnedBy(const class SWidget* Widget) const;
 	void NotifyOwnerDestroyed(const class SWidget* Widget);
 
+	// True while the preview value is being scrub-dragged. Keys query this to stay inert during a scrub
+	// (so a finger drifting onto a key mid-drag doesn't type). Cleared when all scrub fingers lift.
+	bool IsPreviewDragging() const { return bPreviewDragging; }
+
 	static TSharedPtr<SImSlateVirtualKeyboard> Get();
 	// PIE-safe variant: resolves the game viewport keyboard for WorldContext's world instead of the
 	// process-global context. Required under "Play As Client", where multiple worlds exist and the
@@ -316,6 +334,18 @@ private:
 	float PreviewDragAccum = 0.f;   // horizontal travel accumulator (switch selected digit, per cell×1.1)
 	float PreviewDragAccumY = 0.f;  // vertical travel accumulator (adjust selected digit, per StepW)
 	int32 PreviewDragAxis = 0;      // locked drag axis: 0=undecided, 1=horizontal(select), 2=vertical(value)
+	int32 PreviewHLastStepDir = 0;  // last horizontal digit-step direction (+1/-1/0); reversing it needs the
+	                                // extra reverse-debounce dead zone (anti-flicker at a column boundary).
+	int32 PreviewVLastStepDir = 0;  // last vertical value-step direction (+1=up/-1=down/0); same reverse-debounce.
+	// Relay-style multi-touch for the scrub: at most ONE finger drives at a time (no speed-doubling / no
+	// axis-split jitter), but when the driving finger lifts while another is still down, driving hands off to
+	// that finger (relay) so the scrub isn't interrupted — supports "slide to the screen edge, lift, continue
+	// with another finger". At most 2 fingers tracked; a 3rd is ignored.
+	int32 PreviewDragPointerIndex = -1;            // the finger currently DRIVING the scrub (-1 = none)
+	struct FPreviewTouch { int32 Index = -1; FVector2D LastPos = FVector2D::ZeroVector; };
+	FPreviewTouch PreviewTouches[2];               // fingers pressed inside the preview area
+	int32 PreviewTouchCount = 0;
+	int32 FindPreviewTouch(int32 Idx) const { for (int32 i = 0; i < 2; ++i) if (PreviewTouches[i].Index == Idx) return i; return INDEX_NONE; }
 	// Self-simulated "high-precision" mouse for the value scrub (UE's native UseHighPrecisionMouseMovement
 	// is disabled in our virtual-window environment). Mouse only: on press we hide the cursor and remember
 	// its screen pos as the anchor; each move computes delta = current - anchor, applies it, then warps the

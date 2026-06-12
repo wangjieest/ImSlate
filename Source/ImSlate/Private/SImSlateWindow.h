@@ -121,7 +121,16 @@ public:
 	// the NoMove flag is forced on internally, but we still allow a drag IF the user's original
 	// intent was movable (bSavedNoMove == false) — that drag triggers a restore-then-follow (see
 	// OnDragDetected). So a genuinely user-pinned (NoMove) window stays unmovable even maximized.
-	bool CanStartMoveDrag() const { return bMaximized ? !bSavedNoMove : !(Flags & ImSlateWindowFlags_NoMove); }
+	bool CanStartMoveDrag() const
+	{
+#if PLATFORM_IOS || PLATFORM_ANDROID
+		// Mobile: a maximized window fills the screen — there's nowhere to move it, and the desktop
+		// "drag to restore-then-follow" gesture is unwanted on touch. Block move entirely while maximized.
+		if (bMaximized)
+			return false;
+#endif
+		return bMaximized ? !bSavedNoMove : !(Flags & ImSlateWindowFlags_NoMove);
+	}
 
 	SImViewportGame* IsAreaInGameViewport() const;
 	bool IsViewportGame() const;

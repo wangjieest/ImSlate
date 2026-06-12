@@ -234,13 +234,16 @@ public:
 			{
 				FSlateThrottleManager::Get().DisableThrottle(true);
 			}
-			return FReply::Handled();
+			// MUST capture (mirrors the mouse path's OnMouseButtonDown): without it, touch OnTouchMoved is not
+			// routed here, so the drag never continues — the resize/move only fired once on press (looked like
+			// "tap = one fixed size change, no drag"). Capture is per-PointerIndex so it's valid for touch.
+			return FReply::Handled().CaptureMouse(this->AsShared());
 		}
 		return FReply::Handled();
 	}
 	virtual FReply OnTouchMoved(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
 	{
-		if (DragParameters.IsSet() && DragParameters->PointerIndex == MouseEvent.GetPointerIndex())
+		if (DragParameters.IsSet() && DragParameters->PointerIndex == MouseEvent.GetPointerIndex() && this->HasMouseCapture())
 		{
 			auto ScreenSpaceDelta = MouseEvent.GetScreenSpacePosition() - DragParameters->AbsDragStart;
 			FVector2D AbsPos = DragParameters->AbsWindowPos + ScreenSpaceDelta;
@@ -253,14 +256,15 @@ public:
 	}
 	virtual FReply OnTouchEnded(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent) override
 	{
-		if (DragParameters->PointerIndex == MouseEvent.GetPointerIndex())
+		if (DragParameters.IsSet() && DragParameters->PointerIndex == MouseEvent.GetPointerIndex())
 		{
 			DragParameters.Reset();
 			if (--DisableThrottleCnt == 0)
 			{
 				FSlateThrottleManager::Get().DisableThrottle(false);
 			}
-			return FReply::Handled();
+			// Release the capture taken in OnTouchStarted (symmetry; mirrors the mouse OnMouseButtonUp path).
+			return FReply::Handled().ReleaseMouseCapture();
 		}
 		return FReply::Handled();
 	}
@@ -674,12 +678,10 @@ public:
 	TOptional<float> TitleHeight;
 	float GetTitleHeight() const
 	{
-		float H = TitleHeight.Get(24.f);
-#if !PLATFORM_DESKTOP
-		// Mobile: finger-friendly minimum (matches SImSlateWindow::GetTitleHeight). Desktop keeps the value.
-		H = FMath::Max(H, 44.f);
-#endif
-		return H * ImSlate::GetImSlateEffectiveScale();
+		// Logical value × effectiveScale (already physically consistent). The previous mobile max(H,44) over-
+		// inflated the bar on high-PPI / density-fallback devices (square buttons are bar-height wide → didn't
+		// fit). Reverted to match SImSlateWindow::GetTitleHeight.
+		return TitleHeight.Get(24.f) * ImSlate::GetImSlateEffectiveScale();
 	}
 
 public:
@@ -769,6 +771,23 @@ SImSlateWindow::SImSlateWindow()
 void SImSlateWindow::Construct(const FArguments& InArgs, uint32 ImSlateId)
 {
 	UE_LOG(LogTemp, Log, TEXT("SImSlateWindow Construct: %p, id: %d"), this, ImSlateId);
+	// [TitleSizeDbg] Full scale diagnostics (one line per window create) to tell apart the two possible causes
+	// of oversized UI on this device: (A) double-scaling (viewport already DPI-scaled, then ×effectiveScale) vs
+	// (B) the density source over-reporting. Compare:
+	//   effectiveScale (ImSlate, = ScreenDensity/96) vs engineDPIScale (what UE's own UI uses).
+	//   ScreenDensity + Accuracy (0=Unknown/1=Approx/2=Truth) = the raw physical density.
+	//   viewportLogicalSize = the coordinate space ImSlate lays out in (if this is already small/DPI-scaled,
+	//   ×effectiveScale double-counts → that's cause A).
+	{
+		int32 ScreenDensity = 0;
+		const EScreenPhysicalAccuracy Acc = FPlatformApplicationMisc::GetPhysicalScreenDensity(ScreenDensity);
+		const float EngineDPI = SImSlateViewport::StaticGetDPIScaleFactorAtPoint(FVector2D::ZeroVector);
+		FVector2D VpSize(0, 0);
+		if (ViewportGame) VpSize = ViewportGame->GetCachedGeometry().GetLocalSize();
+		UE_LOG(LogTemp, Warning, TEXT("[TitleSizeDbg] effectiveScale=%.3f engineDPIScale=%.3f ScreenDensity=%d Accuracy=%d viewportLogicalSize=%.0fx%.0f TitleHeight=%.1f → titleH=%.1f"),
+			ImSlate::GetImSlateEffectiveScale(), EngineDPI, ScreenDensity, (int32)Acc, VpSize.X, VpSize.Y,
+			TitleHeight, TitleHeight * ImSlate::GetImSlateEffectiveScale());
+	}
 
 	WindowId = ImSlateId;
 	Flags = InArgs._Flags;
@@ -1121,6 +1140,13 @@ void SImSlateWindow::InvokeResizeCallback(FVector2D InSize)
 {
 	if (ensure(Viewport))
 	{
+		// Minimum window size floor (resize can't shrink below this). On mobile, scale it by the effective UI
+		// scale so the floor stays a sensible PHYSICAL size on high-PPI screens (the raw logical 200×40 would
+		// shrink too small). Desktop uses the raw logical value.
+		FVector2D MinHeaderSize = HeaderHandle->GetMinSize() * FVector2D(1.f, 2.f);
+#if !PLATFORM_DESKTOP
+		MinHeaderSize *= ImSlate::GetImSlateEffectiveScale();
+#endif
 		if (ResizeCallback)
 		{
 			ImSlateSizeCallbackData Data;
@@ -1131,12 +1157,12 @@ void SImSlateWindow::InvokeResizeCallback(FVector2D InSize)
 			ResizeCallback(Data);
 			if (Data.ContentSize != Data.DesiredSize)
 			{
-				SetWindowContentSize(FVector2D::Max(Data.DesiredSize, HeaderHandle->GetMinSize() * FVector2D(1.f, 2.f)));
+				SetWindowContentSize(FVector2D::Max(Data.DesiredSize, MinHeaderSize));
 			}
 		}
 		else
 		{
-			Viewport->SetWindowSize(this, FVector2D::Max(InSize, HeaderHandle->GetMinSize() * FVector2D(1.f, 2.f)));
+			Viewport->SetWindowSize(this, FVector2D::Max(InSize, MinHeaderSize));
 		}
 	}
 }
@@ -1436,13 +1462,11 @@ float SImSlateWindow::GetTitleHeight() const
 {
 	if (Flags & ImSlateWindowFlags_NoTitleBar)
 		return 0.f;
-	float H = TitleHeight;
-#if PLATFORM_IOS || PLATFORM_ANDROID
-	// Mobile: the titlebar doubles as the touch grab area for moving the window, so enforce a finger-friendly
-	// minimum height (~44pt) — the desktop default (24) is too thin to hit reliably. Desktop keeps TitleHeight.
-	H = FMath::Max(H, 44.f);
-#endif
-	return H * ImSlate::GetImSlateEffectiveScale();
+	// TitleHeight is a LOGICAL value; ×effectiveScale already makes it physically consistent (scale =
+	// ScreenDensity/ReferencePPI). The previous mobile `max(H,44)` over-inflated the bar on high-PPI /
+	// density-fallback devices (the square close/maximize buttons are bar-height wide, so the bar grew until
+	// they no longer fit). Reverted to the plain logical value.
+	return TitleHeight * ImSlate::GetImSlateEffectiveScale();
 }
 
 FReply SImSlateWindow::OnDragDetected(const FGeometry& MyGeometry, const FPointerEvent& MouseEvent)
@@ -1497,7 +1521,13 @@ void SImSlateWindow::OnArrangeChildren(const FGeometry& AllottedGeometry, FArran
 
 	if (bShowResizeHandle)
 	{
-		ArrangedChildren.AddWidget(EVisibility::Visible, AllottedGeometry.MakeChild(ResizeArea.ToSharedRef(), AllottedGeometry.GetLocalSize() - FVector2D{ResizeHandleWidth}, FVector2D{ResizeHandleWidth}));
+		// Mobile: enlarge the bottom-right resize hit area to a finger-friendly size (the desktop 24 is too
+		// small to grab reliably). The handle is the arranged rect itself, so a bigger rect = bigger hit zone.
+		float HandleW = ResizeHandleWidth;
+#if PLATFORM_IOS || PLATFORM_ANDROID
+		HandleW = FMath::Max(HandleW, 44.f);
+#endif
+		ArrangedChildren.AddWidget(EVisibility::Visible, AllottedGeometry.MakeChild(ResizeArea.ToSharedRef(), AllottedGeometry.GetLocalSize() - FVector2D{HandleW}, FVector2D{HandleW}));
 	}
 }
 
